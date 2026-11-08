@@ -145,6 +145,10 @@ class Usage:
 
     Token counts and ``llm_cost_usd`` come from the agent CLI's own report
     (e.g. Claude Code's ``total_cost_usd`` and ``usage`` block).
+    Token buckets are disjoint: ``input_tokens`` excludes cache reads/writes;
+    ``output_tokens`` includes reasoning. Unreported or incomplete LLM cost
+    is zero, not a claim that the run is free. Standard Codex events report
+    tokens but no dollar cost. Inspect :attr:`AgentRunResult.raw` for metadata.
     ``compute_cost_usd`` is the SDK's estimate of the sandbox compute the run
     consumed (elapsed wall-clock x the backend's per-second price).
 

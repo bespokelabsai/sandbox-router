@@ -15,6 +15,8 @@ from typing import Any, TypeVar, overload
 from bespokelabs.sandbox import _jobs, _transfer, pricing, telemetry
 from bespokelabs.sandbox._usage import (
     parse_claude_result,
+    parse_codex_result,
+    parse_grok_result,
     parse_opencode_result,
     result_text,
     usage_from_result,
@@ -226,9 +228,7 @@ class Sandbox:
         self._usage = Usage()
 
         preset_name = resolved_preset.name if resolved_preset else None
-        with telemetry.span(
-            telemetry.OP_CREATE, backend, preset=preset_name
-        ):
+        with telemetry.span(telemetry.OP_CREATE, backend, preset=preset_name):
             try:
                 self._session: SandboxBackendSession = backend_client.create(
                     self._config
@@ -552,34 +552,36 @@ class Sandbox:
         output_format: str = "json",
         resume: bool = False,
     ) -> AgentRunResult:
-        """Run an agent on *prompt* and return its answer plus token/cost usage.
+        """Run Claude Code, OpenCode, Grok Build, or Codex on *prompt*.
 
-        Unlike :meth:`execute_command`, this owns the agent's output format so
-        usage data is always available: it invokes ``claude -p <prompt>
-        --output-format json`` (override the binary with *command*), parses the
-        reported token counts and ``total_cost_usd``, and estimates the compute
-        cost of the call (elapsed wall-clock x the backend's per-second price
-        from :mod:`bespokelabs.sandbox.pricing`).
+        JSON output is the default; CLI-reported tokens/cost and estimated
+        sandbox compute cost are returned and added to :attr:`usage`.
+        Unreported LLM cost is zero, not a claim that the run was free. Codex
+        normally reports tokens only. Cached input is counted separately;
+        reasoning is included in output tokens, never counted twice.
 
-        The per-call :class:`Usage` is returned on the result and also added to
-        the sandbox total exposed by :attr:`usage`.  Pass ``resume=True`` to
-        continue the most recent conversation (``-c``) and ``extra_args`` to
-        forward extra CLI flags.
+        ``command`` overrides the selected CLI binary. ``model`` selects the
+        model (provider/model for OpenCode); ``extra_args`` forwards CLI flags.
+        ``resume=True`` continues the latest conversation in the workspace
+        (``codex exec resume --last`` for Codex, ``-c`` for the other CLIs).
+        CLI auth, permissions, and session persistence remain caller-owned.
 
-        Select ``harness="opencode"`` to run OpenCode, with ``model`` in
-        provider/model form (for example ``zai/glm-4.7``). Its JSON events
-        are aggregated across steps; reasoning is included in output tokens.
-        ``command`` overrides the selected harness's binary. OpenCode accepts
-        ``json`` or ``default`` output formats (``text`` aliases ``default``).
-
-        ``llm_cost_usd`` and token counts reflect the CLI reports (and may be ``0`` under
-        subscription auth that omits ``total_cost_usd``).  On non-zero exit the
-        result still carries whatever usage was parsed; inspect ``exit_code``.
+        Codex accepts ``json`` or ``text``. Grok accepts ``json``,
+        ``streaming-json``, ``streaming-messages-json``, or ``plain`` (``text``
+        aliases ``plain``). OpenCode accepts ``json`` or ``default`` (``text``
+        aliases ``default``). Plain text has no usage metadata. On non-zero
+        exit, any parsed partial usage is retained; inspect ``exit_code``.
         """
         self._check_alive()
-        if harness not in {"claude-code", "opencode"}:
+        parsers = {
+            "claude-code": parse_claude_result,
+            "opencode": parse_opencode_result,
+            "grok": parse_grok_result,
+            "codex": parse_codex_result,
+        }
+        if harness not in parsers:
             raise ValueError(f"Unsupported agent harness: {harness!r}")
-        command = command or ("opencode" if harness == "opencode" else "claude")
+        command = command or ("claude" if harness == "claude-code" else harness)
         if harness == "opencode":
             if output_format not in {"json", "default", "text"}:
                 raise ValueError(
@@ -590,16 +592,44 @@ class Sandbox:
                 "--format",
                 "default" if output_format == "text" else output_format,
             ]
+        elif harness == "codex":
+            if output_format not in {"json", "text"}:
+                raise ValueError("Codex output_format must be json or text")
+            args = ["exec"]
+            if resume:
+                args.extend(["resume", "--last"])
+            if output_format == "json":
+                args.append("--json")
+        elif harness == "grok":
+            if output_format not in {
+                "json",
+                "streaming-json",
+                "streaming-messages-json",
+                "plain",
+                "text",
+            }:
+                raise ValueError(
+                    "Grok output_format must be json, streaming-json, "
+                    "streaming-messages-json, plain, or text"
+                )
+            args = [
+                "--no-auto-update",
+                "--output-format",
+                "plain" if output_format == "text" else output_format,
+            ]
         else:
             args = ["-p", prompt, "--output-format", output_format]
-        if resume:
+        if resume and harness != "codex":
             args.append("-c")
         if model is not None:
             args.extend(["--model", model])
         if extra_args:
             args.extend(extra_args)
-        if harness == "opencode":
+        if harness in {"opencode", "codex"}:
             args.extend(["--", prompt])
+        elif harness == "grok":
+            # Equals form keeps leading hyphens in prompts from becoming flags.
+            args.append(f"--single={prompt}")
 
         start = time.monotonic()
         with telemetry.span(telemetry.OP_EXEC, self._config.backend) as sp:
@@ -609,12 +639,7 @@ class Sandbox:
             elapsed = time.monotonic() - start
             sp.set(exit_code=result.exit_code, kind="agent")
 
-        parser = (
-            parse_opencode_result
-            if harness == "opencode"
-            else parse_claude_result
-        )
-        record = parser(result.stdout)
+        record = parsers[harness](result.stdout)
         usage = usage_from_result(record) or Usage()
         usage.compute_cost_usd = self.estimate_compute_cost(elapsed)
         self._usage = self._usage + usage

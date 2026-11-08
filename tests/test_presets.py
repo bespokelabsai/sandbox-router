@@ -12,7 +12,13 @@ from bespokelabs.sandbox.presets import (
 )
 from bespokelabs.sandbox.types import SandboxResult
 
-BUILT_IN_PRESETS = {"claude-code", "claude-code-codex", "codex", "opencode"}
+BUILT_IN_PRESETS = {
+    "claude-code",
+    "claude-code-codex",
+    "codex",
+    "opencode",
+    "grok",
+}
 TENSORLAKE_NPM_PREFIX = "mkdir -p $HOME/.npm-global && npm config set prefix $HOME/.npm-global && npm install -g"
 
 
@@ -35,6 +41,28 @@ class PresetTests(unittest.TestCase):
             preset.backend_setup_commands["tensorlake"],
             [f"{TENSORLAKE_NPM_PREFIX} opencode-ai"],
         )
+
+    def test_grok_preset_installs_official_cli_without_prebuilt_image(self):
+        preset = get_preset("grok")
+        self.assertIsNone(preset.image)
+        self.assertTrue(preset.setup_before_workspace)
+        self.assertEqual(
+            preset.setup_commands, ["npm install -g @xai-official/grok"]
+        )
+        self.assertEqual(
+            preset.backend_setup_commands["tensorlake"],
+            [f"{TENSORLAKE_NPM_PREFIX} @xai-official/grok"],
+        )
+        self.assertIn(
+            "apt-get install -y nodejs npm git",
+            preset.backend_setup_commands["docker"][0],
+        )
+        self.assertEqual(
+            preset.backend_setup_commands["docker"][1], preset.setup_commands[0]
+        )
+        self.assertEqual(preset.memory_mb, 2048)
+        self.assertEqual(preset.timeout_secs, 1800)
+        self.assertTrue(preset.allow_internet)
 
     def test_builtin_presets_are_limited_to_agent_clis(self) -> None:
         self.assertEqual(set(PRESETS), BUILT_IN_PRESETS)
@@ -180,29 +208,32 @@ class PresetImageResolutionTests(unittest.TestCase):
         self.assertEqual(sb._config.image, "ghcr.io/test/img:latest")
         sb._session.execute_command.assert_not_called()
 
-    def test_opencode_docker_setup_precedes_clone_and_files(self):
-        with Sandbox(
-            "docker",
-            preset="opencode",
-            git_repo="https://example.com/repo.git",
-            files={"repo/input.txt": "data"},
-        ) as sb:
-            calls = sb._session.mock_calls
-            provisioning, install = get_preset(
-                "opencode"
-            ).backend_setup_commands["docker"]
-            self.assertEqual(
-                calls,
-                [
-                    mock.call.execute_command(provisioning),
-                    mock.call.execute_command(install),
-                    mock.call.execute_command(
-                        "git clone --depth 1 https://example.com/repo.git repo",
-                        None,
-                    ),
-                    mock.call.write_file("repo/input.txt", "data"),
-                ],
-            )
+    def test_runtime_install_precedes_clone_and_files(self):
+        for name in ("opencode", "grok"):
+            with (
+                self.subTest(preset=name),
+                Sandbox(
+                    "docker",
+                    preset=name,
+                    git_repo="https://example.com/repo.git",
+                    files={"repo/input.txt": "data"},
+                ) as sb,
+            ):
+                provisioning, install = get_preset(name).backend_setup_commands[
+                    "docker"
+                ]
+                self.assertEqual(
+                    sb._session.mock_calls,
+                    [
+                        mock.call.execute_command(provisioning),
+                        mock.call.execute_command(install),
+                        mock.call.execute_command(
+                            "git clone --depth 1 https://example.com/repo.git repo",
+                            None,
+                        ),
+                        mock.call.write_file("repo/input.txt", "data"),
+                    ],
+                )
 
     def test_early_setup_failure_cleans_up_before_clone(self):
         from bespokelabs.sandbox.exceptions import SandboxCreationError
