@@ -90,7 +90,7 @@ class SandboxConfig:
         Modal and boxd support every mode, Docker and Tensorlake ``public``
         and ``none``; anything a backend cannot enforce raises.
       - snapshot_id: Tensorlake, Modal, boxd
-      - env_vars: all backends
+      - env_vars: all backends (Monty exposes only the supplied mapping)
       - timeout_secs: all backends (local and ray use subprocess timeout)
       - timeout_secs_explicit: whether ``timeout_secs`` was supplied by the
         caller rather than inherited from a preset or from the default above.
@@ -101,12 +101,18 @@ class SandboxConfig:
       - workdir: Local, Safehouse (host directory used as the sandbox root),
                  Tensorlake, Daytona, RunPod, boxd (command working directory;
                  Tensorlake defaults to /tmp, RunPod to /workspace, boxd to
-                 /home/boxd)
+                 /home/boxd); Monty uses an absolute in-memory virtual path.
       - backend_options: provider-specific escape hatch, merged last into the
         backend's underlying create call (Docker containers.run, Modal
         Sandbox.create, E2B Sandbox.create, Tensorlake create_and_connect,
         Daytona create params, RunPod REST create payload, boxd
-        machines.create). Ignored by local/safehouse/ray.
+        machines.create). Monty accepts only its documented resource/output
+        options and binary_path. Ignored by local/safehouse/ray.
+
+    Monty uses memory_mb as an interpreter allocation budget, not an RSS
+    ceiling. timeout_secs configures execution, worker-turn and sleep budgets,
+    not one end-to-end wall deadline. It supports only network mode "none",
+    and rejects images, disk/GPU configuration and session reattachment.
     """
 
     backend: str

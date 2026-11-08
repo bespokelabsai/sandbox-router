@@ -29,6 +29,7 @@ tensorlake = ["tensorlake>=0.1.0"]
 modal = ["modal>=0.60.0"]
 e2b = ["e2b-code-interpreter>=1.0.0"]
 docker = ["docker>=7.0.0"]
+monty = ["pydantic-monty>=1.5.0,<2"]
 ray = ["ray>=2.0.0"]
 boxd = ["boxd>=0.2.20"]
 gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0"]
@@ -39,6 +40,7 @@ all = [
     "modal>=0.60.0",
     "e2b-code-interpreter>=1.0.0",
     "docker>=7.0.0",
+    "pydantic-monty>=1.5.0,<2",
     "ray>=2.0.0",
     "boxd>=0.2.20",
     "google-cloud-batch>=0.17.0",

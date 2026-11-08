@@ -285,7 +285,7 @@ class ControlPlane:
         with self._lock:
             self._runtimes[record.id] = runtime
         dynamic_rate = None
-        if backend not in {"docker", "local", "ray", "safehouse"}:
+        if backend not in {"docker", "local", "ray", "safehouse", "monty"}:
             candidate_rate = Decimal(str(runtime.estimate_compute_cost(3600)))
             if candidate_rate > 0:
                 dynamic_rate = candidate_rate
@@ -1493,7 +1493,7 @@ class ControlPlane:
 
     @staticmethod
     def _provider_is_configured(backend: str, settings: dict[str, str]) -> bool:
-        if backend in {"local", "docker", "ray", "safehouse"}:
+        if backend in {"local", "docker", "ray", "safehouse", "monty"}:
             return True
         return bool(settings) and all(
             bool(value) for value in settings.values()

@@ -9,6 +9,7 @@ from bespokelabs.sandbox.backends.e2b import E2BClient
 from bespokelabs.sandbox.backends.gcp_batch import GcpBatchClient
 from bespokelabs.sandbox.backends.local import LocalClient
 from bespokelabs.sandbox.backends.modal import ModalClient
+from bespokelabs.sandbox.backends.monty import MontyClient
 from bespokelabs.sandbox.backends.ray import RayClient
 from bespokelabs.sandbox.backends.runpod import RunpodClient
 from bespokelabs.sandbox.backends.safehouse import SafehouseClient
@@ -25,6 +26,7 @@ BACKENDS: dict[str, type] = {
     "e2b": E2BClient,
     "docker": DockerClient,
     "local": LocalClient,
+    "monty": MontyClient,
     "ray": RayClient,
     "runpod": RunpodClient,
     "safehouse": SafehouseClient,
