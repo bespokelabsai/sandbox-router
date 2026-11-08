@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -11,9 +12,10 @@ from bespokelabs.sandbox.control_plane.reconciliation import ProviderObservation
 from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import SandboxTimeoutError
-from bespokelabs.sandbox.types import SandboxResult
+from bespokelabs.sandbox.types import AgentRunResult, SandboxResult, Usage
 
-DB_PATH = "/tmp/bespoke-phase5-browser.db"
+_fixture_dir = tempfile.TemporaryDirectory(prefix="bespoke-dashboard-")
+DB_PATH = f"{_fixture_dir.name}/browser.db"
 OPERATOR_TOKEN = "bsk_live_phase5_operator_fixture_only"
 READ_ONLY_TOKEN = "bsk_live_phase5_read_only_fixture_only"
 
@@ -41,6 +43,29 @@ class BrowserRuntime:
         self, command: str, args: list[str] | None = None
     ) -> SandboxResult:
         return SandboxResult(stdout=" ".join([command, *(args or [])]))
+
+    def run_agent(self, prompt: str, **options) -> AgentRunResult:
+        harness = options["harness"]
+        if prompt == "No usage":
+            return AgentRunResult(text="Usage unavailable", exit_code=1)
+        usage = Usage(
+            input_tokens=800000, output_tokens=50000, cache_read_tokens=200000
+        )
+        raw = {
+            "usage": {
+                "input_tokens": 1000000 if harness == "codex" else 800000,
+                "output_tokens": 50000,
+                "cached_input_tokens"
+                if harness == "codex"
+                else "cache_read_input_tokens": 200000,
+            }
+        }
+        if harness == "grok":
+            usage.llm_cost_usd = 1.25
+            raw["total_cost_usd"] = 1.25
+        return AgentRunResult(
+            text="Fixture agent completed", usage=usage, raw=raw
+        )
 
     def estimate_compute_cost(self, elapsed_secs: float) -> float:
         return elapsed_secs / 1800
@@ -138,6 +163,29 @@ service.execute(
     live.id,
     code="print('fake provider ready')",
     request_id="browser-execution-1",
+)
+service.run_agent(
+    operator,
+    live.id,
+    prompt="Explain",
+    harness="codex",
+    model="gpt-5.3-codex",
+    request_id="browser-codex",
+)
+service.run_agent(
+    operator,
+    live.id,
+    prompt="Explain",
+    harness="grok",
+    model="grok",
+    request_id="browser-grok",
+)
+service.run_agent(
+    operator,
+    live.id,
+    prompt="No usage",
+    harness="codex",
+    request_id="browser-unknown",
 )
 now += timedelta(seconds=500)
 reconciler.by_org[operator.organization_id] = [

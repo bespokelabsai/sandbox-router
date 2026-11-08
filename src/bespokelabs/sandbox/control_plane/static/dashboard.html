@@ -98,7 +98,7 @@
             <div class="table-state" id="emptyState" hidden>No sandboxes match these filters.</div>
             <div class="table-scroll" id="tableScroll" hidden>
               <table>
-                <thead><tr><th>Sandbox</th><th>Provider resource</th><th>Compute</th><th>Rate</th><th>Age / TTL</th><th>Cleanup</th><th>Reconciliation</th><th><span class="sr-only">Actions</span></th></tr></thead>
+                <thead><tr><th>Sandbox</th><th>Provider resource</th><th>Compute</th><th>Rate</th><th>Age / TTL</th><th>Cleanup</th><th>Reconciliation</th><th title="Selected spend period">Agent usage</th><th><span class="sr-only">Actions</span></th></tr></thead>
                 <tbody id="sandboxRows"></tbody>
               </table>
             </div>
@@ -106,8 +106,13 @@
           </section>
 
           <section class="dashboard-grid" id="spend">
-            <article class="panel spend-panel"><div class="panel-header"><div><p class="eyebrow">Customer spend</p><h2>Daily usage</h2></div><div class="period-tabs" id="periodTabs" aria-label="Usage period"><button type="button" data-days="7">7d</button><button type="button" class="active" data-days="30">30d</button><button type="button" data-days="90">90d</button><button type="button" data-days="all">All</button></div></div><div class="chart-wrap" id="spendChart" aria-live="polite"></div></article>
+            <article class="panel spend-panel"><div class="panel-header"><div><p class="eyebrow">Sandbox compute spend</p><h2>Daily usage</h2></div><div class="period-tabs" id="periodTabs" aria-label="Usage period"><button type="button" data-days="7">7d</button><button type="button" class="active" data-days="30">30d</button><button type="button" data-days="90">90d</button><button type="button" data-days="all">All</button></div></div><div class="chart-wrap" id="spendChart" aria-live="polite"></div></article>
             <article class="panel"><div class="panel-header"><div><p class="eyebrow">Cost footprint</p><h2>By provider</h2></div></div><div class="provider-list" id="providerList"></div></article>
+          </section>
+
+          <section class="panel agent-panel" aria-labelledby="agentUsageHeading">
+            <div class="panel-header"><div><p class="eyebrow">Selected spend period · separate from compute</p><h2 id="agentUsageHeading">Model usage</h2></div></div>
+            <div id="agentUsageSummary" aria-live="polite"></div>
           </section>
 
           <section class="activity-grid" id="activity" hidden>

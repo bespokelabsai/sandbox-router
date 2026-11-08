@@ -1,0 +1,86 @@
+// Run with: node --test tests/test_dashboard_dom.mjs
+// A DOM double that rejects HTML parsing makes this rendering contract explicit.
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import vm from "node:vm";
+
+class Element {
+  constructor(tag) {
+    this.tag = tag;
+    this.children = [];
+    this.dataset = {};
+    this.classList = { toggle() {} };
+  }
+  append(...children) {
+    for (const child of children) {
+      if (child instanceof Element && child.tag === "fragment") this.append(...child.children);
+      else this.children.push(child instanceof Element ? child : String(child));
+    }
+  }
+  replaceChildren(...children) { this.children = []; this.append(...children); }
+  insertBefore(child, before) { this.children.splice(this.children.indexOf(before), 0, child); }
+  set textContent(value) { this.replaceChildren(value); }
+  get textContent() { return this.children.map((child) => child instanceof Element ? child.textContent : child).join(""); }
+  set innerHTML(value) { throw new Error(`Unsafe HTML sink: ${value}`); }
+  setAttribute(key, value) { this[key] = String(value); }
+  addEventListener() {}
+}
+
+function dashboard() {
+  const elements = new Map();
+  const context = vm.createContext({
+    window: { location: { pathname: "/dashboard/local" }, setInterval() {} },
+    sessionStorage: { getItem() { return ""; } },
+    document: {
+      querySelector(selector) {
+        if (!elements.has(selector)) elements.set(selector, new Element("div"));
+        return elements.get(selector);
+      },
+      createElement: (tag) => new Element(tag),
+      createDocumentFragment: () => new Element("fragment"),
+      addEventListener() {},
+    },
+  });
+  vm.runInContext(readFileSync(new URL("../src/bespokelabs/sandbox/control_plane/static/dashboard.js", import.meta.url), "utf8"), context);
+  return { context, elements };
+}
+
+test("sandbox detail treats API strings as text and retains controls and cost labels", () => {
+  const { context, elements } = dashboard();
+  const attack = '<img src=x onerror="globalThis.attacked=true"><script>alert(1)</script>';
+  context.detail = {
+    sandbox: { id: attack, status: "running", backend: attack, provider_resource_id: attack, creator_api_key_name: attack, version: attack, latest_error: { code: attack, message: attack } },
+    cost: { cost_state: attack },
+    agent_usage: { runs: 1, unknown_usage_runs: 0, estimated_cost_runs: 1, estimated_cost_usd: "2.135", total_tokens: 1050000 },
+    agent_runs: [{ harness: attack, model: attack, tokens_known: true, total_tokens: 1050000, cost_state: "estimated", cost_usd: "2.135", cost_reason: attack, pricing_as_of: attack, rates_per_million: { input: attack, cached_input: ".175", output: "14" } }],
+    attempts: [{ attempt_number: attack, status: attack, error: { message: attack } }],
+    executions: [{ request_id: attack, status: attack, response: { exit_code: attack, stdout: attack } }],
+    provider_observations: [{ status: attack }],
+  };
+  vm.runInContext("state.session = { can_terminate: true }; renderDetail(detail)", context);
+  const panel = elements.get("#detailContent");
+  assert.ok(panel.textContent.includes(attack));
+  assert.ok(panel.textContent.includes("Codex estimate · $2.14"));
+  assert.ok(panel.textContent.includes("1,050,000 tokens"));
+  const all = (element) => [element, ...element.children.filter((child) => child instanceof Element).flatMap(all)];
+  const nodes = all(panel);
+  assert.equal(nodes.some((element) => ["img", "script"].includes(element.tag)), false);
+  const link = nodes.find((element) => element.tag === "a");
+  assert.equal(link.href, "https://developers.openai.com/api/docs/pricing");
+  const button = elements.get("#detailFooter").children[1];
+  assert.equal(button.tag, "button");
+  assert.equal(button.dataset.id, attack);
+  assert.equal(button.dataset.version, attack);
+  vm.runInContext("state.session = {}; renderDetail(detail)", context);
+  assert.equal(elements.get("#detailFooter").children[1].textContent, "Read-only access");
+});
+
+test("model overview renders both usage and permission states without HTML sinks", () => {
+  const { context, elements } = dashboard();
+  vm.runInContext("renderAgentOverview([])", context);
+  assert.match(elements.get("#agentUsageSummary").textContent, /requires usage access/);
+  vm.runInContext("state.session = { can_view_usage: true }; renderAgentOverview([{ agent_usage: { runs: 1, unknown_usage_runs: 1, unknown_cost_runs: 1 } }])", context);
+  assert.match(elements.get("#agentUsageSummary").textContent, /unavailable cost/);
+  assert.match(elements.get("#agentUsageSummary").textContent, /Unavailable/);
+});
