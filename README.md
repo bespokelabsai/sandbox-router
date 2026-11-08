@@ -28,7 +28,7 @@ operations dashboard.
 
 - **Common interface** — Use the same execution and file APIs across many backends, with provider-specific configuration where needed.
 - **Easily move between providers** — If one provider has an outage or capacity issue, change one string and keep running.
-- **Cost tracking** — Track Claude Code token usage, estimated sandbox compute cost, and compare backend pricing.
+- **Cost tracking** — Track agent-reported token usage and cost, estimate sandbox compute cost, and compare backend pricing.
 - **Optional hosted access** — Operate multiple providers behind organization API keys, with lifecycle costs, policies, audit history, and a dashboard.
 
 Backend selection is explicit. Automatic cheapest-provider routing and automatic
@@ -851,6 +851,76 @@ install tools but do not supply agent credentials.
 
 ### Token usage & cost
 
+`run_agent` supports `harness="claude-code"` (default), `"opencode"`,
+`"grok"`, and `"codex"`. Select the installation preset and runtime harness
+separately. The sync and async clients expose the same options.
+
+For [Grok Build](https://docs.x.ai/build/cli/headless-scripting):
+
+```python
+import os
+from bespokelabs.sandbox import Sandbox
+
+with Sandbox(
+    "local", preset="grok", workdir="/absolute/path/to/your/project",
+    env_vars={"XAI_API_KEY": os.environ["XAI_API_KEY"]},
+) as sb:
+    result = sb.run_agent("Explain this project.", harness="grok")
+    print(result.text, result.usage.total_tokens, result.usage.total_cost_usd)
+    print(result.exit_code, result.stderr)
+    sb.run_agent("Which modules need tests?", harness="grok", resume=True)
+```
+
+The Grok preset installs `@xai-official/grok` via npm (Node.js 20+ required).
+Docker setup installs Node.js, npm, and Git on the default Debian image before
+cloning the workspace. Tensorlake uses its writable npm prefix. Other backends
+need Node.js/npm and installation permissions. No prebuilt Grok image is
+assumed. Local execution runs on the host; use Docker or a cloud backend for
+an isolated environment.
+
+For [Codex](https://developers.openai.com/codex/noninteractive), the existing
+`codex` preset now works with the usage-aware helper:
+
+```python
+with Sandbox(
+    "local", preset="codex", workdir="/absolute/path/to/your/project",
+    env_vars={"CODEX_API_KEY": os.environ["CODEX_API_KEY"]},
+) as sb:
+    result = sb.run_agent("Explain this project.", harness="codex")
+    print(result.text, result.usage.total_tokens)
+    sb.run_agent("Which modules need tests?", harness="codex", resume=True)
+```
+
+Both harnesses accept `model=...`, `command=...` to override the binary, and
+`extra_args=[...]` for CLI flags. Codex uses `exec --json`, and `resume=True`
+uses `exec resume --last`; Grok uses `--single` and `-c`. Keep the same workspace
+and the CLI's session files to resume. Authentication and tool permissions
+come from the CLI configuration; the helper adds no approval-bypass flags.
+Codex requires a Git working directory unless you explicitly pass
+`extra_args=["--skip-git-repo-check"]`.
+
+Codex accepts `output_format="json"` or `"text"`. Grok also accepts `"plain"`
+(`"text"` aliases it), `"streaming-json"`, and `"streaming-messages-json"`.
+JSON is the default; plain output has no token/cost metadata. Streaming formats
+are parsed after command completion, not delivered as live callbacks.
+
+Usage normalization follows the CLI reports:
+
+- Codex input includes cache reads; the SDK splits those into `input_tokens`
+  (uncached) and `cache_read_tokens`. Output already includes reasoning.
+  The final completed agent message becomes `result.text`.
+- Grok's headless input already excludes cache reads. Its output includes
+  reasoning, so `reasoning_tokens` is not added again. Final spend overrides
+  per-response events; interrupted streams retain completed response usage.
+- Grok's reported `total_cost_usd` is parsed when available and complete.
+  Standard Codex events do not report dollar cost. Missing/incomplete LLM cost
+  stays `0` under the existing `Usage` contract; this means **unknown**, not
+  free. The SDK does not infer model pricing. `total_cost_usd` may therefore
+  include only estimated compute cost.
+- Raw events and session metadata remain in `result.raw`; inspect Grok's
+  `usage_is_incomplete` / `cost_is_partial` flags when present. stdout, stderr,
+  exit status, and any parsed usage are retained on failure.
+
 To run GLM through the [OpenCode harness](https://opencode.ai/docs/cli/#run):
 
 ```python
@@ -887,7 +957,7 @@ workspace defaults to the Git-ignored `examples/.sandbox_workdir/opencode_glm`
 directory and survives cleanup, so `--resume` works across invocations. Use
 `--workdir` to override it. Recreating a cloud sandbox does not retain its files.
 
-`run_agent(...)` runs Claude Code on a prompt and reports what the run cost.
+By default, `run_agent(...)` runs Claude Code on a prompt and reports what the run cost.
 It drives the CLI with JSON output under the hood, so it can return both the
 assistant's text answer and a `Usage` breakdown — LLM token counts and dollar
 cost (from Claude Code's own `total_cost_usd`), plus an estimate of the sandbox
@@ -912,8 +982,8 @@ with Sandbox("local", preset="claude-code") as sb:
 
 `sb.usage` is the running total across every `run_agent` call in the sandbox's
 lifetime (its compute component sums the agent-call durations, not idle time
-between calls). Pass extra CLI flags with `extra_args=[...]`. Claude Code and
-OpenCode are supported; token counts and `llm_cost_usd` reflect what the CLI's
+between calls). Pass extra CLI flags with `extra_args=[...]`. Token counts
+and `llm_cost_usd` reflect what the CLI's
 JSON output reports, so `llm_cost_usd` can be `0` under subscription auth that
 omits `total_cost_usd` (the token counts are still captured). The async
 `AsyncSandbox` exposes the same `run_agent(...)` / `usage`. This is distinct
@@ -944,12 +1014,14 @@ cold-start and execution time, then estimates cost with the same pricing data.
 ### Presets
 
 Presets are predefined sandbox configurations with setup commands that run after creation.
-The built-in presets are focused on agent CLIs: `codex`, `claude-code`, `claude-code-codex`, and `opencode`.
+The built-in presets are focused on agent CLIs: `codex`, `grok`, `claude-code`, `claude-code-codex`, and `opencode`.
 The npm-based setup commands require Node.js and `npm` in the execution environment when setup commands are used as a fallback.
 
 #### Prebuilt Preset Images
 
-Built-in presets have prebuilt OCI images published to GitHub Container Registry:
+The `codex`, `claude-code`, and `claude-code-codex` presets have prebuilt OCI
+images published to GitHub Container Registry. `grok` and `opencode` install at
+startup instead:
 
 ```text
 ghcr.io/bespokelabsai/sandbox/<preset>:v2
@@ -1011,6 +1083,7 @@ Built-in presets:
 | `claude-code` | `@anthropic-ai/claude-code` via npm | 2GB RAM, 30min timeout |
 | `claude-code-codex` | `@anthropic-ai/claude-code` and `@openai/codex` via npm | 2GB RAM, 30min timeout |
 | `codex` | `@openai/codex` via npm | 2GB RAM, 30min timeout |
+| `grok` | `@xai-official/grok` via npm (Node.js 20+) | 2GB RAM, 30min timeout |
 | `opencode` | `opencode-ai` via npm | 2GB RAM, 30min timeout |
 
 #### Non-interactive web access
