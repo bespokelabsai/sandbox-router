@@ -215,9 +215,94 @@ function historySection(label, items, render, empty) {
   return node("section", "history-section", node("p", "section-label", label), items.length ? node("div", "history-list", ...items.map(render)) : node("p", "empty-copy", empty));
 }
 
+function svgNode(tag, attributes = {}, text = null) {
+  const element = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, String(value));
+  if (text != null) element.textContent = text;
+  return element;
+}
+function resourceChart(title, samples, valueOf, unit, fixedMaximum = null) {
+  const valid = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+  const values = samples.map(valueOf);
+  const last = values.at(-1);
+  const label = valid(last) ? `${last.toFixed(1)} ${unit}` : "Unavailable";
+  const card = node("article", "resource-chart", node("div", "resource-chart-heading", node("h4", "", title), node("strong", "", label)));
+  const observed = values.filter(valid);
+  if (!observed.length) { card.append(node("p", "empty-copy", "No measurements available yet.")); return card; }
+  const maximum = fixedMaximum || Math.max(1, ...observed) * 1.1;
+  const start = new Date(samples[0].collected_at).getTime();
+  const end = new Date(samples.at(-1).collected_at).getTime();
+  const x = (timestamp) => end > start ? 42 + (timestamp - start) / (end - start) * 310 : 352;
+  const y = (value) => 126 - Math.min(value / maximum, 1) * 108;
+  const svg = svgNode("svg", { viewBox: "0 0 365 154", role: "img", "aria-label": `${title}: latest ${label}; gaps indicate unavailable data` });
+  svg.append(svgNode("title", {}, `${title} · latest ${label}`));
+  for (const value of [0, maximum / 2, maximum]) {
+    svg.append(svgNode("line", { x1: 42, x2: 352, y1: y(value), y2: y(value), class: "resource-gridline" }), svgNode("text", { x: 36, y: y(value) + 4, "text-anchor": "end", class: "resource-axis" }, value.toFixed(maximum < 10 ? 1 : 0)));
+  }
+  let segment = [], previousTime = null;
+  const flush = () => {
+    if (segment.length > 1) svg.append(svgNode("polyline", { points: segment.join(" "), class: "resource-line" }));
+    else if (segment.length) { const [cx, cy] = segment[0].split(","); svg.append(svgNode("circle", { cx, cy, r: 3, class: "resource-dot" })); }
+    segment = [];
+  };
+  samples.forEach((sample, index) => {
+    const timestamp = new Date(sample.collected_at).getTime();
+    if (!valid(values[index]) || (previousTime != null && timestamp - previousTime > 45000)) flush();
+    if (valid(values[index])) segment.push(`${x(timestamp)},${y(values[index])}`);
+    previousTime = timestamp;
+  });
+  flush();
+  const clock = (time) => new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date(time));
+  if (end > start) svg.append(svgNode("text", { x: 42, y: 148, class: "resource-axis" }, clock(start)));
+  svg.append(svgNode("text", { x: 352, y: 148, "text-anchor": "end", class: "resource-axis" }, clock(end)));
+  card.append(svg);
+  return card;
+}
+function resourceContent(data) {
+  const section = node("section", "history-section resource-section", node("p", "section-label", "Live resource usage · last hour"));
+  if (!data) { section.append(node("p", "empty-copy", "Resource metrics require usage access.")); return section; }
+  const samples = data.samples || [], latest = samples.at(-1);
+  const statuses = { available: "Live", partial: "Live · partial metrics", waiting: "Waiting for first sample", unavailable: "Unavailable", disabled: "Sampling disabled", stopped: "Stopped · historical samples", stale: "Stale · waiting for a fresh sample" };
+  section.append(node("p", "resource-status", `${statuses[data.status] || "Unavailable"}${latest ? ` · Last sample ${formatDateTime(latest.collected_at)}` : ""}`));
+  const cadence = data.interval_seconds === 0 ? "Sampling is disabled." : `Sampled every ${data.interval_seconds ?? 15}s when supported.`;
+  section.append(node("p", "agent-note", `${cadence} CPU is percent of cgroup capacity; RAM includes filesystem cache. Missing data is not zero.`));
+  const charts = node("div", "resource-charts",
+    resourceChart("CPU", samples, (sample) => sample.cpu_percent, "%", 100),
+    resourceChart("RAM", samples, (sample) => sample.memory_used_bytes == null ? null : sample.memory_used_bytes / 1073741824, "GiB"));
+  const devices = new Map();
+  for (const sample of [...samples].reverse()) for (const gpu of sample.gpus || []) if (devices.size < 16 && !devices.has(gpu.id)) devices.set(gpu.id, gpu.name);
+  if (!devices.size) charts.append(node("article", "resource-chart", node("h4", "", "GPU"), node("p", "empty-copy", "Unavailable · no supported NVIDIA device measurements.")));
+  for (const [id, name] of devices) {
+    const deviceLabel = devices.size > 1 ? `${name} (${shortId(id, 12)})` : name;
+    const gpuValue = (sample, field) => sample.gpus?.find((gpu) => gpu.id === id)?.[field] ?? null;
+    charts.append(resourceChart(`${deviceLabel} · GPU utilization`, samples, (sample) => gpuValue(sample, "utilization_percent"), "%", 100), resourceChart(`${deviceLabel} · GPU memory`, samples, (sample) => { const value = gpuValue(sample, "memory_used_bytes"); return value == null ? null : value / 1073741824; }, "GiB"));
+  }
+  section.append(charts);
+  if (latest?.memory_limit_bytes) section.append(node("p", "agent-note", `RAM limit: ${(latest.memory_limit_bytes / 1073741824).toFixed(1)} GiB${latest.cpu_capacity_cores ? ` · CPU capacity: ${latest.cpu_capacity_cores} cores` : ""}`));
+  if (devices.size) section.append(node("p", "agent-note", "GPU metrics describe visible devices and may include other workloads on a shared GPU; unsupported MIG counters remain unavailable."));
+  if (latest?.message && !["available", "stopped"].includes(data.status)) section.append(node("p", "agent-note", latest.message));
+  return section;
+}
+async function refreshResourceUsage() {
+  const id = state.selectedId;
+  const panel = elements.resourceUsage;
+  if (!id || !panel || !elements.detailDialog.open || !state.session?.can_view_usage) return;
+  try {
+    const data = await api(`/v1/sandboxes/${encodeURIComponent(id)}/resources`);
+    if (state.selectedId !== id || elements.resourceUsage !== panel || !elements.detailDialog.open) return;
+    const content = resourceContent(data); panel.replaceChildren(...content.childNodes);
+  } catch {
+    if (state.selectedId === id && elements.resourceUsage === panel) {
+      const status = panel.querySelector(".resource-status");
+      if (status) status.textContent = "Refresh failed · displayed samples may be stale";
+    }
+  }
+}
+
 function renderDetail(detail) {
   const sandbox = detail.sandbox; state.selectedId = sandbox.id; elements.detailTitle.textContent = sandbox.id; elements.detailLoading.hidden = true;
   const cost = detail.cost || {}; const canTerminate = state.session?.can_terminate && ["creating", "running", "failed"].includes(sandbox.status);
+  elements.resourceUsage = resourceContent(detail.resource_usage);
   const summaryItem = (label, value) => node("div", "", node("span", "", label), node("strong", "", value));
   const resource = node("strong", "", shortId(sandbox.provider_resource_id, 18));
   resource.title = sandbox.provider_resource_id || "";
@@ -238,6 +323,7 @@ function renderDetail(detail) {
         metric("Effective cost", formatCurrency(cost.effective_cost_usd || 0)),
         metric("Customer cost", formatCurrency(cost.customer_cost_usd || 0)),
         metric("State", cost.cost_state || sandbox.cost_state)))),
+    elements.resourceUsage,
     node("section", "history-section", node("p", "section-label", "Model usage · lifetime"), agentUsageContent(detail.agent_usage),
       detail.agent_runs?.length ? node("div", "history-list", ...detail.agent_runs.map(agentRunContent)) : null),
     historySection("Creation attempts", detail.attempts, (item) => node("article", "", node("div", "", node("strong", "", `Attempt ${item.attempt_number}`), node("span", "", `${item.status} · ${formatDateTime(item.started_at)}`)), errorBlock(item.error)), "No creation attempts recorded."),
@@ -256,7 +342,8 @@ function renderDetail(detail) {
 
 async function openDetail(id) {
   state.selectedId = id; elements.detailContent.replaceChildren(); elements.detailFooter.replaceChildren(); elements.detailLoading.hidden = false; if (!elements.detailDialog.open) elements.detailDialog.showModal();
-  try { renderDetail(await api(`/v1/sandboxes/${encodeURIComponent(id)}/detail`)); } catch (error) {
+  try { const detail = await api(`/v1/sandboxes/${encodeURIComponent(id)}/detail`); if (state.selectedId === id && elements.detailDialog.open) renderDetail(detail); } catch (error) {
+    if (state.selectedId !== id || !elements.detailDialog.open) return;
     elements.detailLoading.hidden = true;
     const message = node("div", "detail-error", error.message); message.setAttribute("role", "alert");
     elements.detailContent.replaceChildren(message);
@@ -294,7 +381,7 @@ async function loadDashboard() {
   } catch (error) {
     if (error.status === 401 || error.status === 403) { if (state.localMode) { sessionStorage.removeItem("bespoke_dashboard_api_key"); state.apiKey = ""; } state.authenticated = false; state.csrfToken = ""; setConnected(false); if (state.localMode || error.status === 403) showError("Authentication failed or this identity lacks dashboard access."); }
     else { showError(error.message || "Could not load dashboard data."); elements.updatedAt.textContent = "Refresh failed"; }
-  } finally { elements.refreshButton.disabled = false; }
+  } finally { elements.refreshButton.disabled = false; await refreshResourceUsage(); }
 }
 
 elements.keyForm.addEventListener("submit", async (event) => { event.preventDefault(); const value = elements.apiKey.value.trim(); if (!value) return; clearError(); try { if (state.localMode) { state.apiKey = value; sessionStorage.setItem("bespoke_dashboard_api_key", value); } else { const response = await fetch("/v1/dashboard/session", { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ api_key: value }) }); const payload = await response.json(); if (!response.ok) { const detail = payload?.detail; throw Object.assign(new Error(typeof detail === "string" ? detail : "Dashboard sign-in failed."), { status: response.status }); } state.csrfToken = payload.csrf_token; state.authenticated = true; } elements.apiKey.value = ""; await loadDashboard(); } catch (error) { showError(error.message || "Dashboard sign-in failed."); setConnected(false); } });

@@ -277,6 +277,35 @@ class Sandbox:
 
     # -- Core operations ---------------------------------------------------
 
+    def resource_usage(self) -> dict:
+        """Read sandbox-scoped counters without adding a billable execution.
+
+        Requires Linux cgroup v2 and python3; GPU readings require nvidia-smi.
+        Shared-host backends intentionally return unavailable measurements.
+        """
+        self._check_alive()
+        from bespokelabs.sandbox import _resource_probe
+
+        if self.backend_name not in {
+            "docker",
+            "modal",
+            "daytona",
+            "e2b",
+            "runpod",
+            "tensorlake",
+            "boxd",
+        }:
+            return {}
+        script = Path(_resource_probe.__file__).read_text()
+        result = self._session.execute_command("python3", ["-c", script])
+        if result.exit_code != 0 or len(result.stdout) > 65536:
+            return {}
+        try:
+            value = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
     @property
     def provider_resource_id(self) -> str | None:
         """Return the backend resource identifier when it exposes one."""

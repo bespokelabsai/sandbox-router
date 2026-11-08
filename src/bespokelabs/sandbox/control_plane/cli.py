@@ -67,6 +67,9 @@ def main() -> None:
         supervision_interval_secs=float(
             os.environ.get("BESPOKE_SUPERVISION_INTERVAL_SECS", "30")
         ),
+        resource_sampling_interval_secs=float(
+            os.environ.get("BESPOKE_RESOURCE_SAMPLING_INTERVAL_SECS", "15")
+        ),
     )
     app = create_app(
         control_plane,
