@@ -81,6 +81,14 @@ IMAGE_REGISTRY = "ghcr.io/bespokelabsai/sandbox"
 #     them (v1 images were slim-based and lacked git).
 PRESET_IMAGE_TAG = "v2"
 
+# Maritime sandboxes ship Node 18, older than the Claude Code npm package
+# needs, so Claude Code comes from its native installer.  The run user has
+# passwordless sudo, which global npm installs need.
+_MARITIME_CLAUDE_INSTALL = (
+    "set -o pipefail && curl -fsSL https://claude.ai/install.sh | bash && "
+    'sudo ln -sf "$HOME/.local/bin/claude" /usr/local/bin/claude'
+)
+
 
 def _tensorlake_npm_install(packages: str) -> str:
     return (
@@ -126,6 +134,7 @@ register_preset(
             ],
             "tensorlake": [_tensorlake_npm_install("opencode-ai")],
             "boxd": ["opencode --version"],
+            "maritime": ["sudo npm install -g opencode-ai"],
         },
         memory_mb=2048,
         timeout_secs=1800,
@@ -146,6 +155,7 @@ register_preset(
                 _tensorlake_npm_install("@anthropic-ai/claude-code"),
             ],
             "boxd": ["claude --version"],
+            "maritime": [_MARITIME_CLAUDE_INSTALL],
         },
         memory_mb=2048,
         timeout_secs=1800,
@@ -165,6 +175,7 @@ register_preset(
                 _tensorlake_npm_install("@openai/codex"),
             ],
             "boxd": ["codex --version"],
+            "maritime": ["sudo npm install -g @openai/codex"],
         },
         memory_mb=2048,
         timeout_secs=1800,
@@ -186,6 +197,10 @@ register_preset(
                 ),
             ],
             "boxd": ["claude --version", "codex --version"],
+            "maritime": [
+                _MARITIME_CLAUDE_INSTALL,
+                "sudo npm install -g @openai/codex",
+            ],
         },
         memory_mb=2048,
         timeout_secs=1800,
