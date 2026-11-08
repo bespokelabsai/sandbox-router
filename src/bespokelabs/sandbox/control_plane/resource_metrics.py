@@ -113,6 +113,8 @@ class ResourceMonitor:
         self._active = {}
         self._last = {}
         self._previous = {}
+        self._targets = []
+        self._targets_checked_at = None
 
     def start(self):
         if self.interval <= 0:
@@ -121,6 +123,7 @@ class ResourceMonitor:
             if self._thread and self._thread.is_alive():
                 return
             self._stop.clear()
+            self._targets_checked_at = None
             self._thread = threading.Thread(
                 target=self._loop, daemon=True, name="sandbox-resource-monitor"
             )
@@ -133,11 +136,19 @@ class ResourceMonitor:
 
     def tick(self):
         """Schedule due probes fairly and record timeouts without waiting."""
-        targets = self.targets()
         with self._lock:
             if self._stop.is_set():
                 return
             current = time.monotonic()
+            # Discover runtimes at sampling cadence, while checking timeouts
+            # and filling free worker slots on every one-second tick.
+            if (
+                self._targets_checked_at is None
+                or current - self._targets_checked_at >= self.interval
+            ):
+                self._targets = self.targets()
+                self._targets_checked_at = current
+            targets = self._targets
             ids = {record.id for record, _ in targets}
             self._last = {k: v for k, v in self._last.items() if k in ids}
             self._previous = {

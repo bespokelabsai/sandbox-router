@@ -232,7 +232,7 @@ function resourceChart(title, samples, valueOf, unit, fixedMaximum = null) {
   const maximum = fixedMaximum || Math.max(1, ...observed) * 1.1;
   const start = new Date(samples[0].collected_at).getTime();
   const end = new Date(samples.at(-1).collected_at).getTime();
-  const x = (timestamp) => 42 + (timestamp - start) / Math.max(15000, end - start) * 310;
+  const x = (timestamp) => end > start ? 42 + (timestamp - start) / (end - start) * 310 : 352;
   const y = (value) => 126 - Math.min(value / maximum, 1) * 108;
   const svg = svgNode("svg", { viewBox: "0 0 365 154", role: "img", "aria-label": `${title}: latest ${label}; gaps indicate unavailable data` });
   svg.append(svgNode("title", {}, `${title} · latest ${label}`));
@@ -253,7 +253,8 @@ function resourceChart(title, samples, valueOf, unit, fixedMaximum = null) {
   });
   flush();
   const clock = (time) => new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit", second: "2-digit" }).format(new Date(time));
-  svg.append(svgNode("text", { x: 42, y: 148, class: "resource-axis" }, clock(start)), svgNode("text", { x: 352, y: 148, "text-anchor": "end", class: "resource-axis" }, clock(end)));
+  if (end > start) svg.append(svgNode("text", { x: 42, y: 148, class: "resource-axis" }, clock(start)));
+  svg.append(svgNode("text", { x: 352, y: 148, "text-anchor": "end", class: "resource-axis" }, clock(end)));
   card.append(svg);
   return card;
 }
@@ -263,7 +264,8 @@ function resourceContent(data) {
   const samples = data.samples || [], latest = samples.at(-1);
   const statuses = { available: "Live", partial: "Live · partial metrics", waiting: "Waiting for first sample", unavailable: "Unavailable", disabled: "Sampling disabled", stopped: "Stopped · historical samples", stale: "Stale · waiting for a fresh sample" };
   section.append(node("p", "resource-status", `${statuses[data.status] || "Unavailable"}${latest ? ` · Last sample ${formatDateTime(latest.collected_at)}` : ""}`));
-  section.append(node("p", "agent-note", `Sampled every ${data.interval_seconds || 15}s when supported. CPU is percent of cgroup capacity; RAM includes filesystem cache. Missing data is not zero.`));
+  const cadence = data.interval_seconds === 0 ? "Sampling is disabled." : `Sampled every ${data.interval_seconds ?? 15}s when supported.`;
+  section.append(node("p", "agent-note", `${cadence} CPU is percent of cgroup capacity; RAM includes filesystem cache. Missing data is not zero.`));
   const charts = node("div", "resource-charts",
     resourceChart("CPU", samples, (sample) => sample.cpu_percent, "%", 100),
     resourceChart("RAM", samples, (sample) => sample.memory_used_bytes == null ? null : sample.memory_used_bytes / 1073741824, "GiB"));

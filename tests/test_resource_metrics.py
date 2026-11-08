@@ -22,6 +22,7 @@ from bespokelabs.sandbox.control_plane.resource_metrics import (
 )
 from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
+from bespokelabs.sandbox.exceptions import SandboxError
 from bespokelabs.sandbox.types import SandboxConfig, SandboxResult
 
 RAW = {
@@ -141,6 +142,19 @@ class ProbeTests(unittest.TestCase):
             self.assertIsNone(row["memory_used_bytes"])
             self.assertIsNone(row["gpus"][0]["utilization_percent"])
             json.dumps(row, allow_nan=False)
+
+    def test_resource_usage_after_destroy_never_calls_provider(self):
+        for backend in ("docker", "local"):
+            with self.subTest(backend=backend):
+                session = Mock()
+                runtime = Sandbox._from_session(
+                    backend, session, SandboxConfig(backend=backend)
+                )
+                runtime.destroy()
+                session.reset_mock()
+                with self.assertRaises(SandboxError):
+                    runtime.resource_usage()
+                session.execute_command.assert_not_called()
 
 
 class MetricsServiceTests(unittest.TestCase):
@@ -306,6 +320,27 @@ class MetricsServiceTests(unittest.TestCase):
 
 class MonitorTests(unittest.TestCase):
 
+    def test_target_discovery_uses_sampling_cadence(self):
+        for interval in (5, 15):
+            with self.subTest(interval=interval):
+                targets = Mock(return_value=[])
+                monitor = ResourceMonitor(
+                    targets,
+                    Mock(),
+                    lambda: datetime.now(UTC),
+                    interval=interval,
+                )
+                with patch(
+                    "bespokelabs.sandbox.control_plane.resource_metrics.time.monotonic"
+                ) as clock:
+                    for tick in range(interval):
+                        clock.return_value = tick
+                        monitor.tick()
+                    targets.assert_called_once()
+                    clock.return_value = interval
+                    monitor.tick()
+                    self.assertEqual(targets.call_count, 2)
+
     def test_timeout_has_bounded_workers_and_discards_late_results(self):
         release = threading.Event()
         entered = threading.Event()
@@ -321,8 +356,9 @@ class MonitorTests(unittest.TestCase):
             for i in range(6)
         ]
         saved = []
+        discover = Mock(return_value=targets)
         monitor = ResourceMonitor(
-            lambda: targets,
+            discover,
             lambda *args: saved.append(args),
             lambda: datetime.now(UTC),
         )
@@ -335,6 +371,7 @@ class MonitorTests(unittest.TestCase):
                     job["started"] -= 11
             monitor.tick()
             self.assertEqual(len(saved), 4)
+            discover.assert_called_once()
             self.assertTrue(
                 all(item[2]["status"] == "unavailable" for item in saved)
             )

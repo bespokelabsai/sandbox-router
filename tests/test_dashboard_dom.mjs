@@ -108,4 +108,26 @@ test("resource charts preserve zero, gaps, stale labels and safe GPU names", () 
   assert.equal(all(cpu).filter((element) => element.tag === "polyline").length, 0);
   context.data.samples = [];
   assert.match(vm.runInContext("resourceContent(data)", context).textContent, /No measurements/);
+  context.data.status = "disabled";
+  context.data.interval_seconds = 0;
+  const disabled = vm.runInContext("resourceContent(data)", context).textContent;
+  assert.match(disabled, /Sampling is disabled/);
+  assert.doesNotMatch(disabled, /Sampled every/);
+});
+
+test("short resource windows align observations with time labels", () => {
+  const { context } = dashboard();
+  const all = (element) => [element, ...element.children.filter((child) => child instanceof Element).flatMap(all)];
+  context.samples = [
+    { collected_at: "2026-11-08T00:00:00Z", cpu_percent: 50 },
+    { collected_at: "2026-11-08T00:00:05Z", cpu_percent: 75 },
+  ];
+  const chart = vm.runInContext('resourceChart("CPU", samples, (sample) => sample.cpu_percent, "%", 100)', context);
+  const line = all(chart).find((element) => element.tag === "polyline");
+  assert.equal(line.points.split(" ")[0].split(",")[0], "42");
+  assert.equal(line.points.split(" ").at(-1).split(",")[0], "352");
+  context.samples = [context.samples[0]];
+  const single = vm.runInContext('resourceChart("CPU", samples, (sample) => sample.cpu_percent, "%", 100)', context);
+  assert.equal(all(single).find((element) => element.tag === "circle").cx, "352");
+  assert.equal(all(single).filter((element) => element.tag === "text" && element.y === "148").length, 1);
 });

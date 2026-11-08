@@ -283,6 +283,7 @@ class Sandbox:
         Requires Linux cgroup v2 and python3; GPU readings require nvidia-smi.
         Shared-host backends intentionally return unavailable measurements.
         """
+        self._check_alive()
         from bespokelabs.sandbox import _resource_probe
 
         if self.backend_name not in {
