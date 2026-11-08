@@ -13,6 +13,10 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
+from bespokelabs.sandbox.control_plane.agent_usage import (
+    add_agent_usage,
+    empty_agent_summary,
+)
 from bespokelabs.sandbox.control_plane.errors import (
     AuthenticationError,
     ConflictError,
@@ -388,6 +392,20 @@ _MIGRATIONS = (
     (
         8,
         ("ALTER TABLE orphan_cleanups ADD COLUMN claim_id TEXT",),
+    ),
+    (
+        9,
+        (
+            "ALTER TABLE executions ADD COLUMN request_fingerprint TEXT",
+            """CREATE TABLE agent_usage (
+                execution_id TEXT PRIMARY KEY REFERENCES executions(id),
+                organization_id TEXT NOT NULL REFERENCES organizations(id),
+                sandbox_id TEXT NOT NULL REFERENCES sandboxes(id),
+                usage_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )""",
+            "CREATE INDEX agent_usage_org_created_idx ON agent_usage(organization_id, created_at)",
+        ),
     ),
 )
 
@@ -2039,7 +2057,12 @@ class SQLiteStore:
         }
 
     def begin_execution(
-        self, organization_id: str, sandbox_id: str, request_id: str
+        self,
+        organization_id: str,
+        sandbox_id: str,
+        request_id: str,
+        *,
+        request_fingerprint: str | None = None,
     ) -> tuple[str, dict | None]:
         execution_id = _id("exe")
         try:
@@ -2048,8 +2071,8 @@ class SQLiteStore:
                     """
                     INSERT INTO executions(
                         id, organization_id, sandbox_id, request_id, status,
-                        created_at
-                    ) VALUES (?, ?, ?, ?, 'running', ?)
+                        created_at, request_fingerprint
+                    ) VALUES (?, ?, ?, ?, 'running', ?, ?)
                     """,
                     (
                         execution_id,
@@ -2057,6 +2080,7 @@ class SQLiteStore:
                         sandbox_id,
                         request_id,
                         _now(),
+                        request_fingerprint,
                     ),
                 )
             return execution_id, None
@@ -2064,7 +2088,7 @@ class SQLiteStore:
             with self._connect() as connection:
                 row = connection.execute(
                     """
-                    SELECT id, status, response_json, error FROM executions
+                    SELECT id, status, response_json, error, request_fingerprint FROM executions
                     WHERE organization_id = ? AND sandbox_id = ?
                           AND request_id = ?
                     """,
@@ -2072,12 +2096,22 @@ class SQLiteStore:
                 ).fetchone()
             if row is None:
                 raise
+            if row["request_fingerprint"] != request_fingerprint:
+                raise ConflictError(
+                    "idempotency key was used for a different request"
+                ) from None
             if row["status"] == "completed":
                 return row["id"], json.loads(row["response_json"])
             detail = row["error"] or "execution is already in progress"
             raise ConflictError(detail) from None
 
-    def finish_execution(self, execution_id: str, response: dict) -> None:
+    def finish_execution(
+        self,
+        execution_id: str,
+        response: dict,
+        *,
+        agent_usage: dict | None = None,
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
@@ -2087,8 +2121,12 @@ class SQLiteStore:
                 """,
                 (json.dumps(response), _now(), execution_id),
             )
+            if agent_usage is not None:
+                self._insert_agent_usage(connection, execution_id, agent_usage)
 
-    def fail_execution(self, execution_id: str, error: str) -> None:
+    def fail_execution(
+        self, execution_id: str, error: str, *, agent_usage: dict | None = None
+    ) -> None:
         with self._connect() as connection:
             connection.execute(
                 """
@@ -2097,6 +2135,108 @@ class SQLiteStore:
                 """,
                 (error, _now(), execution_id),
             )
+            if agent_usage is not None:
+                self._insert_agent_usage(connection, execution_id, agent_usage)
+
+    def cached_agent_execution(
+        self,
+        organization_id: str,
+        sandbox_id: str,
+        request_id: str,
+        fingerprint: str,
+    ) -> dict | None:
+        """Replay completed agent requests even after runtime shutdown/restart."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT status, response_json, request_fingerprint FROM executions "
+                "WHERE organization_id=? AND sandbox_id=? AND request_id=?",
+                (organization_id, sandbox_id, request_id),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["request_fingerprint"] != fingerprint:
+            raise ConflictError(
+                "idempotency key was used for a different request"
+            ) from None
+        if row["status"] != "completed":
+            raise ConflictError(
+                "agent execution is in progress or previously failed"
+            )
+        return json.loads(row["response_json"])
+
+    @staticmethod
+    def _insert_agent_usage(connection, execution_id: str, usage: dict) -> None:
+        # Atomic with execution completion; one usage row per execution.
+        connection.execute(
+            """INSERT INTO agent_usage
+               SELECT id, organization_id, sandbox_id, ?, ? FROM executions WHERE id=?
+               ON CONFLICT(execution_id) DO NOTHING""",
+            (json.dumps(usage), _now(), execution_id),
+        )
+
+    def agent_runs(
+        self,
+        organization_id: str,
+        *,
+        sandbox_id: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> list[dict]:
+        """Read durable, tenant-scoped run usage; timestamps use [start, end)."""
+        start_at = _parse_time_bound(start, "start")
+        end_at = _parse_time_bound(end, "end")
+        if start_at is not None and end_at is not None and start_at >= end_at:
+            raise ValueError("start must be before end")
+        clauses = ["a.organization_id=?"]
+        params = [organization_id]
+        for clause, value in (
+            ("a.sandbox_id=?", sandbox_id),
+            ("a.created_at>=?", start_at.isoformat() if start_at else None),
+            ("a.created_at<?", end_at.isoformat() if end_at else None),
+        ):
+            if value is not None:
+                clauses.append(clause)
+                params.append(value)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT a.*, s.backend FROM agent_usage a "
+                "JOIN sandboxes s ON s.id=a.sandbox_id WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY a.created_at DESC, a.execution_id",
+                params,
+            ).fetchall()
+        return [
+            {
+                "execution_id": row["execution_id"],
+                "sandbox_id": row["sandbox_id"],
+                "backend": row["backend"],
+                "created_at": row["created_at"],
+                **json.loads(row["usage_json"]),
+            }
+            for row in rows
+        ]
+
+    def summarize_agent_usage(
+        self,
+        organization_id: str,
+        *,
+        group_by: str = "sandbox",
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, dict]:
+        if group_by not in {"sandbox", "backend", "day"}:
+            raise ValueError("group_by must be sandbox, backend, or day")
+        totals = {}
+        for run in self.agent_runs(organization_id, start=start, end=end):
+            key = (
+                run["sandbox_id"]
+                if group_by == "sandbox"
+                else run["backend"]
+                if group_by == "backend"
+                else run["created_at"][:10]
+            )
+            add_agent_usage(totals.setdefault(key, empty_agent_summary()), run)
+        return totals
 
     def record_runtime_usage(
         self,

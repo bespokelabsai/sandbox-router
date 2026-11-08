@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import (
     FastAPI,
@@ -114,6 +114,15 @@ class AlertConfigurationUpdate(BaseModel):
 class RetentionPolicyUpdate(BaseModel):
     operational_days: int = Field(default=90, ge=1, le=3650)
     audit_days: int = Field(default=365, ge=1, le=3650)
+
+
+class AgentRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    harness: Literal["claude-code", "opencode", "grok", "codex"] = "claude-code"
+    model: str | None = None
+    command: str | None = None
+    extra_args: list[str] | None = None
+    resume: bool = False
 
 
 class ExecuteRequest(BaseModel):
@@ -786,6 +795,21 @@ def create_app(
             language=body.language,
             command=body.command,
             args=body.args,
+            request_id=idempotency_key,
+        )
+
+    @app.post("/v1/sandboxes/{sandbox_id}/agent")
+    def run_agent(
+        sandbox_id: str,
+        body: AgentRequest,
+        authorization: Annotated[str | None, Header()] = None,
+        idempotency_key: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        principal = authenticate(authorization, "sandboxes:execute")
+        return control_plane.run_agent(
+            principal,
+            sandbox_id,
+            **body.model_dump(),
             request_id=idempotency_key,
         )
 

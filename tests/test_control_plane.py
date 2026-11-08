@@ -506,7 +506,7 @@ class SQLiteMigrationTest(unittest.TestCase):
 
             self.assertEqual(
                 versions,
-                [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             self.assertIsNone(alerts.budget_threshold_percent)
             self.assertTrue(alerts.provider_degradation_enabled)
@@ -577,7 +577,7 @@ class SQLiteMigrationTest(unittest.TestCase):
                 ).fetchall()
             self.assertEqual(
                 versions,
-                [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,)],
+                [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,)],
             )
             self.assertEqual(observation_table, ("provider_observations",))
             self.assertEqual(policy_table, ("organization_policies",))

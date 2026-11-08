@@ -43,6 +43,7 @@ from bespokelabs.sandbox.exceptions import (
 )
 from bespokelabs.sandbox.presets import SandboxPreset
 from bespokelabs.sandbox.remote import (
+    RemoteAgentRunResult,
     RemoteSandbox,
     RemoteSandboxClient,
     RemoteSandboxError,
@@ -77,6 +78,7 @@ __all__ = [
     "telemetry",
     "Sandbox",
     "SandboxClient",
+    "RemoteAgentRunResult",
     "RemoteSandbox",
     "RemoteSandboxClient",
     "RemoteSandboxError",

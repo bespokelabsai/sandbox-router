@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -13,6 +14,11 @@ from typing import Any, Protocol
 
 from bespokelabs.sandbox import pricing
 from bespokelabs.sandbox.backends import BACKENDS
+from bespokelabs.sandbox.control_plane.agent_usage import (
+    add_agent_usage,
+    agent_usage_record,
+    empty_agent_summary,
+)
 from bespokelabs.sandbox.control_plane.errors import (
     AuthorizationError,
     ConflictError,
@@ -31,7 +37,7 @@ from bespokelabs.sandbox.control_plane.reconciliation import ProviderReconciler
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import ErrorOutcome
 from bespokelabs.sandbox.sandbox import Sandbox
-from bespokelabs.sandbox.types import SandboxResult
+from bespokelabs.sandbox.types import AgentRunResult, SandboxResult
 
 _SANDBOX_CONFIG_FIELDS = {
     "preset",
@@ -69,6 +75,9 @@ class SandboxRuntime(Protocol):
     def execute_command(
         self, command: str, args: list[str] | None = None
     ) -> SandboxResult:
+        ...
+
+    def run_agent(self, prompt: str, **kwargs: Any) -> AgentRunResult:
         ...
 
     def estimate_compute_cost(self, elapsed_secs: float) -> float:
@@ -358,6 +367,119 @@ class ControlPlane:
                 raise
             raise provider_error from exc
 
+    def run_agent(
+        self,
+        principal: Principal,
+        sandbox_id: str,
+        *,
+        prompt: str,
+        harness: str = "claude-code",
+        model: str | None = None,
+        command: str | None = None,
+        extra_args: list[str] | None = None,
+        resume: bool = False,
+        request_id: str | None = None,
+    ) -> dict:
+        """Execute a hosted agent and persist usage once per idempotency key."""
+        self.require(principal, "sandboxes:execute")
+        if harness not in {"claude-code", "opencode", "grok", "codex"}:
+            raise ValueError("unsupported agent harness")
+        record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        options = {
+            "harness": harness,
+            "model": model,
+            "command": command,
+            "extra_args": extra_args,
+            "resume": resume,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"operation": "agent", "prompt": prompt, **options},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        cached = self.store.cached_agent_execution(
+            principal.organization_id,
+            sandbox_id,
+            request_id,
+            fingerprint,
+        )
+        if cached is not None:
+            return cached
+        if record.status != "running":
+            raise ConflictError(f"sandbox is {record.status}")
+        with self._lock:
+            runtime = self._runtimes.get(sandbox_id)
+        if runtime is None:
+            raise ConflictError(
+                "sandbox runtime is unavailable after a control-plane restart"
+            )
+        execution_id, cached = self.store.begin_execution(
+            principal.organization_id,
+            sandbox_id,
+            request_id,
+            request_fingerprint=fingerprint,
+        )
+        if cached is not None:
+            return cached
+        started = time.monotonic()
+        agent_usage = agent_usage_record(
+            AgentRunResult(), harness=harness, model=model
+        )
+        try:
+            result = runtime.run_agent(prompt, **options)
+            elapsed = time.monotonic() - started
+            agent_usage = agent_usage_record(
+                result,
+                harness=harness,
+                model=model,
+                extra_args=extra_args,
+            )
+            runtime_usage = self._record_usage(
+                principal,
+                record,
+                runtime,
+                execution_id,
+                request_id,
+                elapsed,
+            )
+            response = {
+                "request_id": request_id,
+                "text": result.text,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "exit_code": result.exit_code,
+                "usage": runtime_usage,
+                "agent_usage": agent_usage,
+            }
+            self.store.finish_execution(
+                execution_id, response, agent_usage=agent_usage
+            )
+            return response
+        except Exception as exc:
+            self._record_usage(
+                principal,
+                record,
+                runtime,
+                execution_id,
+                request_id,
+                time.monotonic() - started,
+            )
+            provider_error = normalize_provider_error(
+                exc, backend=record.backend, op="execute"
+            )
+            self.store.fail_execution(
+                execution_id,
+                json.dumps(
+                    provider_error_payload(provider_error), sort_keys=True
+                ),
+                agent_usage=agent_usage,
+            )
+            if provider_error is exc:
+                raise
+            raise provider_error from exc
+
     def destroy_sandbox(
         self,
         principal: Principal,
@@ -430,7 +552,23 @@ class ControlPlane:
     def sandbox_detail(self, principal: Principal, sandbox_id: str) -> dict:
         self.require(principal, "sandboxes:read")
         self._accrue_active(principal)
-        return self.store.sandbox_detail(principal.organization_id, sandbox_id)
+        detail = self.store.sandbox_detail(
+            principal.organization_id, sandbox_id
+        )
+        if principal.allows("usage:read"):
+            runs = self.store.agent_runs(
+                principal.organization_id, sandbox_id=sandbox_id
+            )
+            summary = empty_agent_summary()
+            for run in runs:
+                add_agent_usage(summary, run)
+            detail.update(agent_usage=summary, agent_runs=runs)
+        else:
+            detail.update(agent_usage=None, agent_runs=[])
+            for execution in detail["executions"]:
+                if execution["response"]:
+                    execution["response"].pop("agent_usage", None)
+        return detail
 
     def get_policy(self, principal: Principal) -> OrganizationPolicy:
         self.require(principal, "policies:read")
@@ -708,7 +846,7 @@ class ControlPlane:
         group_by: str = "sandbox",
         start: str | None = None,
         end: str | None = None,
-    ) -> list[dict[str, str]]:
+    ) -> list[dict]:
         self.require(principal, "usage:read")
         self._accrue_active(principal)
         summaries = self.store.summarize_costs(
@@ -717,14 +855,37 @@ class ControlPlane:
             start=start,
             end=end,
         )
-        return [
-            {
+        agent_totals = self.store.summarize_agent_usage(
+            principal.organization_id,
+            group_by=group_by,
+            start=start,
+            end=end,
+        )
+        items = {
+            item.key: {
                 "key": item.key,
                 "runtime_seconds": str(item.runtime_seconds),
                 "provider_cost_usd": str(item.provider_cost_usd),
                 "customer_cost_usd": str(item.customer_cost_usd),
             }
             for item in summaries
+        }
+        for key in agent_totals:
+            items.setdefault(
+                key,
+                {
+                    "key": key,
+                    "runtime_seconds": "0",
+                    "provider_cost_usd": "0",
+                    "customer_cost_usd": "0",
+                },
+            )
+        return [
+            {
+                **items[key],
+                "agent_usage": agent_totals.get(key, empty_agent_summary()),
+            }
+            for key in sorted(items)
         ]
 
     def reconcile(self, principal: Principal, backend: str) -> dict:

@@ -46,6 +46,14 @@ class RemoteSandboxResult(SandboxResult):
     usage: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass
+class RemoteAgentRunResult(RemoteSandboxResult):
+    """Hosted agent output with separate, labeled LLM usage and cost."""
+
+    text: str = ""
+    agent_usage: dict[str, Any] = field(default_factory=dict)
+
+
 class RemoteSandboxClient:
     """Client for the hosted, multi-provider sandbox control plane.
 
@@ -201,6 +209,51 @@ class RemoteSandbox:
     ) -> RemoteSandboxResult:
         return self._execute(
             {"command": command, "args": args}, idempotency_key
+        )
+
+    def run_agent(
+        self,
+        prompt: str,
+        *,
+        harness: str = "claude-code",
+        model: str | None = None,
+        command: str | None = None,
+        extra_args: list[str] | None = None,
+        resume: bool = False,
+        idempotency_key: str | None = None,
+    ) -> RemoteAgentRunResult:
+        """Run a hosted agent and persist its usage for the dashboard.
+
+        Returns text/stdout/stderr/exit_code, compute ``usage``, and separate
+        ``agent_usage`` with token counts and nullable, labeled model cost.
+        JSON output is required for metering. Reuse an idempotency key to
+        retrieve the same result without running or billing twice.
+        """
+        if self._destroyed:
+            raise RemoteSandboxError("sandbox has been destroyed")
+        result = self._client._request(
+            "POST",
+            f"/v1/sandboxes/{self.id}/agent",
+            {
+                "prompt": prompt,
+                "harness": harness,
+                "model": model,
+                "command": command,
+                "extra_args": extra_args,
+                "resume": resume,
+            },
+            idempotency_key=idempotency_key
+            if idempotency_key is not None
+            else f"req_{uuid.uuid4().hex}",
+        )
+        return RemoteAgentRunResult(
+            text=result["text"],
+            stdout=result["stdout"],
+            stderr=result["stderr"],
+            exit_code=result["exit_code"],
+            request_id=result["request_id"],
+            usage=result["usage"],
+            agent_usage=result["agent_usage"],
         )
 
     def destroy(self) -> None:

@@ -851,6 +851,58 @@ install tools but do not supply agent credentials.
 
 ### Token usage & cost
 
+The hosted dashboard shows model usage separately from sandbox compute:
+input/output/cache token counts, reported model cost, and labeled Codex
+estimates. The overview follows the selected spend period; sandbox details
+show lifetime totals and individual runs, including unavailable/partial usage.
+
+To collect this data, run agents through `RemoteSandbox.run_agent` (or
+`POST /v1/sandboxes/{id}/agent`):
+
+```python
+import os
+from bespokelabs.sandbox import RemoteSandboxClient
+
+client = RemoteSandboxClient(
+    "https://sandbox.example.com", os.environ["BESPOKE_API_KEY"],
+    timeout_secs=1800,
+)
+with client.create(
+    "docker", preset="codex",
+    env_vars={"CODEX_API_KEY": os.environ["CODEX_API_KEY"]},
+) as sb:
+    result = sb.run_agent(
+        "Explain the current workspace.", harness="codex",
+        model="gpt-5.3-codex", extra_args=["--skip-git-repo-check"],
+        idempotency_key="workspace-review-1",
+    )
+    print(result.text)
+    print(result.agent_usage)  # tokens, cost_usd, cost_state, pricing provenance
+    print(result.usage)        # separate sandbox compute metering
+```
+
+Use `harness="grok"` with the `grok` preset and `XAI_API_KEY` to record
+Grok's reported spend. JSON output is selected automatically. Hosted runs
+are persisted once per idempotency key; repeating the same request returns
+its saved response. A changed request with the same key is rejected.
+The API requires `sandboxes:execute`; viewing model usage requires
+`usage:read`. The database migration runs automatically at server startup.
+
+Codex estimates multiply uncached input, cache reads, and output by bundled
+[standard short-context API rates](https://developers.openai.com/api/docs/pricing),
+verified November 7, 2026. Supported explicit model IDs are `gpt-5.3-codex`,
+`gpt-6-astra`, `gpt-6.1-sol`, `gpt-6.1-terra`, and `gpt-6-luna`.
+Each run stores its rates and source date, so future price changes do not
+rewrite history. These estimates exclude fast/long-context premiums, tool
+charges, regional charges, and subscription billing. Unknown/default models,
+model/provider overrides in `extra_args`, and missing/incomplete usage show
+**Unavailable**, never a fabricated zero-dollar estimate.
+
+Model costs are observational: they are not added to compute billing,
+customer markup, compute budget guardrails, or existing compute CSV exports.
+Direct `Sandbox.run_agent` calls and raw shell commands are not uploaded to
+the control plane; earlier runs cannot be backfilled automatically.
+
 `run_agent` supports `harness="claude-code"` (default), `"opencode"`,
 `"grok"`, and `"codex"`. Select the installation preset and runtime harness
 separately. The sync and async clients expose the same options.
@@ -915,7 +967,7 @@ Usage normalization follows the CLI reports:
 - Grok's reported `total_cost_usd` is parsed when available and complete.
   Standard Codex events do not report dollar cost. Missing/incomplete LLM cost
   stays `0` under the existing `Usage` contract; this means **unknown**, not
-  free. The SDK does not infer model pricing. `total_cost_usd` may therefore
+  free. The direct SDK does not infer model pricing. `total_cost_usd` may therefore
   include only estimated compute cost.
 - Raw events and session metadata remain in `result.raw`; inspect Grok's
   `usage_is_incomplete` / `cost_is_partial` flags when present. stdout, stderr,
