@@ -125,6 +125,12 @@ def agent_usage_record(
     )
     sources = [raw, *(e for e in events if isinstance(e, dict))]
     incomplete = any(s.get("usage_is_incomplete") for s in sources)
+    if harness == "opencode":
+        incomplete = (
+            incomplete
+            or result.exit_code != 0
+            or any(e.get("type") == "error" for e in events)
+        )
     partial_cost = any(s.get("cost_is_partial") for s in sources)
     known = _has_tokens(raw, harness)
     if events and known:

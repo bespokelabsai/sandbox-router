@@ -225,7 +225,8 @@ class RemoteSandbox:
         """Run a hosted agent and persist its usage for the dashboard.
 
         Returns text/stdout/stderr/exit_code, compute ``usage``, and separate
-        ``agent_usage`` with token counts and nullable, labeled model cost.
+        ``agent_usage`` with token counts and nullable, labeled model cost
+        (empty without the ``usage:read`` scope).
         JSON output is required for metering. Reuse an idempotency key to
         retrieve the same result without running or billing twice.
         """
@@ -253,7 +254,7 @@ class RemoteSandbox:
             exit_code=result["exit_code"],
             request_id=result["request_id"],
             usage=result["usage"],
-            agent_usage=result["agent_usage"],
+            agent_usage=result.get("agent_usage", {}),
         )
 
     def destroy(self) -> None:

@@ -68,27 +68,51 @@ function agentCostSummary(usage) {
   if (usage.unknown_cost_runs) parts.push(`${formatTokens(usage.unknown_cost_runs)} cost unavailable`);
   return parts.join(" · ");
 }
+// Append strings as text nodes; API values must never be parsed as markup.
+function node(tag, className = "", ...children) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.append(...children.filter((child) => child != null));
+  return element;
+}
 function agentUsageContent(usage) {
-  if (!usage) return '<p class="empty-copy">Model usage requires usage access.</p>';
-  if (!usage.runs) return '<p class="empty-copy">No agent runs recorded for this period.</p>';
+  if (!usage) return node("p", "empty-copy", "Model usage requires usage access.");
+  if (!usage.runs) return node("p", "empty-copy", "No agent runs recorded for this period.");
   const tokensKnown = usage.runs > usage.unknown_usage_runs;
-  const metric = (label, value) => `<div><dt>${label}</dt><dd>${value}</dd></div>`;
-  return `<dl class="agent-metrics">${metric("Total tokens", tokensKnown ? formatTokens(usage.total_tokens) : "Unavailable")}${metric("Input (uncached)", tokensKnown ? formatTokens(usage.input_tokens) : "—")}${metric("Output (incl. reasoning)", tokensKnown ? formatTokens(usage.output_tokens) : "—")}${metric("Cache reads / writes", tokensKnown ? `${formatTokens(usage.cache_read_tokens)} / ${formatTokens(usage.cache_creation_tokens)}` : "—")}${metric("Reported model cost", usage.reported_cost_runs ? formatCurrency(usage.reported_cost_usd) : "—")}${metric("Estimated model cost", usage.estimated_cost_runs ? formatCurrency(usage.estimated_cost_usd) : "—")}</dl>
-    <p class="agent-note">${formatTokens(usage.runs)} agent runs${usage.unknown_usage_runs ? ` · ${formatTokens(usage.unknown_usage_runs)} with unavailable token counts` : ""}${usage.incomplete_usage_runs ? ` · ${formatTokens(usage.incomplete_usage_runs)} with partial token counts` : ""}${usage.unknown_cost_runs ? ` · ${formatTokens(usage.unknown_cost_runs)} with unavailable cost` : ""}. Totals include recorded usage only.</p>
-    ${usage.estimated_cost_runs ? '<p class="agent-note">Codex estimates use standard short-context API rates. They are not subscription charges or invoices, and exclude premiums, tools, and regional charges.</p>' : ""}`;
+  const metric = (label, value) => node("div", "", node("dt", "", label), node("dd", "", value));
+  const content = document.createDocumentFragment();
+  content.append(node("dl", "agent-metrics",
+    metric("Total tokens", tokensKnown ? formatTokens(usage.total_tokens) : "Unavailable"),
+    metric("Input (uncached)", tokensKnown ? formatTokens(usage.input_tokens) : "—"),
+    metric("Output (incl. reasoning)", tokensKnown ? formatTokens(usage.output_tokens) : "—"),
+    metric("Cache reads / writes", tokensKnown ? `${formatTokens(usage.cache_read_tokens)} / ${formatTokens(usage.cache_creation_tokens)}` : "—"),
+    metric("Reported model cost", usage.reported_cost_runs ? formatCurrency(usage.reported_cost_usd) : "—"),
+    metric("Estimated model cost", usage.estimated_cost_runs ? formatCurrency(usage.estimated_cost_usd) : "—")),
+  node("p", "agent-note", `${formatTokens(usage.runs)} agent runs${usage.unknown_usage_runs ? ` · ${formatTokens(usage.unknown_usage_runs)} with unavailable token counts` : ""}${usage.incomplete_usage_runs ? ` · ${formatTokens(usage.incomplete_usage_runs)} with partial token counts` : ""}${usage.unknown_cost_runs ? ` · ${formatTokens(usage.unknown_cost_runs)} with unavailable cost` : ""}. Totals include recorded usage only.`));
+  if (usage.estimated_cost_runs) content.append(node("p", "agent-note", "Codex estimates use standard short-context API rates. They are not subscription charges or invoices, and exclude premiums, tools, and regional charges."));
+  return content;
 }
 function renderAgentOverview(items) {
-  if (!state.session?.can_view_usage) { elements.agentUsageSummary.innerHTML = agentUsageContent(null); return; }
+  if (!state.session?.can_view_usage) { elements.agentUsageSummary.replaceChildren(agentUsageContent(null)); return; }
   const total = {};
   for (const item of items) for (const [key, value] of Object.entries(item.agent_usage || {})) total[key] = (total[key] || 0) + Number(value || 0);
-  elements.agentUsageSummary.innerHTML = agentUsageContent(total);
+  elements.agentUsageSummary.replaceChildren(agentUsageContent(total));
 }
 function agentRunContent(run) {
   const label = run.cost_state === "estimated" ? "Codex estimate" : run.cost_state === "reported" ? "Reported cost" : "Cost unavailable";
   const price = run.cost_usd == null ? "" : ` · ${formatCurrency(run.cost_usd)}`;
   const tokens = run.tokens_known ? `${formatTokens(run.total_tokens)} tokens${run.usage_is_incomplete ? " (partial)" : ""}` : "Tokens unavailable";
   const rates = run.rates_per_million;
-  return `<article class="agent-run"><div><strong>${escapeHtml(run.harness)} · ${escapeHtml(run.model || "Default model")}</strong><span>${formatDateTime(run.created_at)} · ${tokens}</span></div><span class="state-label ${run.cost_state === "estimated" ? "pending" : ""}">${label}${price}</span>${run.cost_reason ? `<p class="agent-note">${escapeHtml(run.cost_reason)}</p>` : ""}${rates ? `<p class="agent-note">Rates per 1M tokens: input $${escapeHtml(rates.input)}, cached input $${escapeHtml(rates.cached_input)}, output $${escapeHtml(rates.output)} · As of ${escapeHtml(run.pricing_as_of)} · <a href="https://developers.openai.com/api/docs/pricing" target="_blank" rel="noopener noreferrer">OpenAI pricing</a></p>` : ""}</article>`;
+  const article = node("article", "agent-run",
+    node("div", "", node("strong", "", `${run.harness} · ${run.model || "Default model"}`), node("span", "", `${formatDateTime(run.created_at)} · ${tokens}`)),
+    node("span", run.cost_state === "estimated" ? "state-label pending" : "state-label", `${label}${price}`));
+  if (run.cost_reason) article.append(node("p", "agent-note", run.cost_reason));
+  if (rates) {
+    const link = node("a", "", "OpenAI pricing");
+    link.href = "https://developers.openai.com/api/docs/pricing"; link.target = "_blank"; link.rel = "noopener noreferrer";
+    article.append(node("p", "agent-note", `Rates per 1M tokens: input $${rates.input}, cached input $${rates.cached_input}, output $${rates.output} · As of ${run.pricing_as_of} · `, link));
+  }
+  return article;
 }
 
 function renderOverview() {
@@ -181,26 +205,62 @@ function renderProviders(items) {
   elements.providerList.innerHTML = [...items].sort((a, b) => Number(b.customer_cost_usd) - Number(a.customer_cost_usd)).map((item) => { const value = Number(item.customer_cost_usd); return `<div class="provider-row"><div class="provider-meta"><span class="provider-name"><span class="provider-swatch"></span>${escapeHtml(item.key)}</span><span class="provider-value">${formatCurrency(value)} · ${formatDuration(item.runtime_seconds)}</span></div><progress class="provider-track" aria-label="${escapeHtml(item.key)} share of spend" max="100" value="${Math.max(value / maximum * 100, 1).toFixed(2)}"></progress></div>`; }).join("");
 }
 
-function timelineItem(label, value) { return `<li class="${value ? "complete" : ""}"><span class="timeline-dot"></span><div><strong>${escapeHtml(label)}</strong><span>${escapeHtml(formatDateTime(value))}</span></div></li>`; }
-function errorBlock(error) { if (!error) return ""; return `<div class="error-block"><strong>${escapeHtml(error.code || "Operation failed")}</strong><p>${escapeHtml(error.message || "Sandbox operation failed.")}</p></div>`; }
+function timelineItem(label, value) {
+  return node("li", value ? "complete" : "", node("span", "timeline-dot"), node("div", "", node("strong", "", label), node("span", "", formatDateTime(value))));
+}
+function errorBlock(error) {
+  return error ? node("div", "error-block", node("strong", "", error.code || "Operation failed"), node("p", "", error.message || "Sandbox operation failed.")) : null;
+}
+function historySection(label, items, render, empty) {
+  return node("section", "history-section", node("p", "section-label", label), items.length ? node("div", "history-list", ...items.map(render)) : node("p", "empty-copy", empty));
+}
 
 function renderDetail(detail) {
   const sandbox = detail.sandbox; state.selectedId = sandbox.id; elements.detailTitle.textContent = sandbox.id; elements.detailLoading.hidden = true;
   const cost = detail.cost || {}; const canTerminate = state.session?.can_terminate && ["creating", "running", "failed"].includes(sandbox.status);
-  elements.detailContent.innerHTML = `<div class="detail-summary"><div><span>Status</span><strong><span class="status-pill ${escapeHtml(sandbox.status)}">${escapeHtml(sandbox.status)}</span></strong></div><div><span>Provider</span><strong>${escapeHtml(sandbox.backend)}</strong></div><div><span>Resource</span><strong title="${escapeHtml(sandbox.provider_resource_id || "")}">${escapeHtml(shortId(sandbox.provider_resource_id, 18))}</strong></div><div><span>Creator key</span><strong>${escapeHtml(sandbox.creator_api_key_name || shortId(sandbox.creator_api_key_id))}</strong></div></div>
-    ${errorBlock(sandbox.latest_error)}
-    <div class="detail-grid"><section><p class="section-label">Lifecycle timeline</p><ol class="timeline">${timelineItem("Requested", sandbox.requested_at)}${timelineItem("Provisioning", sandbox.provisioning_at)}${timelineItem("Running", sandbox.running_at)}${timelineItem("Stopping", sandbox.stopping_at)}${timelineItem("Terminated", sandbox.terminated_at)}${timelineItem("Failed", sandbox.failed_at)}</ol></section>
-    <section><p class="section-label">Compute cost breakdown</p><dl class="cost-list"><div><dt>Billable runtime</dt><dd>${formatDuration(cost.billable_seconds || 0)}</dd></div><div><dt>Estimated</dt><dd>${formatCurrency(cost.estimated_cost_usd || 0)}</dd></div><div><dt>Provider reported</dt><dd>${cost.provider_reported_cost_usd == null ? "—" : formatCurrency(cost.provider_reported_cost_usd)}</dd></div><div><dt>Effective cost</dt><dd>${formatCurrency(cost.effective_cost_usd || 0)}</dd></div><div><dt>Customer cost</dt><dd>${formatCurrency(cost.customer_cost_usd || 0)}</dd></div><div><dt>State</dt><dd>${escapeHtml(cost.cost_state || sandbox.cost_state)}</dd></div></dl></section></div>
-    <section class="history-section"><p class="section-label">Model usage · lifetime</p>${agentUsageContent(detail.agent_usage)}${detail.agent_runs?.length ? `<div class="history-list">${detail.agent_runs.map(agentRunContent).join("")}</div>` : ""}</section>
-    <section class="history-section"><p class="section-label">Creation attempts</p>${detail.attempts.length ? `<div class="history-list">${detail.attempts.map((item) => `<article><div><strong>Attempt ${item.attempt_number}</strong><span>${escapeHtml(item.status)} · ${formatDateTime(item.started_at)}</span></div>${errorBlock(item.error)}</article>`).join("")}</div>` : '<p class="empty-copy">No creation attempts recorded.</p>'}</section>
-    <section class="history-section"><p class="section-label">Executions</p>${detail.executions.length ? `<div class="history-list">${detail.executions.map((item) => `<article><div><strong>${escapeHtml(shortId(item.request_id, 18))}</strong><span>${escapeHtml(item.status)} · ${formatDateTime(item.created_at)}</span></div>${item.response ? `<code>exit ${escapeHtml(item.response.exit_code ?? 0)} · ${escapeHtml(shortId(item.response.stdout || "No output", 80))}</code>` : ""}${errorBlock(item.error)}</article>`).join("")}</div>` : '<p class="empty-copy">No executions recorded.</p>'}</section>
-    <section class="history-section"><p class="section-label">Provider observations</p>${detail.provider_observations.length ? `<div class="history-list">${detail.provider_observations.map((item) => `<article><div><strong>${escapeHtml(item.missing ? "Provider resource missing" : item.status)}</strong><span>${formatDateTime(item.observed_at)}${item.provider_cost_usd == null ? "" : ` · ${formatCurrency(item.provider_cost_usd)}`}</span></div></article>`).join("")}</div>` : '<p class="empty-copy">No provider observations recorded.</p>'}</section>`;
-  elements.detailFooter.innerHTML = `<span>Revision ${sandbox.version}</span>${canTerminate ? `<button class="button danger terminate" type="button" data-id="${escapeHtml(sandbox.id)}" data-version="${sandbox.version}">Terminate sandbox</button>` : '<span class="read-only-label">Read-only access</span>'}`;
+  const summaryItem = (label, value) => node("div", "", node("span", "", label), node("strong", "", value));
+  const resource = node("strong", "", shortId(sandbox.provider_resource_id, 18));
+  resource.title = sandbox.provider_resource_id || "";
+  const metric = (label, value) => node("div", "", node("dt", "", label), node("dd", "", value));
+  elements.detailContent.replaceChildren(
+    node("div", "detail-summary",
+      summaryItem("Status", node("span", `status-pill ${sandbox.status}`, sandbox.status)),
+      summaryItem("Provider", sandbox.backend),
+      node("div", "", node("span", "", "Resource"), resource),
+      summaryItem("Creator key", sandbox.creator_api_key_name || shortId(sandbox.creator_api_key_id))),
+    node("div", "detail-grid",
+      node("section", "", node("p", "section-label", "Lifecycle timeline"), node("ol", "timeline",
+        timelineItem("Requested", sandbox.requested_at), timelineItem("Provisioning", sandbox.provisioning_at), timelineItem("Running", sandbox.running_at), timelineItem("Stopping", sandbox.stopping_at), timelineItem("Terminated", sandbox.terminated_at), timelineItem("Failed", sandbox.failed_at))),
+      node("section", "", node("p", "section-label", "Compute cost breakdown"), node("dl", "cost-list",
+        metric("Billable runtime", formatDuration(cost.billable_seconds || 0)),
+        metric("Estimated", formatCurrency(cost.estimated_cost_usd || 0)),
+        metric("Provider reported", cost.provider_reported_cost_usd == null ? "—" : formatCurrency(cost.provider_reported_cost_usd)),
+        metric("Effective cost", formatCurrency(cost.effective_cost_usd || 0)),
+        metric("Customer cost", formatCurrency(cost.customer_cost_usd || 0)),
+        metric("State", cost.cost_state || sandbox.cost_state)))),
+    node("section", "history-section", node("p", "section-label", "Model usage · lifetime"), agentUsageContent(detail.agent_usage),
+      detail.agent_runs?.length ? node("div", "history-list", ...detail.agent_runs.map(agentRunContent)) : null),
+    historySection("Creation attempts", detail.attempts, (item) => node("article", "", node("div", "", node("strong", "", `Attempt ${item.attempt_number}`), node("span", "", `${item.status} · ${formatDateTime(item.started_at)}`)), errorBlock(item.error)), "No creation attempts recorded."),
+    historySection("Executions", detail.executions, (item) => node("article", "", node("div", "", node("strong", "", shortId(item.request_id, 18)), node("span", "", `${item.status} · ${formatDateTime(item.created_at)}`)),
+      item.response ? node("code", "", `exit ${item.response.exit_code ?? 0} · ${shortId(item.response.stdout || "No output", 80)}`) : null, errorBlock(item.error)), "No executions recorded."),
+    historySection("Provider observations", detail.provider_observations, (item) => node("article", "", node("div", "", node("strong", "", item.missing ? "Provider resource missing" : item.status), node("span", "", `${formatDateTime(item.observed_at)}${item.provider_cost_usd == null ? "" : ` · ${formatCurrency(item.provider_cost_usd)}`}`))), "No provider observations recorded."));
+  const error = errorBlock(sandbox.latest_error);
+  if (error) elements.detailContent.insertBefore(error, elements.detailContent.children[1]);
+  elements.detailFooter.replaceChildren(node("span", "", `Revision ${sandbox.version}`));
+  if (canTerminate) {
+    const button = node("button", "button danger terminate", "Terminate sandbox");
+    button.type = "button"; button.dataset.id = sandbox.id; button.dataset.version = String(sandbox.version);
+    elements.detailFooter.append(button);
+  } else elements.detailFooter.append(node("span", "read-only-label", "Read-only access"));
 }
 
 async function openDetail(id) {
-  state.selectedId = id; elements.detailContent.innerHTML = ""; elements.detailFooter.innerHTML = ""; elements.detailLoading.hidden = false; if (!elements.detailDialog.open) elements.detailDialog.showModal();
-  try { renderDetail(await api(`/v1/sandboxes/${encodeURIComponent(id)}/detail`)); } catch (error) { elements.detailLoading.hidden = true; elements.detailContent.innerHTML = `<div class="detail-error" role="alert">${escapeHtml(error.message)}</div>`; }
+  state.selectedId = id; elements.detailContent.replaceChildren(); elements.detailFooter.replaceChildren(); elements.detailLoading.hidden = false; if (!elements.detailDialog.open) elements.detailDialog.showModal();
+  try { renderDetail(await api(`/v1/sandboxes/${encodeURIComponent(id)}/detail`)); } catch (error) {
+    elements.detailLoading.hidden = true;
+    const message = node("div", "detail-error", error.message); message.setAttribute("role", "alert");
+    elements.detailContent.replaceChildren(message);
+  }
 }
 
 function requestTermination(id, version) {

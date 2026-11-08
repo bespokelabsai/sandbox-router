@@ -885,8 +885,15 @@ Use `harness="grok"` with the `grok` preset and `XAI_API_KEY` to record
 Grok's reported spend. JSON output is selected automatically. Hosted runs
 are persisted once per idempotency key; repeating the same request returns
 its saved response. A changed request with the same key is rejected.
+An in-progress, failed, or interrupted request without a saved result returns
+409 and is never automatically rerun, since it may already have produced side
+effects or incurred costs. After a server crash, inspect the provider sandbox
+and confirm the prior process has stopped before deliberately starting a new
+request with a new key (and a new hosted sandbox after a control-plane restart).
 The API requires `sandboxes:execute`; viewing model usage requires
-`usage:read`. The database migration runs automatically at server startup.
+`usage:read`, including fresh responses and idempotent replays. Without that
+scope, `RemoteAgentRunResult.agent_usage` is empty. The database migration runs
+automatically at server startup.
 
 Codex estimates multiply uncached input, cache reads, and output by bundled
 [standard short-context API rates](https://developers.openai.com/api/docs/pricing),

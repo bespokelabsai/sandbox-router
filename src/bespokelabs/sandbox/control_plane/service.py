@@ -382,6 +382,14 @@ class ControlPlane:
     ) -> dict:
         """Execute a hosted agent and persist usage once per idempotency key."""
         self.require(principal, "sandboxes:execute")
+
+        def visible_response(response: dict) -> dict:
+            # Persist the full result, but authorize each delivery independently,
+            # including replays made with a different API key.
+            if principal.allows("usage:read"):
+                return response
+            return {k: v for k, v in response.items() if k != "agent_usage"}
+
         if harness not in {"claude-code", "opencode", "grok", "codex"}:
             raise ValueError("unsupported agent harness")
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
@@ -406,7 +414,7 @@ class ControlPlane:
             fingerprint,
         )
         if cached is not None:
-            return cached
+            return visible_response(cached)
         if record.status != "running":
             raise ConflictError(f"sandbox is {record.status}")
         with self._lock:
@@ -422,7 +430,7 @@ class ControlPlane:
             request_fingerprint=fingerprint,
         )
         if cached is not None:
-            return cached
+            return visible_response(cached)
         started = time.monotonic()
         agent_usage = agent_usage_record(
             AgentRunResult(), harness=harness, model=model
@@ -456,7 +464,7 @@ class ControlPlane:
             self.store.finish_execution(
                 execution_id, response, agent_usage=agent_usage
             )
-            return response
+            return visible_response(response)
         except Exception as exc:
             self._record_usage(
                 principal,

@@ -244,6 +244,83 @@ class AgentDashboardTests(unittest.TestCase):
             self.run_agent(request_id="failed")
         self.assertEqual(self.sessions[0].execute_command.call_count, 1)
 
+    def test_execute_only_responses_and_replays_hide_usage(self):
+        key = self.service.issue_api_key(
+            self.principal, name="Execute only", scopes=["sandboxes:execute"]
+        )
+        executor = self.store.authenticate(key.secret)
+
+        def execute(principal, request_id):
+            return self.service.run_agent(
+                principal,
+                self.sb.id,
+                prompt="Explain",
+                harness="codex",
+                model="gpt-5.3-codex",
+                request_id=request_id,
+            )
+
+        # Authorization belongs to the caller, not the key that created the
+        # cached result. Full metadata must still be stored for usage readers.
+        for creator in (executor, self.principal):
+            request_id = creator.api_key_id
+            first = execute(creator, request_id)
+            self.assertEqual(
+                "agent_usage" in first, creator.allows("usage:read")
+            )
+            self.assertNotIn("agent_usage", execute(executor, request_id))
+            self.assertEqual(
+                execute(self.principal, request_id)["agent_usage"][
+                    "cost_state"
+                ],
+                "estimated",
+            )
+            # Exercise the race path where begin_execution sees a completion
+            # that was not present at the initial cache lookup.
+            with patch.object(
+                self.store, "cached_agent_execution", return_value=None
+            ):
+                self.assertNotIn("agent_usage", execute(executor, request_id))
+        self.assertEqual(self.sessions[0].execute_command.call_count, 2)
+        self.assertEqual(
+            len(self.store.agent_runs(self.principal.organization_id)), 2
+        )
+
+        remote = RemoteSandboxClient("https://testserver", key.secret)
+        with patch.object(
+            remote,
+            "_request",
+            return_value=execute(executor, executor.api_key_id),
+        ):
+            result = RemoteSandbox(remote, self.sb.id, "local").run_agent(
+                "Explain"
+            )
+        self.assertEqual(result.agent_usage, {})
+        self.assertEqual(result.text, "Done.")
+
+    def test_interrupted_run_is_not_reexecuted_after_restart(self):
+        # Simulate termination of the process between the external side effect
+        # and saving the response. The original outcome cannot be inferred.
+        self.sessions[0].execute_command.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_agent(request_id="interrupted")
+        restarted = ControlPlane(SQLiteStore(self.path, key_pepper="test"))
+        with self.assertRaisesRegex(
+            ConflictError, "verify the prior run has stopped"
+        ):
+            restarted.run_agent(
+                self.principal,
+                self.sb.id,
+                prompt="Explain",
+                harness="codex",
+                model="gpt-5.3-codex",
+                request_id="interrupted",
+            )
+        self.sessions[0].execute_command.assert_called_once()
+        self.assertEqual(
+            self.store.agent_runs(self.principal.organization_id), []
+        )
+
     @unittest.skipIf(TestClient is None, "server dependencies missing")
     def test_http_and_remote_client_end_to_end(self):
         client = TestClient(create_app(self.service))
@@ -298,6 +375,41 @@ class AgentDashboardTests(unittest.TestCase):
 
 
 class EstimateTests(unittest.TestCase):
+
+    def test_opencode_failure_keeps_tokens_but_not_complete_cost(self):
+        from bespokelabs.sandbox._usage import (
+            parse_opencode_result,
+            usage_from_result,
+        )
+
+        step = {
+            "type": "step_finish",
+            "part": {
+                "id": "step-1",
+                "cost": 0.25,
+                "tokens": {"input": 100, "output": 20},
+            },
+        }
+        for exit_code, error in ((0, False), (1, False), (0, True), (1, True)):
+            with self.subTest(exit_code=exit_code, error=error):
+                events = [step]
+                if error:
+                    events.append(
+                        {"type": "error", "error": {"message": "Failed"}}
+                    )
+                raw = parse_opencode_result("\n".join(map(json.dumps, events)))
+                result = AgentRunResult(
+                    raw=raw, usage=usage_from_result(raw), exit_code=exit_code
+                )
+                row = agent_usage_record(result, harness="opencode", model=None)
+                failed = bool(exit_code or error)
+                self.assertEqual(row["usage_is_incomplete"], failed)
+                self.assertEqual(
+                    row["cost_state"], "unavailable" if failed else "reported"
+                )
+                self.assertEqual(row["cost_usd"], None if failed else "0.25")
+                self.assertTrue(row["tokens_known"])
+                self.assertEqual(row["total_tokens"], 120)
 
     def result(self, raw=None):
         return AgentRunResult(

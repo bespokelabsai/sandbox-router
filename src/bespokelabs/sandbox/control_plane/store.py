@@ -2160,7 +2160,10 @@ class SQLiteStore:
             ) from None
         if row["status"] != "completed":
             raise ConflictError(
-                "agent execution is in progress or previously failed"
+                "agent execution has no saved result (in progress, interrupted, "
+                "or failed); this key will not rerun it. Inspect the sandbox "
+                "and verify the prior run has stopped before deliberately "
+                "submitting a new request with a new idempotency key"
             )
         return json.loads(row["response_json"])
 

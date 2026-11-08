@@ -51,7 +51,15 @@ class BrowserRuntime:
         usage = Usage(
             input_tokens=800000, output_tokens=50000, cache_read_tokens=200000
         )
-        raw = {"usage": {"input_tokens": 800000, "output_tokens": 50000}}
+        raw = {
+            "usage": {
+                "input_tokens": 1000000 if harness == "codex" else 800000,
+                "output_tokens": 50000,
+                "cached_input_tokens"
+                if harness == "codex"
+                else "cache_read_input_tokens": 200000,
+            }
+        }
         if harness == "grok":
             usage.llm_cost_usd = 1.25
             raw["total_cost_usd"] = 1.25
