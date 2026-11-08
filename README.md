@@ -23,10 +23,11 @@ organization policies, and manage sandboxes from a shared dashboard.
 **[Try the SDK](#quickstart)** · **[Run the control plane](#hosted-control-plane)** ·
 **[Explore supported providers](#supported-backends)**
 
-![Per-sandbox CPU, RAM, GPU utilization, and GPU memory charts](docs/images/sandbox-resource-dashboard.jpg)
+![Example Daytona and Modal usage report with runtime, idle hours, and estimated idle cost](docs/images/sandbox-usage-overview.svg)
 
-*Dashboard preview with fixture data. Resource charts refresh every 15 seconds;
-available metrics depend on the provider and sandbox image.*
+*Illustrative Daytona + Modal workload report with synthetic data and example
+rates. Idle summaries show an analysis you can build from resource telemetry;
+they are not currently a built-in dashboard aggregate.*
 
 ## Visibility and control, across providers
 
@@ -36,6 +37,16 @@ Open a sandbox to inspect its CPU and RAM history, GPU utilization and memory,
 execution history, and lifecycle timeline. Find the creator key, provider
 resource, age, and cleanup status in the inventory. Missing or stale measurements
 are labeled explicitly, so an unavailable metric never looks like an idle machine.
+
+<details>
+<summary>See the current per-sandbox dashboard</summary>
+
+![Per-sandbox CPU, RAM, GPU utilization, and GPU memory charts](docs/images/sandbox-resource-dashboard.jpg)
+
+*Actual dashboard with fixture data. Resource charts refresh every 15 seconds;
+available metrics depend on the provider and sandbox image.*
+
+</details>
 
 ### Understand the cost of a run
 
