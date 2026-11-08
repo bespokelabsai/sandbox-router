@@ -1,0 +1,107 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="900" viewBox="0 0 1280 900" role="img" aria-labelledby="title desc">
+<title id="title">Example sandbox usage across Daytona and Modal</title>
+<desc id="desc">Example report, not a product screenshot: 12 sandboxes, 48 sandbox-hours, 14 idle hours, and 4 dollars 80 cents of estimated compute cost during idle time. Daytona: 28 hours, 9 idle. Modal: 20 hours, 5 idle. Rates are examples.</desc>
+<style>text{font-family:Inter,Arial,sans-serif;fill:#242725}.muted{fill:#6c736e}.eyebrow{font-size:12px;font-weight:700;letter-spacing:1.8px}.label{font-size:15px}.value{font-size:34px;font-weight:700;letter-spacing:-1px}.head{font-size:19px;font-weight:700}.small{font-size:13px}.medium{font-size:16px;font-weight:600}</style>
+<rect x="0" y="0" width="1280" height="900" rx="0" fill="#f4f5ef"/>
+<rect x="24" y="24" width="1232" height="852" rx="20" fill="#fcfdf9" stroke="#dfe3da"/>
+<rect x="52" y="51" width="24" height="24" rx="6" fill="#d9472c"/>
+<text x="88" y="69" class="eyebrow">BESPOKE SANDBOX</text>
+<rect x="994" y="48" width="232" height="30" rx="15" fill="#eef0e8"/>
+<text x="1110" y="68" class="eyebrow" text-anchor="middle">EXAMPLE WORKLOAD · 24H</text>
+<text x="52" y="119" class="" font-size="34">See usage. Find idle compute.</text>
+<text x="52" y="148" class="label muted">Daytona + Modal   /   12 sandboxes used   /   Example workload report</text>
+<rect x="52" y="179" width="280" height="116" rx="12" fill="#ffffff" stroke="#e2e5dc"/>
+<text x="72" y="207" class="eyebrow" style="fill:#6c736e">ALLOCATED RUNTIME</text>
+<text x="72" y="250" class="value">48.0 h</text>
+<text x="72" y="276" class="small muted">Total sandbox-hours</text>
+<rect x="350" y="179" width="280" height="116" rx="12" fill="#ffffff" stroke="#e2e5dc"/>
+<text x="370" y="207" class="eyebrow" style="fill:#6c736e">BUSY RUNTIME</text>
+<text x="370" y="250" class="value">34.0 h</text>
+<text x="370" y="276" class="small muted">70.8% of allocated runtime</text>
+<rect x="648" y="179" width="280" height="116" rx="12" fill="#fff6ee" stroke="#e2e5dc"/>
+<text x="668" y="207" class="eyebrow" style="fill:#a34228">IDLE RUNTIME</text>
+<text x="668" y="250" class="value">14.0 h</text>
+<text x="668" y="276" class="small muted">29.2% of allocated runtime</text>
+<rect x="946" y="179" width="280" height="116" rx="12" fill="#fff6ee" stroke="#e2e5dc"/>
+<text x="966" y="207" class="eyebrow" style="fill:#a34228">COST DURING IDLE</text>
+<text x="966" y="250" class="value">$4.80</text>
+<text x="966" y="276" class="small muted">Example compute estimate</text>
+<rect x="52" y="319" width="1176" height="247" rx="12" fill="#ffffff" stroke="#e2e5dc"/>
+<text x="76" y="353" class="head">Where the runtime goes</text>
+<rect x="895" y="340" width="12" height="12" rx="3" fill="#4d6257"/>
+<text x="915" y="351" class="small muted">Busy</text>
+<rect x="995" y="340" width="12" height="12" rx="3" fill="#edc29f"/>
+<text x="1015" y="351" class="small muted">Idle</text>
+<text x="1198" y="351" class="small muted" text-anchor="end">sandbox-hours</text>
+<line x1="112" y1="514" x2="1196" y2="514" stroke="#e5e8e1"/>
+<text x="94" y="519" class="small muted" text-anchor="end">0</text>
+<line x1="112" y1="454" x2="1196" y2="454" stroke="#e5e8e1"/>
+<text x="94" y="459" class="small muted" text-anchor="end">2</text>
+<line x1="112" y1="394" x2="1196" y2="394" stroke="#e5e8e1"/>
+<text x="94" y="399" class="small muted" text-anchor="end">4</text>
+<rect x="132" y="394" width="48" height="15.0" rx="0" fill="#edc29f"/>
+<rect x="132" y="409.0" width="48" height="105.0" rx="0" fill="#4d6257"/>
+<text x="156" y="539" class="small muted" text-anchor="middle">00:00</text>
+<rect x="221" y="394" width="48" height="22.5" rx="0" fill="#edc29f"/>
+<rect x="221" y="416.5" width="48" height="97.5" rx="0" fill="#4d6257"/>
+<text x="245" y="539" class="small muted" text-anchor="middle">02:00</text>
+<rect x="310" y="394" width="48" height="30" rx="0" fill="#edc29f"/>
+<rect x="310" y="424" width="48" height="90" rx="0" fill="#4d6257"/>
+<text x="334" y="539" class="small muted" text-anchor="middle">04:00</text>
+<rect x="399" y="394" width="48" height="45.0" rx="0" fill="#edc29f"/>
+<rect x="399" y="439.0" width="48" height="75.0" rx="0" fill="#4d6257"/>
+<text x="423" y="539" class="small muted" text-anchor="middle">06:00</text>
+<rect x="488" y="394" width="48" height="60" rx="0" fill="#edc29f"/>
+<rect x="488" y="454" width="48" height="60" rx="0" fill="#4d6257"/>
+<text x="512" y="539" class="small muted" text-anchor="middle">08:00</text>
+<rect x="577" y="394" width="48" height="30" rx="0" fill="#edc29f"/>
+<rect x="577" y="424" width="48" height="90" rx="0" fill="#4d6257"/>
+<text x="601" y="539" class="small muted" text-anchor="middle">10:00</text>
+<rect x="666" y="394" width="48" height="37.5" rx="0" fill="#edc29f"/>
+<rect x="666" y="431.5" width="48" height="82.5" rx="0" fill="#4d6257"/>
+<text x="690" y="539" class="small muted" text-anchor="middle">12:00</text>
+<rect x="755" y="394" width="48" height="30" rx="0" fill="#edc29f"/>
+<rect x="755" y="424" width="48" height="90" rx="0" fill="#4d6257"/>
+<text x="779" y="539" class="small muted" text-anchor="middle">14:00</text>
+<rect x="844" y="394" width="48" height="45.0" rx="0" fill="#edc29f"/>
+<rect x="844" y="439.0" width="48" height="75.0" rx="0" fill="#4d6257"/>
+<text x="868" y="539" class="small muted" text-anchor="middle">16:00</text>
+<rect x="933" y="394" width="48" height="60" rx="0" fill="#edc29f"/>
+<rect x="933" y="454" width="48" height="60" rx="0" fill="#4d6257"/>
+<text x="957" y="539" class="small muted" text-anchor="middle">18:00</text>
+<rect x="1022" y="394" width="48" height="30" rx="0" fill="#edc29f"/>
+<rect x="1022" y="424" width="48" height="90" rx="0" fill="#4d6257"/>
+<text x="1046" y="539" class="small muted" text-anchor="middle">20:00</text>
+<rect x="1111" y="394" width="48" height="15.0" rx="0" fill="#edc29f"/>
+<rect x="1111" y="409.0" width="48" height="105.0" rx="0" fill="#4d6257"/>
+<text x="1135" y="539" class="small muted" text-anchor="middle">22:00</text>
+<rect x="52" y="586" width="1176" height="184" rx="12" fill="#ffffff" stroke="#e2e5dc"/>
+<text x="76" y="614" class="eyebrow" style="fill:#6c736e">PROVIDER</text>
+<text x="278" y="614" class="eyebrow" style="fill:#6c736e">SANDBOXES</text>
+<text x="439" y="614" class="eyebrow" style="fill:#6c736e">RUNTIME</text>
+<text x="606" y="614" class="eyebrow" style="fill:#6c736e">BUSY / IDLE</text>
+<text x="895" y="614" class="eyebrow" style="fill:#6c736e">IDLE HOURS</text>
+<text x="1197" y="614" class="eyebrow" style="fill:#6c736e" text-anchor="end">IDLE COST</text>
+<line x1="76" y1="627" x2="1204" y2="627" stroke="#e5e8e1"/>
+<rect x="76" y="640" width="8" height="22" rx="4" fill="#d9472c"/>
+<text x="97" y="657" class="head">Daytona</text>
+<text x="278" y="657" class="medium">8</text>
+<text x="439" y="657" class="medium">28.0 h</text>
+<rect x="606" y="645" width="234" height="12" rx="6" fill="#edc29f"/>
+<rect x="606" y="645" width="158.7857142857143" height="12" rx="6" fill="#4d6257"/>
+<text x="606" y="679" class="small muted">67.9% busy · 32.1% idle</text>
+<text x="895" y="657" class="medium">9.0 h</text>
+<text x="1197" y="657" class="medium" text-anchor="end">$1.80</text>
+<rect x="76" y="712" width="8" height="22" rx="4" fill="#268477"/>
+<text x="97" y="729" class="head">Modal</text>
+<text x="278" y="729" class="medium">4</text>
+<text x="439" y="729" class="medium">20.0 h</text>
+<rect x="606" y="717" width="234" height="12" rx="6" fill="#edc29f"/>
+<rect x="606" y="717" width="175.5" height="12" rx="6" fill="#4d6257"/>
+<text x="606" y="751" class="small muted">75.0% busy · 25.0% idle</text>
+<text x="895" y="729" class="medium">5.0 h</text>
+<text x="1197" y="729" class="medium" text-anchor="end">$3.00</text>
+<text x="52" y="805" class="small muted">Example idle rule: CPU &lt; 5% and GPU &lt; 5% (when present) for at least 5 minutes.</text>
+<text x="52" y="827" class="small muted">Unavailable telemetry is excluded. Idle does not automatically mean safe to terminate.</text>
+<text x="52" y="849" class="small muted">Example rates: Daytona $0.20 / sandbox-hour · Modal $0.60 / sandbox-hour. These are not provider quotes.</text>
+</svg>

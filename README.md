@@ -23,6 +23,10 @@ organization policies, and manage sandboxes from a shared dashboard.
 **[Try the SDK](#quickstart)** · **[Run the control plane](#hosted-control-plane)** ·
 **[Explore supported providers](#supported-backends)**
 
+![Example Daytona and Modal usage report with runtime, idle hours, and estimated idle cost](docs/images/sandbox-usage-overview.svg)
+
+*Example Daytona + Modal workload report: runtime, idle time, and cost breakdowns.*
+
 ## Visibility and control, across providers
 
 ### See what your agents are using
