@@ -780,6 +780,14 @@ def create_app(
             execution.pop("response_json", None)
         return detail
 
+    @app.get("/v1/sandboxes/{sandbox_id}/resources")
+    def resource_usage(
+        sandbox_id: str,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        principal = authenticate(authorization, "usage:read")
+        return control_plane.resource_usage(principal, sandbox_id)
+
     @app.post("/v1/sandboxes/{sandbox_id}/execute")
     def execute(
         sandbox_id: str,

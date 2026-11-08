@@ -407,6 +407,20 @@ _MIGRATIONS = (
             "CREATE INDEX agent_usage_org_created_idx ON agent_usage(organization_id, created_at)",
         ),
     ),
+    (
+        10,
+        (
+            """CREATE TABLE resource_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                organization_id TEXT NOT NULL REFERENCES organizations(id),
+                sandbox_id TEXT NOT NULL REFERENCES sandboxes(id),
+                collected_at TEXT NOT NULL,
+                sample_json TEXT NOT NULL
+            )""",
+            "CREATE INDEX resource_samples_sandbox_idx ON resource_samples(organization_id, sandbox_id, id)",
+            "CREATE INDEX resource_samples_time_idx ON resource_samples(collected_at)",
+        ),
+    ),
 )
 
 
@@ -2166,6 +2180,46 @@ class SQLiteStore:
                 "submitting a new request with a new idempotency key"
             )
         return json.loads(row["response_json"])
+
+    def record_resource_sample(
+        self, organization_id: str, sandbox_id: str, sample: dict
+    ) -> None:
+        """Keep the latest 240 observations, excluding terminated sandboxes."""
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO resource_samples(organization_id, sandbox_id, collected_at, sample_json)
+                   SELECT organization_id, id, ?, ? FROM sandboxes
+                   WHERE organization_id=? AND id=? AND status='running'""",
+                (
+                    sample["collected_at"],
+                    json.dumps(sample, allow_nan=False),
+                    organization_id,
+                    sandbox_id,
+                ),
+            )
+            connection.execute(
+                """DELETE FROM resource_samples WHERE organization_id=? AND sandbox_id=?
+                   AND id NOT IN (SELECT id FROM resource_samples WHERE organization_id=? AND sandbox_id=? ORDER BY id DESC LIMIT 240)""",
+                (organization_id, sandbox_id, organization_id, sandbox_id),
+            )
+
+    def resource_samples(
+        self, organization_id: str, sandbox_id: str
+    ) -> list[dict]:
+        """Return bounded, tenant-scoped history in chronological order."""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT sample_json FROM resource_samples WHERE organization_id=? AND sandbox_id=? ORDER BY id DESC LIMIT 240",
+                (organization_id, sandbox_id),
+            ).fetchall()
+        return [json.loads(row[0]) for row in reversed(rows)]
+
+    def prune_resource_samples(self, before: str) -> None:
+        """Expire telemetry independently of billing/audit retention."""
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM resource_samples WHERE collected_at < ?", (before,)
+            )
 
     @staticmethod
     def _insert_agent_usage(connection, execution_id: str, usage: dict) -> None:

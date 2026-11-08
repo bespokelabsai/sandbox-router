@@ -21,6 +21,7 @@ class Element {
   replaceChildren(...children) { this.children = []; this.append(...children); }
   insertBefore(child, before) { this.children.splice(this.children.indexOf(before), 0, child); }
   set textContent(value) { this.replaceChildren(value); }
+  get childNodes() { return this.children; }
   get textContent() { return this.children.map((child) => child instanceof Element ? child.textContent : child).join(""); }
   set innerHTML(value) { throw new Error(`Unsafe HTML sink: ${value}`); }
   setAttribute(key, value) { this[key] = String(value); }
@@ -38,6 +39,7 @@ function dashboard() {
         return elements.get(selector);
       },
       createElement: (tag) => new Element(tag),
+      createElementNS: (_namespace, tag) => new Element(tag),
       createDocumentFragment: () => new Element("fragment"),
       addEventListener() {},
     },
@@ -83,4 +85,27 @@ test("model overview renders both usage and permission states without HTML sinks
   vm.runInContext("state.session = { can_view_usage: true }; renderAgentOverview([{ agent_usage: { runs: 1, unknown_usage_runs: 1, unknown_cost_runs: 1 } }])", context);
   assert.match(elements.get("#agentUsageSummary").textContent, /unavailable cost/);
   assert.match(elements.get("#agentUsageSummary").textContent, /Unavailable/);
+});
+
+test("resource charts preserve zero, gaps, stale labels and safe GPU names", () => {
+  const { context } = dashboard();
+  const attack = '<img src=x onerror="alert(1)">';
+  context.data = { status: "stale", interval_seconds: 15, samples: [
+    { collected_at: "2026-11-08T00:00:00Z", cpu_percent: 50, memory_used_bytes: 1073741824, gpus: [{ id: "gpu", name: attack, utilization_percent: 10, memory_used_bytes: 1000 }] },
+    { collected_at: "2026-11-08T00:00:15Z", cpu_percent: null, memory_used_bytes: null, gpus: [] },
+    { collected_at: "2026-11-08T00:00:30Z", cpu_percent: 0, memory_used_bytes: 0, gpus: [{ id: "gpu", name: attack, utilization_percent: null, memory_used_bytes: 2000 }] },
+  ] };
+  const content = vm.runInContext("resourceContent(data)", context);
+  assert.match(content.textContent, /Stale/);
+  assert.match(content.textContent, /0\.0 %/);
+  assert.match(content.textContent, /GPU utilizationUnavailable/);
+  assert.ok(content.textContent.includes(attack));
+  const all = (element) => [element, ...element.children.filter((child) => child instanceof Element).flatMap(all)];
+  const nodes = all(content);
+  assert.equal(nodes.some((element) => element.tag === "img"), false);
+  const cpu = nodes.find((element) => element.tag === "svg");
+  assert.equal(all(cpu).filter((element) => element.tag === "circle").length, 2);
+  assert.equal(all(cpu).filter((element) => element.tag === "polyline").length, 0);
+  context.data.samples = [];
+  assert.match(vm.runInContext("resourceContent(data)", context).textContent, /No measurements/);
 });

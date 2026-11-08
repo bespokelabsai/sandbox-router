@@ -377,6 +377,38 @@ Open [`http://127.0.0.1:8000/dashboard`](http://127.0.0.1:8000/dashboard) and
 enter the `bsk_live_...` product key. For this plain-HTTP loopback example,
 set `BESPOKE_SESSION_COOKIE_SECURE=0` before starting the server so the browser
 can send its session cookie. Keep the default `1` when serving over HTTPS.
+The sandbox detail panel includes live CPU, RAM, and NVIDIA GPU charts for the
+last hour. The control plane samples attached, running sandboxes every 15 seconds
+independently of the lifecycle watchdog. Read the same history through
+`GET /v1/sandboxes/{id}/resources` with both `sandboxes:read` and `usage:read`.
+Dashboard refreshes read stored samples, without launching additional probes.
+
+CPU is the average percentage of effective cgroup CPU capacity between samples;
+the first sample has no CPU value. RAM is cgroup memory usage including filesystem
+cache. The probe requires Python 3 and Linux cgroup v2 in the sandbox image.
+Docker, Modal, Daytona, E2B, Runpod, Tensorlake, and Boxd use this probe on a
+best-effort basis; missing counters or packages show **unavailable**. Local, Ray,
+and Safehouse do not report shared host CPU/RAM as sandbox usage.
+GPU charts require `nvidia-smi` and show visible device utilization and memory,
+which can include other workloads on shared devices. Unsupported MIG counters
+stay unavailable. These resource samples are separate from compute billing and
+agent token costs; probes add a small amount of sandbox activity and provider
+API traffic, but do not create execution-ledger entries.
+
+The UI labels stale samples after 45 seconds, breaks chart lines across missing
+data, and retains historical charts when a sandbox stops. Sampling resumes only
+for attached runtimes; after a control-plane restart, historical samples remain
+readable but detached sandboxes show unavailable. Storage migration 10 keeps at
+most 240 samples per sandbox; an hourly sweep removes observations older than
+24 hours while sampling is enabled. Set `BESPOKE_RESOURCE_SAMPLING_INTERVAL_SECS`
+to 5–15 to adjust cadence, or 0 to disable sampling. Faster cadences shorten the
+240-sample history. At most four probes run concurrently; a provider call that
+exceeds ten seconds is marked unavailable and keeps its slot until it returns,
+so repeated failures cannot accumulate unbounded workers.
+
+The counter meanings follow the [Linux cgroup v2 documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
+and [NVIDIA's monitoring documentation](https://docs.nvidia.com/deploy/nvidia-smi/).
+
 The initial organization key has every scope. A read-only dashboard key needs
 both `usage:read` and `sandboxes:read`.
 

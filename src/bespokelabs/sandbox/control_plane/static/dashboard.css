@@ -1500,3 +1500,16 @@ dialog::backdrop {
   .agent-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
   .agent-metrics dd { font-size: 18px; }
 }
+
+.resource-charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 16px 0; }
+.resource-chart { min-width: 0; border: 1px solid #ded9ce; border-radius: 10px; padding: 14px; background: #fffdf8; }
+.resource-chart-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.resource-chart h4 { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.resource-chart strong { font-size: 14px; white-space: nowrap; }
+.resource-chart svg { width: 100%; display: block; margin-top: 12px; }
+.resource-axis { fill: #716c63; font-size: 10px; }
+.resource-gridline { stroke: #e7e2d8; stroke-width: 1; }
+.resource-line { stroke: #d7472e; stroke-width: 2; fill: none; stroke-linejoin: round; }
+.resource-dot { fill: #d7472e; }
+.resource-status { font-size: 13px; font-weight: 600; }
+@media (max-width: 640px) { .resource-charts { grid-template-columns: 1fr; } }

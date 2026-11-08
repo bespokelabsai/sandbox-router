@@ -34,6 +34,10 @@ from bespokelabs.sandbox.control_plane.models import (
     SandboxRecord,
 )
 from bespokelabs.sandbox.control_plane.reconciliation import ProviderReconciler
+from bespokelabs.sandbox.control_plane.resource_metrics import (
+    STALE_SECONDS,
+    ResourceMonitor,
+)
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import ErrorOutcome
 from bespokelabs.sandbox.sandbox import Sandbox
@@ -104,6 +108,7 @@ class ControlPlane:
         ) = None,
         provider_terminators: dict[str, Callable[[str], None]] | None = None,
         supervision_interval_secs: float = 30,
+        resource_sampling_interval_secs: float = 15,
         now: Callable[[], datetime] | None = None,
     ) -> None:
         self.store = store
@@ -142,6 +147,20 @@ class ControlPlane:
         self._supervisor_owner = f"supervisor-{uuid.uuid4().hex}"
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
+        if (
+            resource_sampling_interval_secs != 0
+            and not 5 <= resource_sampling_interval_secs <= 15
+        ):
+            raise ValueError(
+                "resource sampling interval must be 0 (disabled) or 5–15 seconds"
+            )
+        self._resource_monitor = ResourceMonitor(
+            self._resource_targets,
+            store.record_resource_sample,
+            self._now,
+            interval=resource_sampling_interval_secs,
+        )
+        self._resource_pruned_at: datetime | None = None
 
     def bootstrap_organization(
         self, name: str
@@ -571,12 +590,73 @@ class ControlPlane:
             for run in runs:
                 add_agent_usage(summary, run)
             detail.update(agent_usage=summary, agent_runs=runs)
+            detail["resource_usage"] = self.resource_usage(
+                principal, sandbox_id
+            )
         else:
             detail.update(agent_usage=None, agent_runs=[])
             for execution in detail["executions"]:
                 if execution["response"]:
                     execution["response"].pop("agent_usage", None)
         return detail
+
+    def resource_usage(self, principal: Principal, sandbox_id: str) -> dict:
+        """Read sampled resource history without executing provider commands."""
+        self.require(principal, "sandboxes:read")
+        self.require(principal, "usage:read")
+        record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        samples = self.store.resource_samples(
+            principal.organization_id, sandbox_id
+        )
+        cutoff = self._now() - timedelta(hours=1)
+        samples = [
+            s
+            for s in samples
+            if datetime.fromisoformat(s["collected_at"]) >= cutoff
+        ]
+        latest = samples[-1] if samples else None
+        with self._lock:
+            attached = sandbox_id in self._runtimes
+        if record.status != "running":
+            status = "stopped"
+        elif self._resource_monitor.interval <= 0:
+            status = "disabled"
+        elif not attached:
+            status = "unavailable"
+        elif latest is None:
+            status = "waiting"
+        elif (
+            self._now() - datetime.fromisoformat(latest["collected_at"])
+        ).total_seconds() > STALE_SECONDS:
+            status = "stale"
+        else:
+            status = latest["status"]
+        return {
+            "status": status,
+            "samples": samples,
+            "interval_seconds": self._resource_monitor.interval,
+            "stale_after_seconds": STALE_SECONDS,
+            "window_seconds": 3600,
+        }
+
+    def _resource_targets(self) -> list:
+        now = self._now()
+        if (
+            self._resource_pruned_at is None
+            or now - self._resource_pruned_at >= timedelta(hours=1)
+        ):
+            self.store.prune_resource_samples(
+                (now - timedelta(hours=24)).isoformat()
+            )
+            self._resource_pruned_at = now
+        with self._lock:
+            runtimes = list(self._runtimes.items())
+        targets = []
+        for sandbox_id, runtime in runtimes:
+            record = self.store.get_sandbox_internal(sandbox_id)
+            if record.status == "running":
+                targets.append((record, runtime))
+        return targets
 
     def get_policy(self, principal: Principal) -> OrganizationPolicy:
         self.require(principal, "policies:read")
@@ -1131,6 +1211,7 @@ class ControlPlane:
 
     def start_supervision(self) -> None:
         """Start the daemon supervisor once for this service process."""
+        self._resource_monitor.start()
         if self._supervision_interval_secs <= 0:
             return
         with self._lock:
@@ -1145,6 +1226,7 @@ class ControlPlane:
             self._supervisor_thread.start()
 
     def stop_supervision(self) -> None:
+        self._resource_monitor.stop()
         self._supervisor_stop.set()
         thread = self._supervisor_thread
         if thread and thread is not threading.current_thread():

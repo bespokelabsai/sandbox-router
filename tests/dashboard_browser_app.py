@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import math
 import tempfile
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from bespokelabs.sandbox.control_plane.api import create_app
 from bespokelabs.sandbox.control_plane.errors import PolicyDeniedError
 from bespokelabs.sandbox.control_plane.reconciliation import ProviderObservation
+from bespokelabs.sandbox.control_plane.resource_metrics import normalize
 from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import SandboxTimeoutError
@@ -69,6 +72,26 @@ class BrowserRuntime:
 
     def estimate_compute_cost(self, elapsed_secs: float) -> float:
         return elapsed_secs / 1800
+
+    def resource_usage(self) -> dict:
+        ticks = time.monotonic()
+        return {
+            "cpu_seconds": ticks,
+            "monotonic_seconds": ticks,
+            "cpu_capacity": 2,
+            "counter_id": self.provider_resource_id,
+            "memory_used_bytes": 2.4 * 1073741824,
+            "memory_limit_bytes": 8 * 1073741824,
+            "gpus": [
+                {
+                    "id": "fixture-gpu",
+                    "name": "NVIDIA A100 (fixture)",
+                    "utilization_percent": 64,
+                    "memory_used_bytes": 12 * 1073741824,
+                    "memory_total_bytes": 40 * 1073741824,
+                }
+            ],
+        }
 
     def destroy(self) -> None:
         self.destroyed = True
@@ -239,6 +262,25 @@ except PolicyDeniedError:
     pass
 
 service.alert_history(operator, offset=0, limit=20)
+
+previous = None
+for index in range(120):
+    raw = factory.created[-1].resource_usage()
+    raw.update(
+        cpu_seconds=100 + index * 15 + math.sin(index / 5) * 10,
+        monotonic_seconds=1000 + index * 15,
+    )
+    raw["memory_used_bytes"] = (2.4 + math.sin(index / 8) * 0.4) * 1073741824
+    raw["gpus"][0]["utilization_percent"] = 60 + math.sin(index / 4) * 20
+    raw["gpus"][0]["memory_used_bytes"] = (
+        12 + math.sin(index / 9) * 2
+    ) * 1073741824
+    sample = normalize(raw, previous)
+    sample["collected_at"] = (
+        now - timedelta(seconds=(119 - index) * 15)
+    ).isoformat()
+    store.record_resource_sample(operator.organization_id, live.id, sample)
+    previous = raw
 
 app = create_app(
     service,
