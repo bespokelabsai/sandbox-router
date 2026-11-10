@@ -7,42 +7,119 @@
   </a>
 </p>
 
-<h1 align="center">One Library for all Sandbox Providers</h1>
-<h3 align="center" style="font-size: 20px; margin-bottom: 4px">One API. Many sandbox providers.</h3>
+<h1 align="center">Bespoke Sandbox</h1>
+<h3 align="center">Run agents across providers. See their usage. Set the limits.</h3>
 <br/>
 
-Just like [OpenRouter](https://openrouter.ai) gives you a single API across LLM providers, `bespokelabs-sandbox` gives you a unified interface across sandbox providers. Write your code once, swap backends with a single parameter.
+When agents start creating sandboxes, execution is only part of the problem.
+Your team also needs to know which environments are still running, where the
+money is going, and who can create the next GPU instance.
 
-Use `Sandbox` / `SandboxClient` when your application owns provider credentials,
-or `RemoteSandboxClient` when it connects to a control plane that you operate.
-The direct SDK provides execution, files, workspaces, agent helpers, and session
-resume. The optional server adds organization keys, policies, metering, and an
-operations dashboard.
+**Bespoke Sandbox brings execution, observability, and control into one project.**
+Use a common Python API to run code and agents across local and cloud providers.
+Add the self-hosted control plane to see resource usage and costs, enforce
+organization policies, and manage sandboxes from a shared dashboard.
 
-**Contents:** [Install](#install) · [Quickstart](#quickstart) ·
-[Hosted control plane](#hosted-control-plane) · [API reference](#api-reference) ·
-[Feature support](#feature-support-matrix) · [Examples](#examples) ·
-[Development](#development)
+**[Try the SDK](#quickstart)** · **[Run the control plane](#hosted-control-plane)** ·
+**[Explore supported providers](#supported-backends)**
 
-## Why?
+![Example Daytona and Modal usage report with runtime, idle hours, and estimated idle cost](docs/images/sandbox-usage-overview.svg)
 
-- **Common interface** — Use the same execution and file APIs across many backends, with provider-specific configuration where needed.
-- **Easily move between providers** — If one provider has an outage or capacity issue, change one string and keep running.
-- **Cost tracking** — Track agent-reported token usage and cost, estimate sandbox compute cost, and compare backend pricing.
-- **Optional hosted access** — Operate multiple providers behind organization API keys, with lifecycle costs, policies, audit history, and a dashboard.
+*Example Daytona + Modal workload report: runtime, idle time, and cost breakdowns.*
 
-Backend selection is explicit. Automatic cheapest-provider routing and automatic
-failover are not implemented; the benchmark example helps compare providers.
+## Visibility and control, across providers
+
+### See what your agents are using
+
+Open a sandbox to inspect its CPU and RAM history, GPU utilization and memory,
+execution history, and lifecycle timeline. Find the creator key, provider
+resource, age, and cleanup status in the inventory. Missing or stale measurements
+are labeled explicitly, so an unavailable metric never looks like an idle machine.
+
+<details>
+<summary>See the current per-sandbox dashboard</summary>
+
+![Per-sandbox CPU, RAM, GPU utilization, and GPU memory charts](docs/images/sandbox-resource-dashboard.jpg)
+
+*Actual dashboard with fixture data. Resource charts refresh every 15 seconds;
+available metrics depend on the provider and sandbox image.*
+
+</details>
+
+### Understand the cost of a run
+
+Track sandbox compute spend by day, provider, or sandbox. For hosted agent runs,
+see input, output, and cached tokens alongside reported model costs and labeled
+Codex cost estimates. Compute spend and model spend remain separate, with the
+source and assumptions visible where they matter.
+
+### Set boundaries before resources are created
+
+Keep provider credentials on your server and give teams organization-scoped
+product keys. Set concurrency limits, compute spend thresholds, allowed providers
+and GPU types, and maximum requested lifetimes. Creation requests are checked
+before provisioning; configured sandbox deadlines let the supervisor clean up
+attached resources even after the client disconnects.
+
+### Investigate and act from one place
+
+Filter the inventory, inspect failed launches, review policy denials and audit
+events, and terminate a sandbox with the appropriate permissions. Export usage,
+costs, and ledger entries for analysis. Connect the direct SDK's lifecycle events
+to your own metrics tooling when you want execution telemetry in an existing stack.
+
+| What you need | What you get |
+|---|---|
+| Visibility into resource consumption | Per-sandbox CPU/RAM charts and visible NVIDIA device metrics where supported |
+| Cost attribution | Organization and sandbox compute metering, plus token/cost records from hosted agent runs |
+| Control over provisioning | Scoped keys, concurrency and compute-spend checks, provider/GPU allowlists, and lifetime limits |
+| An operational trail | Creation attempts, executions, errors, cleanup state, alerts, audit events, and CSV exports |
+| Flexibility across providers | Common execution and file APIs, with explicit backend selection and provider-specific options |
+
+The control plane is a service **you operate**. Live resource metrics require a
+compatible image; model usage is captured through hosted `run_agent` calls.
+Provider reconciliation and cleanup after a server restart require
+deployment-supplied adapters. Compute budget checks apply at creation and do not
+include model spend. See the [setup and operating details](#hosted-control-plane).
+
+## Choose how to run
+
+| | Direct SDK | Self-hosted control plane |
+|---|---|---|
+| Best fit | An application or agent that manages its own sandboxes | A team or platform that needs shared visibility and policies |
+| Client | `Sandbox` / `SandboxClient` | `RemoteSandboxClient` or HTTP |
+| Provider credentials | In your application's environment | On the control-plane server |
+| Operational visibility | Execution results, SDK usage, and lifecycle telemetry hooks | Dashboard, persisted usage, scoped access, policies, and audit history |
+| Start here | [Local quickstart](#quickstart) | [Server setup](#hosted-control-plane) |
+
+The direct SDK works independently of the server; its runs are not automatically
+uploaded to the dashboard. Both paths use explicit backend selection. You can
+change providers through the same interface, subject to their supported features;
+automatic failover and cheapest-provider routing are not implemented.
+
+**In this README:** [Install](#install) · [Quickstart](#quickstart) ·
+[Control plane](#hosted-control-plane) · [Providers](#supported-backends) ·
+[Agent usage and cost](#token-usage--cost) · [API reference](#api-reference) ·
+[Feature support](#feature-support-matrix) · [Examples](#examples) · [Development](#development)
 
 ## Install
 
-The core SDK declares Python **3.10+**. Use **Python 3.11+** for the control
-plane and its tests: the current server implementation imports `datetime.UTC`.
+Use Python **3.10+** for the core SDK and **3.11+** for the control plane
+and its tests.
 The only required core dependency is Pydantic; provider SDKs are optional.
 
 ```bash
 pip install bespokelabs-sandbox
 ```
+
+For the server and a provider adapter, install the matching extras together:
+
+```bash
+pip install 'bespokelabs-sandbox[server,e2b]'
+```
+
+<details>
+<summary>Using Sandbox alongside Curator or other Bespoke packages</summary>
 
 Sandbox can share an environment with Curator:
 
@@ -64,7 +141,10 @@ environment with namespace-compatible versions of all installed Bespoke packages
 Use `python -m pip` with the interpreter used by your app or notebook, and check
 for old editable checkouts or a local `bespokelabs.py` if imports fail.
 
-With a specific backend:
+</details>
+
+<details>
+<summary>Provider installation options</summary>
 
 ```bash
 pip install 'bespokelabs-sandbox[docker]'
@@ -91,78 +171,42 @@ macOS:
 brew install eugene1g/safehouse/agent-safehouse
 ```
 
-## Supported Backends
-
-### Local
-
-Local execution needs no provider account. Docker, Ray, and Safehouse have
-the runtime requirements listed below.
-
-| Backend | Extra | Requires |
-|---|---|---|
-| Local subprocess | _(none)_ | Python installed |
-| [Monty](https://github.com/pydantic/monty) | `[monty]` | Bundled Monty worker binary |
-| [Agent Safehouse](https://github.com/eugene1g/agent-safehouse) | _(none)_ | macOS + `safehouse` CLI |
-| [Docker](https://www.docker.com) | `[docker]` | Docker daemon running |
-| [Ray](https://www.ray.io) | `[ray]` | Ray installed (local or remote cluster) |
-
-### Cloud
-
-| Backend | Extra | Auth |
-|---|---|---|
-| [Daytona](https://www.daytona.io) | `[daytona]` | `DAYTONA_API_KEY` |
-| [Tensorlake](https://tensorlake.ai) | `[tensorlake]` | `TENSORLAKE_API_KEY` or `tl login` |
-| [Modal](https://modal.com) | `[modal]` | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` |
-| [RunPod](https://www.runpod.io) | _(none)_ | `RUNPOD_API_KEY` + registered SSH key |
-| [E2B](https://e2b.dev) | `[e2b]` | `E2B_API_KEY` |
-| [boxd](https://boxd.sh) | `[boxd]` | `BOXD_API_KEY` |
-| [Google Cloud Batch](https://cloud.google.com/batch) (jobs only) | `[gcp-batch]` | Application Default Credentials |
-
-You only need to install the backend you use. The others are lazily imported.
-
-Local and Ray execute subprocesses on the host or Ray worker and inherit its
-environment. Their workspace path rewriting is a convenience, not an OS
-security boundary. Safehouse wraps subprocesses with its macOS policy, while
-its file helpers still access the host directly. Use the isolation properties
-of your selected backend when deciding which workloads to run.
+</details>
 
 ## Quickstart
+
+Start with local execution. No provider account or Docker daemon is required.
 
 ```python
 from bespokelabs.sandbox import Sandbox
 
-# Zero setup — runs locally
 with Sandbox("local") as sb:
-    result = sb.execute_code('print("hello")')
+    result = sb.execute_code('print("Ready to run")')
     print(result.stdout)
+```
 
-# Or use Safehouse on macOS
-with Sandbox("safehouse") as sb:
-    result = sb.execute_code('print("hello from safehouse")')
-    print(result.stdout)
+The context manager cleans up when the block exits. Local execution runs on your
+host; choose Docker or a cloud provider when your workload needs that provider's
+isolation boundary.
 
-# Or use Docker
+Switch the backend when you are ready. With Docker running and the `[docker]`
+extra installed:
+
+```python
+from bespokelabs.sandbox import Sandbox
+
 with Sandbox("docker") as sb:
     result = sb.execute_code('print("hello from a container")')
     print(result.stdout)
-
-# Or any cloud provider — same interface
-with Sandbox("e2b") as sb:
-    result = sb.execute_code('print("hello from the cloud")')
-    print(result.stdout)
 ```
 
-Switch backends by changing one string:
+The same pattern works with configured cloud providers such as `e2b`, `modal`,
+and `daytona`. See [provider requirements](#supported-backends) and the
+[feature matrix](#feature-support-matrix) for differences.
 
-```python
-for backend in [
-    "local", "safehouse", "docker", "modal", "runpod",
-    "e2b", "daytona", "tensorlake", "ray", "boxd",
-]:
-    options = {"gpu": "NVIDIA L4"} if backend == "runpod" else {}
-    with Sandbox(backend, **options) as sb:
-        sb.execute_code('print("same code, any backend")')
-```
+**Ready for shared visibility and control?** Run the control plane below and
+connect through `RemoteSandboxClient`. For agent workloads, jump to
+[agent-ready sandboxes](#agent-ready-sandboxes) or [token usage and cost](#token-usage--cost).
 
 ### Monty: local Python execution
 
@@ -227,10 +271,24 @@ and [security model](https://pydantic.dev/docs/monty/concepts/security/).
 
 ## Hosted control plane
 
-The optional control plane lets a customer use one Bespoke API key across all
-of the providers you operate. Provider credentials remain on the server, and
-every execution is automatically attributed to the customer's organization
-and sandbox.
+Give your users one product API key and your operators one place to manage
+their sandboxes. Clients send work to your control plane; it authenticates the
+organization, checks creation policies, calls the selected provider, and records
+usage against the organization and sandbox.
+
+The dashboard brings together three views of the same workload:
+
+- **Resources:** what is running, who created it, how much CPU/RAM/GPU it uses,
+  and when it expires.
+- **Spend:** sandbox compute costs and, for hosted agent runs, tokens and model
+  costs with reported values and estimates clearly distinguished.
+- **Operations:** creation failures, execution history, policy denials, alerts,
+  audit events, and permission-controlled termination.
+
+Use the five steps below to go from a server installation to a metered run you
+can inspect in the dashboard. For deployment details, keep the
+[operations runbook](docs/CONTROL_PLANE_OPERATIONS.md) and
+[HTTP API contract](docs/CONTROL_PLANE_API.md) alongside this guide.
 
 This is a self-hosted service shipped in the repository. Run **one API process
 per SQLite database**: live sandbox handles are held in that process, and
@@ -288,6 +346,9 @@ allowed; set an explicit list for your deployment. `HOST` and `PORT` default to
 `127.0.0.1` and `8000`. The CLI serves HTTP; terminate HTTPS at a reverse proxy
 for the secure dashboard cookie.
 
+<details>
+<summary>Provider configuration, health checks, and restart recovery</summary>
+
 Provider configuration is server-owned. The control plane reads the standard
 Daytona, E2B, Modal, Runpod, Tensorlake, and boxd credential variables into memory;
 it never returns their names or values through the product API. Scoped
@@ -304,6 +365,8 @@ restarted process cannot reclaim a real cloud resource whose in-memory runtime
 was lost. A production deployment requiring those capabilities must instantiate
 `ControlPlane` in deployment code and inject provider-specific health-check,
 reconciler, and terminator adapters after testing them against that provider.
+
+</details>
 
 ### 3. Issue the initial product API key
 
@@ -362,23 +425,33 @@ costs = client.costs(group_by="backend")
 print(costs)
 ```
 
+The run is now attributed to its organization and sandbox. Open the dashboard
+in step 5 to inspect its lifecycle and compute cost. To capture model tokens and
+costs as well, use the hosted [`run_agent` workflow](#token-usage--cost).
+
+<details>
+<summary>Request semantics, cost accounting, policies, and cleanup</summary>
+
 The context manager requests sandbox destruction on exit. Creation keys are
 scoped to an organization: the same key and payload return the existing record,
 including its current status, while a different payload is rejected. Execution
-keys are scoped to an organization and sandbox. A completed execution can
+keys are scoped to an organization and sandbox. A completed code/command execution can
 return its cached response while the runtime remains attached and running;
-an in-progress or failed execution returns a conflict. Execution payloads are
+an in-progress or failed execution returns a conflict. Code/command payloads are
 not compared, so use a new key for each distinct command and reuse it only to
 retry that command. The client does not automatically retry HTTP requests.
+Hosted agent runs have their own persisted replay and payload checks, described
+in [token usage and cost](#token-usage--cost).
 
 `RemoteSandboxClient(..., timeout_secs=60)` sets the HTTP request timeout;
 `client.create(..., timeout_secs=60)` sets the sandbox timeout. Allow enough
 HTTP time for provider creation. A client timeout does not cancel server work.
 
 The remote surface currently supports creation, inventory (`list` / `get`),
-code/command execution, destruction, costs, and reconciliation. It does not
-expose the direct SDK's file transfers, `Manifest`, `backend_options`, agent
-helpers, structured `return_type`, snapshot creation, or session resume. See the
+code/command execution, `run_agent`, destruction, costs, and reconciliation.
+Hosted `run_agent` records model usage for the dashboard. The remote client does
+not expose the direct SDK's file transfers, `Manifest`, `backend_options`,
+`AgentSpec` bindings, structured `return_type`, snapshot creation, or session resume. See the
 [API contract](docs/CONTROL_PLANE_API.md) for the remaining HTTP endpoints.
 Cost amounts and durations arrive as decimal strings; `group_by` accepts
 `"sandbox"`, `"backend"`, or `"day"`.
@@ -434,12 +507,23 @@ is not repeated. Set `BESPOKE_SUPERVISION_INTERVAL_SECS` to tune the scan
 interval. These restart-recovery and reconciliation behaviors require injected
 terminator/reconciler adapters; the stock CLI does not supply them.
 
+</details>
+
 ### 5. Inspect usage in the dashboard
 
 Open [`http://127.0.0.1:8000/dashboard`](http://127.0.0.1:8000/dashboard) and
 enter the `bsk_live_...` product key. For this plain-HTTP loopback example,
 set `BESPOKE_SESSION_COOKIE_SECURE=0` before starting the server so the browser
 can send its session cookie. Keep the default `1` when serving over HTTPS.
+
+Start with the sandbox you just created: inspect its lifecycle, execution result,
+and compute cost. For a still-running sandbox with a compatible image, its detail
+panel also shows live resource charts. Hosted agent runs add token and model-cost
+records. A local-only example records runtime with zero provider cost.
+
+<details>
+<summary>Live metrics: availability, sampling, and retention</summary>
+
 The sandbox detail panel includes live CPU, RAM, and NVIDIA GPU charts for the
 last hour. The control plane samples attached, running sandboxes every 15 seconds
 independently of the lifecycle watchdog. Read the same history through
@@ -471,6 +555,8 @@ so repeated failures cannot accumulate unbounded workers.
 
 The counter meanings follow the [Linux cgroup v2 documentation](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
 and [NVIDIA's monitoring documentation](https://docs.nvidia.com/deploy/nvidia-smi/).
+
+</details>
 
 The initial organization key has every scope. A read-only dashboard key needs
 both `usage:read` and `sandboxes:read`.
@@ -546,6 +632,41 @@ Common errors:
 | `backend is not enabled: e2b` | Add `e2b` to `BESPOKE_ALLOWED_BACKENDS` and restart the server. |
 | `invalid API key` | Confirm the full `bsk_live_...` value, database path, and original pepper. |
 | Provider authentication failure | Install that provider's extra and configure its credential on the server. |
+
+## Supported Backends
+
+### Local
+
+Local execution needs no provider account. Docker, Ray, and Safehouse have
+the runtime requirements listed below.
+
+| Backend | Extra | Requires |
+|---|---|---|
+| Local subprocess | _(none)_ | Python installed |
+| [Monty](https://github.com/pydantic/monty) | `[monty]` | Bundled Monty worker binary |
+| [Agent Safehouse](https://github.com/eugene1g/agent-safehouse) | _(none)_ | macOS + `safehouse` CLI |
+| [Docker](https://www.docker.com) | `[docker]` | Docker daemon running |
+| [Ray](https://www.ray.io) | `[ray]` | Ray installed (local or remote cluster) |
+
+### Cloud
+
+| Backend | Extra | Auth |
+|---|---|---|
+| [Daytona](https://www.daytona.io) | `[daytona]` | `DAYTONA_API_KEY` |
+| [Tensorlake](https://tensorlake.ai) | `[tensorlake]` | `TENSORLAKE_API_KEY` or `tl login` |
+| [Modal](https://modal.com) | `[modal]` | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` |
+| [RunPod](https://www.runpod.io) | _(none)_ | `RUNPOD_API_KEY` + registered SSH key |
+| [E2B](https://e2b.dev) | `[e2b]` | `E2B_API_KEY` |
+| [boxd](https://boxd.sh) | `[boxd]` | `BOXD_API_KEY` |
+| [Google Cloud Batch](https://cloud.google.com/batch) (jobs only) | `[gcp-batch]` | Application Default Credentials |
+
+You only need to install the backend you use. The others are lazily imported.
+
+Local and Ray execute subprocesses on the host or Ray worker and inherit its
+environment. Their workspace path rewriting is a convenience, not an OS
+security boundary. Safehouse wraps subprocesses with its macOS policy, while
+its file helpers still access the host directly. Use the isolation properties
+of your selected backend when deciding which workloads to run.
 
 ## API Reference
 
