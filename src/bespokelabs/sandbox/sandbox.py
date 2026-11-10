@@ -154,6 +154,30 @@ class Sandbox:
         elif isinstance(preset, SandboxPreset):
             resolved_preset = preset
 
+        capabilities = (
+            _backend_client
+            if _backend_client is not None
+            else BACKENDS[backend]
+        )
+        if getattr(capabilities, "supports_commands", True) is False and (
+            resolved_preset is not None or git_repo is not None
+        ):
+            raise FeatureNotSupportedError(
+                f"Backend '{backend}' does not support presets or git_repo; "
+                "seed virtual files with files= instead",
+                backend=backend,
+                op="create",
+            )
+        if (
+            cpu is not None
+            and getattr(capabilities, "supports_cpu_limits", True) is False
+        ):
+            raise FeatureNotSupportedError(
+                f"Backend '{backend}' does not support CPU reservations",
+                backend=backend,
+                op="create",
+            )
+
         # Pick the preset image for this backend: tensorlake uses a
         # project-scoped name (tensorlake_image), while RunPod uses its
         # SSH-ready default image and runs the preset setup commands there.
@@ -454,6 +478,13 @@ class Sandbox:
         sandbox.  Empty source directories are a no-op (returns 0).
         """
         self._check_alive()
+        if getattr(self._session, "supports_directory_transfer", True) is False:
+            raise FeatureNotSupportedError(
+                "Directory transfers are unsupported; seed files with files= "
+                "or upload_file() instead",
+                backend=self.backend_name,
+                op="upload_dir",
+            )
         return _transfer.upload_dir(self, local_dir, remote_dir, method=method)
 
     def download_dir(
@@ -468,6 +499,12 @@ class Sandbox:
         to a per-file loop when ``tar`` is unavailable.
         """
         self._check_alive()
+        if getattr(self._session, "supports_directory_transfer", True) is False:
+            raise FeatureNotSupportedError(
+                "Directory transfers are unsupported; use download_file() instead",
+                backend=self.backend_name,
+                op="download_dir",
+            )
         return _transfer.download_dir(
             self, remote_dir, local_dir, method=method
         )

@@ -2,6 +2,15 @@
   "last_updated": "2026-03-28",
   "note": "Prices are best-effort estimates. Run examples/update_pricing.py to refresh from the web.",
   "backends": {
+    "monty": {
+      "vcpu_per_hour_usd": 0.0,
+      "ram_gib_per_hour_usd": 0.0,
+      "storage_gib_per_month_usd": 0.0,
+      "per_execution_usd": 0.0,
+      "free_tier": null,
+      "pricing_url": null,
+      "notes": "Local Monty workers; no provider fee. Host compute is not included."
+    },
     "local": {
       "vcpu_per_hour_usd": 0.0,
       "ram_gib_per_hour_usd": 0.0,

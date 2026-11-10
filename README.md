@@ -148,6 +148,7 @@ for old editable checkouts or a local `bespokelabs.py` if imports fail.
 
 ```bash
 pip install 'bespokelabs-sandbox[docker]'
+pip install 'bespokelabs-sandbox[monty]'       # local Python subset, no shell
 pip install 'bespokelabs-sandbox[daytona]'
 pip install 'bespokelabs-sandbox[tensorlake]'
 pip install 'bespokelabs-sandbox[modal]'
@@ -206,6 +207,67 @@ and `daytona`. See [provider requirements](#supported-backends) and the
 **Ready for shared visibility and control?** Run the control plane below and
 connect through `RemoteSandboxClient`. For agent workloads, jump to
 [agent-ready sandboxes](#agent-ready-sandboxes) or [token usage and cost](#token-usage--cost).
+
+### Monty: local Python execution
+
+Monty runs a Python subset in a local Rust interpreter worker. It needs no
+provider account or Docker daemon. Install `bespokelabs-sandbox[monty]`
+(Python 3.10+), then use the same code and file APIs:
+
+```python
+from bespokelabs.sandbox import NetworkPolicy, Sandbox
+
+with Sandbox(
+    "monty",
+    memory_mb=64,
+    timeout_secs=5,
+    network=NetworkPolicy(mode="none"),
+    files={"/data/numbers.json": "[1, 2, 3]"},
+) as sb:
+    result = sb.execute_code(
+        "import json\n"
+        "numbers = json.loads(open('/data/numbers.json').read())\n"
+        "print(sum(numbers))"
+    )
+    print(result.stdout)  # 6
+```
+
+Globals and files persist between calls in one sandbox. `execute_code()`
+accepts `python` or `python3` and returns captured stdout/stderr and an exit
+code; trailing expression values are not printed automatically. `return_type=`
+still parses printed JSON. `SandboxClient` and the async wrappers also work;
+each sandbox owns a separate worker pool, closed by `destroy()` or context exit.
+Calls on the same session are serialized.
+
+Files live in memory through Monty's `OSAccess`, including writes from code
+and single-file uploads/downloads. `workdir` is an absolute **virtual** POSIX
+path (default `/`), created automatically and reset before each execution.
+Relative SDK paths use that directory. `env_vars` exposes only supplied
+values; host files, environment, network, callbacks and modules are not exposed.
+Networking is always unavailable, including with the default legacy
+`allow_internet=True`; explicit `network=` accepts only `none`.
+
+`memory_mb` limits Monty's allocator usage, not worker RSS or total host memory.
+`timeout_secs` sets the per-feed execution budget, per-turn worker deadline,
+and sleep budget; it is not a single end-to-end wall-clock deadline.
+Timeouts return exit code 124; guest errors return 1. A timeout, memory/output
+limit, or worker crash closes the session: create a new sandbox afterward.
+Ordinary syntax and runtime errors leave the session usable.
+
+Supported `backend_options` are `binary_path` (explicit worker executable),
+`max_output_bytes` (default 10 MiB per execution), `max_file_bytes` (default
+50,000,000 total file-content bytes), `max_recursion_depth` (default 1000),
+and `max_suspensions` (default 1000 host round trips per session). Numeric limits
+must be positive; unknown options are rejected. File and output budgets are
+separate from interpreter memory.
+
+Shell commands, CLI agents, package installation, presets, `git_repo`, directory
+transfers, executable permissions, images, CPU/GPU reservations, disk volumes,
+ports, snapshots, and session reattachment are unsupported. Use `files=` (or
+`build_files_map`) to seed directory contents. Monty is a language-level sandbox;
+it does not provide container/VM isolation or full CPython/package compatibility.
+See the upstream [language limitations](https://pydantic.dev/docs/monty/limitations/)
+and [security model](https://pydantic.dev/docs/monty/concepts/security/).
 
 ## Hosted control plane
 
@@ -581,6 +643,7 @@ the runtime requirements listed below.
 | Backend | Extra | Requires |
 |---|---|---|
 | Local subprocess | _(none)_ | Python installed |
+| [Monty](https://github.com/pydantic/monty) | `[monty]` | Bundled Monty worker binary |
 | [Agent Safehouse](https://github.com/eugene1g/agent-safehouse) | _(none)_ | macOS + `safehouse` CLI |
 | [Docker](https://www.docker.com) | `[docker]` | Docker daemon running |
 | [Ray](https://www.ray.io) | `[ray]` | Ray installed (local or remote cluster) |
@@ -1780,6 +1843,9 @@ rather than at `AsyncSandboxClient(...)` construction, which does no I/O.
 This table describes the adapters in this repository, not every feature offered
 by each provider's native SDK. “Interpreter” means an installed binary that
 accepts `-c`; use shell commands for other language runtimes.
+
+Monty's Python-only capability set is described [above](#monty-local-python-execution);
+the table below covers the backends that support shell commands.
 
 | Feature | Local | Safehouse | Docker | Ray | Daytona | Tensorlake | Modal | RunPod | E2B | boxd |
 |---|---|---|---|---|---|---|---|---|---|---|
