@@ -8,9 +8,11 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterable
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Protocol
+from weakref import WeakValueDictionary
 
 from bespokelabs.sandbox import pricing
 from bespokelabs.sandbox.backends import BACKENDS
@@ -39,9 +41,17 @@ from bespokelabs.sandbox.control_plane.resource_metrics import (
     ResourceMonitor,
 )
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
-from bespokelabs.sandbox.exceptions import ErrorOutcome
+from bespokelabs.sandbox.exceptions import (
+    ErrorOutcome,
+    FeatureNotSupportedError,
+    SandboxConfigurationError,
+)
 from bespokelabs.sandbox.sandbox import Sandbox
-from bespokelabs.sandbox.types import AgentRunResult, SandboxResult
+from bespokelabs.sandbox.types import (
+    AgentRunResult,
+    NetworkPolicy,
+    SandboxResult,
+)
 
 _SANDBOX_CONFIG_FIELDS = {
     "preset",
@@ -53,6 +63,7 @@ _SANDBOX_CONFIG_FIELDS = {
     "image",
     "env_vars",
     "allow_internet",
+    "network",
     "app_name",
     "template",
     "snapshot_id",
@@ -82,6 +93,9 @@ class SandboxRuntime(Protocol):
         ...
 
     def run_agent(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+        ...
+
+    def set_network(self, policy: NetworkPolicy) -> None:
         ...
 
     def estimate_compute_cost(self, elapsed_secs: float) -> float:
@@ -134,6 +148,9 @@ class ControlPlane:
                 f"create sandboxes: {sorted(self._allowed_backends & job_only)}"
             )
         self._runtimes: dict[str, SandboxRuntime] = {}
+        self._network_locks: WeakValueDictionary[str, threading.Lock] = (
+            WeakValueDictionary()
+        )
         self._provider_reconcilers = provider_reconcilers or {}
         self._provider_settings = {
             backend: dict(values)
@@ -225,7 +242,25 @@ class ControlPlane:
         ):
             raise ValueError("idempotency key must contain 1 to 255 characters")
 
-        persisted_config = dict(config)
+        config = dict(config)
+        network = config.get("network")
+        if network is not None:
+            if not isinstance(network, NetworkPolicy):
+                raise SandboxConfigurationError(
+                    "network must be a NetworkPolicy",
+                    backend=backend,
+                    op="create",
+                )
+            if config.get("allow_internet") is not None:
+                raise SandboxConfigurationError(
+                    "Pass either network or allow_internet, not both",
+                    backend=backend,
+                    op="create",
+                )
+        request_config = dict(config)
+        if network is not None:
+            request_config["network"] = asdict(network)
+        persisted_config = dict(request_config)
         env_vars = persisted_config.pop("env_vars", None)
         if env_vars:
             persisted_config["env_var_names"] = sorted(env_vars)
@@ -242,7 +277,7 @@ class ControlPlane:
             backend,
             persisted_config,
             idempotency_key=idempotency_key,
-            request_payload={"backend": backend, **config},
+            request_payload={"backend": backend, **request_config},
             timestamp=timestamp,
             hourly_rate_usd=hourly_rate,
             pricing_source=pricing.get_pricing()["last_updated"],
@@ -307,6 +342,54 @@ class ControlPlane:
     ) -> SandboxRecord:
         self.require(principal, "sandboxes:read")
         return self.store.get_sandbox(principal.organization_id, sandbox_id)
+
+    def set_network(
+        self, principal: Principal, sandbox_id: str, policy: NetworkPolicy
+    ) -> SandboxRecord:
+        """Apply an egress policy before recording its successful replacement."""
+        self.require(principal, "sandboxes:network")
+        record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        if not isinstance(policy, NetworkPolicy):
+            raise SandboxConfigurationError(
+                "set_network() takes a NetworkPolicy",
+                backend=record.backend,
+                op="set_network",
+            )
+        with self._lock:
+            lock = self._network_locks.setdefault(sandbox_id, threading.Lock())
+        # Serialize replacements for this sandbox without blocking other runtimes.
+        with lock:
+            record = self.store.get_sandbox(
+                principal.organization_id, sandbox_id
+            )
+            if record.status != "running":
+                raise ConflictError(f"sandbox is {record.status}")
+            with self._lock:
+                runtime = self._runtimes.get(sandbox_id)
+            if runtime is None:
+                raise ConflictError(
+                    "sandbox runtime is unavailable after a control-plane restart"
+                )
+            try:
+                setter = getattr(runtime, "set_network", None)
+                if setter is None:
+                    raise FeatureNotSupportedError(
+                        "Backend cannot change the network policy of a running sandbox",
+                        backend=record.backend,
+                        op="set_network",
+                    )
+                setter(policy)
+            except Exception as exc:
+                provider_error = normalize_provider_error(
+                    exc, backend=record.backend, op="set_network"
+                )
+                if provider_error is exc:
+                    raise
+                raise provider_error from exc
+            self.store.update_sandbox_network(
+                principal.organization_id, sandbox_id, asdict(policy)
+            )
+            return self.store.get_sandbox(principal.organization_id, sandbox_id)
 
     def execute(
         self,

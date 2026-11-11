@@ -28,6 +28,7 @@ _PUBLIC_MESSAGES = {
     ErrorCode.AUTHENTICATION: "Provider authentication failed.",
     ErrorCode.BACKEND_NOT_INSTALLED: "Provider backend is unavailable.",
     ErrorCode.CONFIGURATION: "Provider configuration is invalid.",
+    ErrorCode.FEATURE_NOT_SUPPORTED: "Provider does not support this operation or policy.",
     ErrorCode.CONNECTION: "Provider connection failed.",
     ErrorCode.CREATION_FAILED: "Provider sandbox creation failed.",
     ErrorCode.EXECUTION_FAILED: "Provider execution failed.",

@@ -30,7 +30,7 @@ opener, and HSTS protections.
 
 | Area | Read | Mutate |
 |---|---|---|
-| Sandboxes | `sandboxes:read` | `sandboxes:create`, `sandboxes:execute`, `sandboxes:terminate` |
+| Sandboxes | `sandboxes:read` | `sandboxes:create`, `sandboxes:execute`, `sandboxes:terminate`, `sandboxes:network` |
 | Usage/cost | `usage:read` | — |
 | Policy | `policies:read` | `policies:write` |
 | Providers | `providers:read` | `providers:write`, `providers:reconcile` |
@@ -42,6 +42,8 @@ opener, and HSTS protections.
 
 `*` grants all scopes. Legacy `sandboxes:write` maps to create, execute,
 terminate, and provider reconciliation only.
+Changing a running sandbox's network policy requires `sandboxes:network` or
+`*`; neither `sandboxes:execute` nor legacy `sandboxes:write` grants it.
 
 ## Endpoints
 
@@ -58,6 +60,7 @@ terminate, and provider reconciliation only.
 | `GET /v1/sandboxes` | `sandboxes:read` | Tenant inventory |
 | `GET /v1/sandboxes/{id}` | `sandboxes:read` | Lifecycle record |
 | `GET /v1/sandboxes/{id}/detail` | `sandboxes:read` | Timeline, attempts, executions, cost, observations |
+| `PUT /v1/sandboxes/{id}/network` | `sandboxes:network` | Replace egress policy; returns updated lifecycle record |
 | `POST /v1/sandboxes/{id}/execute` | `sandboxes:execute` | Exactly one code or command request |
 | `DELETE /v1/sandboxes/{id}` | `sandboxes:terminate` | Idempotent termination; optional revision `If-Match` |
 | `GET /v1/costs` | `usage:read` | Group by `sandbox`, `backend`, or `day` |
@@ -78,6 +81,71 @@ Creation and execution accept `Idempotency-Key`. Reusing a creation key with an
 identical request returns the same logical sandbox; changing the request returns
 `409`. Termination accepts a positive version in `If-Match` and rejects a stale
 revision with `409`, while an already completed termination remains idempotent.
+
+## Network policies
+
+`POST /v1/sandboxes` accepts a `network` object using the SDK's `NetworkPolicy`
+fields:
+
+```json
+{
+  "backend": "daytona",
+  "network": {
+    "mode": "allowlist",
+    "domains": ["api.example.com"],
+    "cidrs": []
+  }
+}
+```
+
+`mode` is `public` (the default), `none`, or `allowlist`. `domains` and `cidrs`
+are arrays of strings, defaulting to empty. An allowlist needs at least one
+entry; the other modes cannot include entries. CIDRs must be valid IP networks.
+Unknown policy fields are rejected. Supplying both a non-null `network` and
+non-null `allow_internet` returns `422`, even when their intent agrees. Omitting
+`network` preserves the existing legacy behavior.
+
+To replace a running sandbox's policy, send the policy itself as the body of
+`PUT /v1/sandboxes/{id}/network`, for example `{"mode":"none"}`. This replaces
+the entire policy, including previous allowlist entries; it is not a patch.
+The response is the sandbox record with `config.network` set to the last
+successfully applied policy and an incremented `version`. An old
+`config.allow_internet` field is removed after a successful replacement.
+Creation idempotency still compares the original creation request: replaying
+it returns the existing record and does not restore the original policy.
+
+Backend capabilities and restrictions match the
+[direct SDK](SDK_REFERENCE.md#network-policy). Unsupported modes or runtime
+updates return `422` with `detail.code="feature_not_supported"`; invalid
+provider-specific configuration also returns `422`. Provider errors retain
+their structured fields, including `op="set_network"`. Detached runtimes
+(including after a server restart) and non-running sandboxes return `409`.
+Updates are tenant-scoped, require `sandboxes:network`, obey browser CSRF
+protection, and produce `sandbox.set_network` audit records.
+
+The server records the new policy only after the provider call succeeds.
+A timeout or connection error can leave the provider state unknown; the
+stored policy is the last confirmed value, not independent verification of
+current egress. Updates do not use creation/execution idempotency keys and
+the client does not retry them automatically.
+
+With `RemoteSandboxClient`, pass the existing Python value object:
+
+```python
+from bespokelabs.sandbox import NetworkPolicy, RemoteSandboxClient
+
+client = RemoteSandboxClient("https://sandbox.example", product_api_key)
+with client.create(
+    "daytona",
+    network=NetworkPolicy(mode="allowlist", domains=["api.example.com"]),
+) as sandbox:
+    sandbox.set_network(NetworkPolicy(mode="none"))
+```
+
+This example's key needs `sandboxes:create`, `sandboxes:network`, and
+`sandboxes:terminate` (or `*`). `RemoteSandbox.set_network()` returns `None`
+on success and raises `RemoteSandboxError` for HTTP/provider failures.
+`client.get(sandbox.id)` exposes the recorded policy with `sandboxes:read`.
 
 ## Pagination and CSV
 
