@@ -9,7 +9,7 @@ Start with the [first agent example](../README.md#run-your-first-agent). This gu
 - [Agent-ready sandboxes](#agent-ready-sandboxes)
 - [Token usage & cost](#token-usage--cost)
 - [Presets](#presets)
-- [Prebuilt Preset Images](#prebuilt-preset-images)
+- [Installation and custom images](#installation-and-custom-images)
 - [Non-interactive web access](#non-interactive-web-access)
 - [Envy notifications for agents](#envy-notifications-for-agents)
 
@@ -248,8 +248,9 @@ GLM models can be selected using their OpenCode `provider/model` identifier.
 `extra_args=["--session", session_id]` selects a specific session.
 The preset installs OpenCode at startup, requiring npm and install permissions
 on the sandbox; its Docker setup installs npm and Git on the default Debian image
-before cloning repositories. OpenCode opts into `setup_before_workspace=True`;
-other presets retain setup after workspace materialization by default.
+before cloning repositories. All built-in agent presets use
+`setup_before_workspace=True`; custom presets default to setup after workspace
+materialization.
 No prebuilt OpenCode image is assumed. The preset installs the CLI; select the
 harness separately with `harness="opencode"` when calling `run_agent`.
 OpenCode JSON step costs and token counts are summed across the run, including
@@ -316,68 +317,64 @@ cold-start and execution time, then estimates cost with the same pricing data.
 
 ## Presets
 
-Presets are predefined sandbox configurations with setup commands that run after creation.
-The built-in presets are focused on agent CLIs: `codex`, `grok`, `claude-code`, `claude-code-codex`, and `opencode`.
-The npm-based setup commands require Node.js and `npm` in the execution environment when setup commands are used as a fallback.
+Presets combine agent installation commands with resource and environment
+defaults. The built-in presets are `codex`, `grok`, `claude-code`,
+`claude-code-codex`, and `opencode`.
 
-### Prebuilt Preset Images
+### Installation and custom images
 
-The `codex`, `claude-code`, and `claude-code-codex` presets have prebuilt OCI
-images published to GitHub Container Registry. `grok` and `opencode` install at
-startup instead:
-
-```text
-ghcr.io/bespokelabsai/sandbox/<preset>:v2
-```
-
-Docker, Daytona, and Modal use these images automatically when you pass a preset, then skip the preset's setup commands because the tools are already baked into the image.
-
-The main advantage is that prebuilt images move setup work from sandbox startup time to image build time:
-
-- Sandboxes start faster because they do not reinstall the same tools for every run.
-- Startup is more reliable because it depends less on package registry availability during sandbox creation.
-- Preset environments are more reproducible because images use pinned tags instead of a moving `latest` tag.
-
-For example, this Docker sandbox starts from `ghcr.io/bespokelabsai/sandbox/codex:v2` and does not run `npm install -g @openai/codex` at startup:
+Built-in presets install their CLIs at sandbox creation; they do not select
+Bespoke-hosted images. In particular, `preset="codex"` no longer pulls the old
+`ghcr.io/bespokelabsai/sandbox/codex:v2` image.
 
 ```python
+from bespokelabs.sandbox import Sandbox
+
 with Sandbox("docker", preset="codex") as sb:
-    sb.execute_command("codex --version")
+    print(sb.execute_command("codex --version").stdout)
 ```
 
-You can still override the image explicitly when you need a custom base image:
+On Docker, Daytona, and Modal, setup checks for Node.js, npm, and Git, installing
+missing prerequisites with `apt-get` on Debian/Ubuntu base images before
+running `npm install -g`. Custom images need those tools already available or
+root access to a working `apt-get`. Choose a Node.js version supported by the
+CLI you install. Setup runs before repository cloning and file/workspace
+materialization. A failed setup triggers sandbox cleanup.
+
+Installation requires network access, adds startup time, and uses the npm
+package version resolved at creation. Credentials are supplied separately.
+Tensorlake uses a writable npm prefix; boxd checks the tools already present
+for its supported presets. Other backends need Node.js/npm and installation
+permissions. On Local and Ray, setup runs on the host/worker and can install
+global npm packages.
+
+Passing `image=` with a built-in preset changes the base image and still runs
+installation. To use your own image with the tools already installed and skip
+setup on Docker, Daytona, or Modal, supply a custom preset:
 
 ```python
-with Sandbox("docker", preset="codex", image="my-registry/codex-tools:v3") as sb:
-    sb.execute_command("codex --version")
+from bespokelabs.sandbox import Sandbox, SandboxPreset
+
+codex_image = SandboxPreset(
+    name="my-codex",
+    description="Codex installed in an image maintained by my team",
+    image="registry.example.com/my-team/codex:2026-11-11",
+    setup_commands=["npm install -g @openai/codex"],
+    memory_mb=2048,
+    timeout_secs=1800,
+)
+with Sandbox("docker", preset=codex_image) as sb:
+    print(sb.execute_command("codex --version").stdout)
 ```
 
-An explicit image different from the preset image makes setup commands run
-again, so that custom image must support the preset's installation commands.
-On Local and Ray, those commands run on the host/worker and can install global
-npm packages. Use `Sandbox.list_presets()` to inspect registered defaults.
+Use an image you have built and published, preferably pinned by digest for
+reproducibility. The matching preset image skips setup on supported backends;
+an explicit different `image=` or `dockerfile=` runs the custom preset's setup
+commands. Tensorlake uses `tensorlake_image=` on the preset for its
+project-scoped image names. The Dockerfiles under `images/` remain available
+for building your own images; built-in presets do not depend on published tags.
 
-The Dockerfiles live under `images/<preset>/`. Local, Safehouse, Ray, and other
-backends that cannot use the prebuilt image still fall back to the preset setup
-commands. RunPod deliberately does this on its SSH-ready default image.
-Tensorlake image names are project-scoped, so you can build/register equivalent
-images from the same Dockerfiles when you need Tensorlake-specific preset
-images.
-
-```python
-# Sandbox with Codex CLI installed
-with Sandbox("docker", preset="codex") as sb:
-    sb.execute_command("codex --version")
-
-# Sandbox with Claude Code installed
-with Sandbox("docker", preset="claude-code") as sb:
-    sb.execute_command("claude --version")
-
-# Sandbox with both Claude Code and Codex CLI installed
-with Sandbox("docker", preset="claude-code-codex") as sb:
-    sb.execute_command("claude --version")
-    sb.execute_command("codex --version")
-```
+Use `Sandbox.list_presets()` to inspect registered configurations.
 
 Built-in presets:
 

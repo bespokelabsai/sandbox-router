@@ -69,17 +69,16 @@ def get_preset(name: str) -> SandboxPreset:
     return PRESETS[name]
 
 
-# -- Constants -------------------------------------------------------------
-
-IMAGE_REGISTRY = "ghcr.io/bespokelabsai/sandbox"
-
-# Pinned tag for preset images. Bump to cut a new immutable image set,
-# then run the build-images workflow_dispatch with the same tag value.
-# Never use ":latest" here — it's not reproducible.
-#
-# v2: every preset image now installs git, so git_repo= works on all of
-#     them (v1 images were slim-based and lacked git).
-PRESET_IMAGE_TAG = "v2"
+def _container_npm_install(packages: str) -> list[str]:
+    """Install prerequisites on Debian/Ubuntu base images, then the CLI."""
+    return [
+        "(command -v node >/dev/null 2>&1 && "
+        "command -v npm >/dev/null 2>&1 && "
+        "command -v git >/dev/null 2>&1) || "
+        "(apt-get update && DEBIAN_FRONTEND=noninteractive "
+        "apt-get install -y --no-install-recommends nodejs npm git)",
+        f"npm install -g {packages}",
+    ]
 
 
 def _tensorlake_npm_install(packages: str) -> str:
@@ -98,12 +97,9 @@ register_preset(
         description="Sandbox with Grok Build CLI installed",
         setup_commands=["npm install -g @xai-official/grok"],
         backend_setup_commands={
-            "docker": [
-                "(command -v npm >/dev/null 2>&1 && "
-                "command -v git >/dev/null 2>&1) || "
-                "(apt-get update && apt-get install -y nodejs npm git)",
-                "npm install -g @xai-official/grok",
-            ],
+            "docker": _container_npm_install("@xai-official/grok"),
+            "daytona": _container_npm_install("@xai-official/grok"),
+            "modal": _container_npm_install("@xai-official/grok"),
             "tensorlake": [_tensorlake_npm_install("@xai-official/grok")],
         },
         memory_mb=2048,
@@ -118,12 +114,9 @@ register_preset(
         description="Sandbox with OpenCode CLI installed (including GLM support)",
         setup_commands=["npm install -g opencode-ai"],
         backend_setup_commands={
-            "docker": [
-                "(command -v npm >/dev/null 2>&1 && "
-                "command -v git >/dev/null 2>&1) || "
-                "(apt-get update && apt-get install -y nodejs npm git)",
-                "npm install -g opencode-ai",
-            ],
+            "docker": _container_npm_install("opencode-ai"),
+            "daytona": _container_npm_install("opencode-ai"),
+            "modal": _container_npm_install("opencode-ai"),
             "tensorlake": [_tensorlake_npm_install("opencode-ai")],
             "boxd": ["opencode --version"],
         },
@@ -137,11 +130,13 @@ register_preset(
     SandboxPreset(
         name="claude-code",
         description="Sandbox with Claude Code (Anthropic CLI) installed",
-        image=f"{IMAGE_REGISTRY}/claude-code:{PRESET_IMAGE_TAG}",
         setup_commands=[
             "npm install -g @anthropic-ai/claude-code",
         ],
         backend_setup_commands={
+            "docker": _container_npm_install("@anthropic-ai/claude-code"),
+            "daytona": _container_npm_install("@anthropic-ai/claude-code"),
+            "modal": _container_npm_install("@anthropic-ai/claude-code"),
             "tensorlake": [
                 _tensorlake_npm_install("@anthropic-ai/claude-code"),
             ],
@@ -149,6 +144,7 @@ register_preset(
         },
         memory_mb=2048,
         timeout_secs=1800,
+        setup_before_workspace=True,
     )
 )
 
@@ -156,11 +152,13 @@ register_preset(
     SandboxPreset(
         name="codex",
         description="Sandbox with Codex CLI installed",
-        image=f"{IMAGE_REGISTRY}/codex:{PRESET_IMAGE_TAG}",
         setup_commands=[
             "npm install -g @openai/codex",
         ],
         backend_setup_commands={
+            "docker": _container_npm_install("@openai/codex"),
+            "daytona": _container_npm_install("@openai/codex"),
+            "modal": _container_npm_install("@openai/codex"),
             "tensorlake": [
                 _tensorlake_npm_install("@openai/codex"),
             ],
@@ -168,6 +166,7 @@ register_preset(
         },
         memory_mb=2048,
         timeout_secs=1800,
+        setup_before_workspace=True,
     )
 )
 
@@ -175,11 +174,19 @@ register_preset(
     SandboxPreset(
         name="claude-code-codex",
         description="Sandbox with Claude Code and Codex CLI installed",
-        image=f"{IMAGE_REGISTRY}/claude-code-codex:{PRESET_IMAGE_TAG}",
         setup_commands=[
             "npm install -g @anthropic-ai/claude-code @openai/codex",
         ],
         backend_setup_commands={
+            "docker": _container_npm_install(
+                "@anthropic-ai/claude-code @openai/codex"
+            ),
+            "daytona": _container_npm_install(
+                "@anthropic-ai/claude-code @openai/codex"
+            ),
+            "modal": _container_npm_install(
+                "@anthropic-ai/claude-code @openai/codex"
+            ),
             "tensorlake": [
                 _tensorlake_npm_install(
                     "@anthropic-ai/claude-code @openai/codex"
@@ -189,5 +196,6 @@ register_preset(
         },
         memory_mb=2048,
         timeout_secs=1800,
+        setup_before_workspace=True,
     )
 )

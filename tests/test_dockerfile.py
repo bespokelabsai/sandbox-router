@@ -15,6 +15,7 @@ from bespokelabs.sandbox.exceptions import (
     FeatureNotSupportedError,
     SandboxConfigurationError,
 )
+from bespokelabs.sandbox.presets import SandboxPreset
 from bespokelabs.sandbox.types import SandboxConfig, SandboxResult
 
 try:
@@ -76,7 +77,14 @@ class SandboxDockerfileArgsTests(_TmpDockerfile):
         backend = self._backend()
 
         config = self._sandbox(
-            backend, preset="claude-code", dockerfile=self.dockerfile
+            backend,
+            preset=SandboxPreset(
+                name="custom",
+                description="A caller-owned prebuilt image",
+                image="registry.example.com/agent:1",
+                setup_commands=["echo setup"],
+            ),
+            dockerfile=self.dockerfile,
         )
 
         self.assertIsNone(config.image)

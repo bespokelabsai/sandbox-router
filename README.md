@@ -103,8 +103,9 @@ The same API works with configured cloud providers, subject to their
 ## Run your first agent
 
 Use the same Docker installation to run a CLI agent inside a sandbox. This
-example uses the `codex` preset, which supplies an image with the CLI installed.
-Provide your model API key in the environment before running the Python example:
+example uses the `codex` preset, which installs the CLI at startup on the
+backend's base image. Provide your model API key in the environment before
+running the Python example:
 
 ```bash
 export CODEX_API_KEY='your-api-key'
@@ -134,9 +135,10 @@ with Sandbox(
 ```
 
 This makes a model API call using your account. `--skip-git-repo-check` allows
-this file-only example to run without a Git repository. The preset installs
-tools; it does not supply credentials. `preset=` selects the environment and
-`harness=` selects the CLI that `run_agent()` invokes.
+this file-only example to run without a Git repository. Startup installation
+needs network access and adds setup time. The preset installs tools; it does
+not supply credentials. `preset=` selects the environment and `harness=`
+selects the CLI that `run_agent()` invokes.
 
 Use `run_agent()` for supported CLI agents and normalized output and usage.
 Use `agent(AgentSpec.inside(...))` when you need a custom command, working
