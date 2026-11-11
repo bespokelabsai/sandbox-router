@@ -123,6 +123,11 @@ their structured fields, including `op="set_network"`. Detached runtimes
 Updates are tenant-scoped, require `sandboxes:network`, obey browser CSRF
 protection, and produce `sandbox.set_network` audit records.
 
+Network updates and operator/shutdown termination serialize per sandbox,
+including the provider call and policy persistence. TTL cleanup defers a
+sandbox with an active lifecycle operation until a later supervisor pass;
+other expired sandboxes can still be cleaned up in the current pass.
+
 The server records the new policy only after the provider call succeeds.
 A timeout or connection error can leave the provider state unknown; the
 stored policy is the last confirmed value, not independent verification of
