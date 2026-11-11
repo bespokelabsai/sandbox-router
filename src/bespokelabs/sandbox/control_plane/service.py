@@ -148,7 +148,7 @@ class ControlPlane:
                 f"create sandboxes: {sorted(self._allowed_backends & job_only)}"
             )
         self._runtimes: dict[str, SandboxRuntime] = {}
-        self._network_locks: WeakValueDictionary[str, threading.Lock] = (
+        self._lifecycle_locks: WeakValueDictionary[str, threading.Lock] = (
             WeakValueDictionary()
         )
         self._provider_reconcilers = provider_reconcilers or {}
@@ -343,6 +343,13 @@ class ControlPlane:
         self.require(principal, "sandboxes:read")
         return self.store.get_sandbox(principal.organization_id, sandbox_id)
 
+    def _lifecycle_lock(self, sandbox_id: str) -> threading.Lock:
+        """Share a per-sandbox lock across policy updates and termination."""
+        with self._lock:
+            return self._lifecycle_locks.setdefault(
+                sandbox_id, threading.Lock()
+            )
+
     def set_network(
         self, principal: Principal, sandbox_id: str, policy: NetworkPolicy
     ) -> SandboxRecord:
@@ -355,10 +362,8 @@ class ControlPlane:
                 backend=record.backend,
                 op="set_network",
             )
-        with self._lock:
-            lock = self._network_locks.setdefault(sandbox_id, threading.Lock())
-        # Serialize replacements for this sandbox without blocking other runtimes.
-        with lock:
+        # Hold through persistence so termination cannot strand an applied policy.
+        with self._lifecycle_lock(sandbox_id):
             record = self.store.get_sandbox(
                 principal.organization_id, sandbox_id
             )
@@ -598,6 +603,20 @@ class ControlPlane:
         expected_version: int | None = None,
     ) -> SandboxRecord:
         self.require(principal, "sandboxes:terminate")
+        self.store.get_sandbox(principal.organization_id, sandbox_id)
+        with self._lifecycle_lock(sandbox_id):
+            return self._destroy_sandbox(
+                principal, sandbox_id, expected_version=expected_version
+            )
+
+    def _destroy_sandbox(
+        self,
+        principal: Principal,
+        sandbox_id: str,
+        *,
+        expected_version: int | None,
+    ) -> SandboxRecord:
+        """Terminate while the caller holds this sandbox's lifecycle lock."""
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
         if record.status == "destroyed":
             return record
@@ -1200,9 +1219,13 @@ class ControlPlane:
         """Best-effort cleanup of runtimes owned by this process."""
         self.stop_supervision()
         with self._lock:
-            runtimes = list(self._runtimes.items())
-            self._runtimes.clear()
-            for sandbox_id, _ in runtimes:
+            sandbox_ids = list(self._runtimes)
+        for sandbox_id in sandbox_ids:
+            with self._lifecycle_lock(sandbox_id):
+                with self._lock:
+                    runtime = self._runtimes.pop(sandbox_id, None)
+                if runtime is None:
+                    continue
                 try:
                     self.store.mark_lifecycle(
                         sandbox_id, "stopping", self._now().isoformat()
@@ -1211,31 +1234,30 @@ class ControlPlane:
                     # A persistence failure must not strand later provider
                     # runtimes during best-effort process shutdown.
                     pass
-        for sandbox_id, runtime in runtimes:
-            try:
-                runtime.destroy()
-            except Exception:
-                status = "failed"
-                reason = None
-                observation = f"close-failed:{sandbox_id}"
-            else:
-                status = "destroyed"
-                reason = "shutdown"
-                observation = f"close:{sandbox_id}"
-            try:
-                completed_at = self._now().isoformat()
-                self.store.mark_lifecycle(
-                    sandbox_id, status, completed_at, reason=reason
-                )
-                self._record_lifecycle_estimate(
-                    self.store.get_sandbox_internal(sandbox_id),
-                    completed_at,
-                    observation_id=observation,
-                )
-            except Exception:
-                # Provider cleanup for later runtimes takes priority over
-                # best-effort shutdown bookkeeping while persistence is down.
-                pass
+                try:
+                    runtime.destroy()
+                except Exception:
+                    status = "failed"
+                    reason = None
+                    observation = f"close-failed:{sandbox_id}"
+                else:
+                    status = "destroyed"
+                    reason = "shutdown"
+                    observation = f"close:{sandbox_id}"
+                try:
+                    completed_at = self._now().isoformat()
+                    self.store.mark_lifecycle(
+                        sandbox_id, status, completed_at, reason=reason
+                    )
+                    self._record_lifecycle_estimate(
+                        self.store.get_sandbox_internal(sandbox_id),
+                        completed_at,
+                        observation_id=observation,
+                    )
+                except Exception:
+                    # Provider cleanup for later runtimes takes priority over
+                    # best-effort shutdown bookkeeping while persistence is down.
+                    pass
 
     def _record_usage(
         self,
@@ -1324,11 +1346,15 @@ class ControlPlane:
             when
             - timedelta(seconds=max(60, self._supervision_interval_secs * 3))
         ).isoformat()
-        expired = self.store.claim_expired_sandboxes(
-            timestamp=timestamp,
-            owner=self._supervisor_owner,
-            stale_before=stale_before,
-        )
+        # Registering a lifecycle operation and claiming expiry share this lock.
+        # Defer busy sandboxes to the next pass without blocking unrelated cleanup.
+        with self._lock:
+            expired = self.store.claim_expired_sandboxes(
+                timestamp=timestamp,
+                owner=self._supervisor_owner,
+                stale_before=stale_before,
+                exclude_ids=tuple(self._lifecycle_locks),
+            )
         result = {
             "expired_claimed": len(expired),
             "expired_terminated": 0,
