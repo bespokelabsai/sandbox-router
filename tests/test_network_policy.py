@@ -233,8 +233,19 @@ class ModalNetworkTests(unittest.TestCase):
             return Router()
 
         impl = object.__new__(_sandbox._Sandbox)
-        impl._task_id = "ta-1"
-        impl._get_command_router_client = router
+        try:
+            from modal.sandbox._impl_v1 import SandboxImplV1
+        except ImportError:
+            # Older SDKs keep the RPC plumbing on _Sandbox itself.
+            impl._task_id = "ta-1"
+            impl._get_command_router_client = router
+        else:
+            # Modal 1.6.3 delegates to a separate implementation. Keep its real
+            # set_network_access method too, replacing only the RPC transport.
+            backend = SandboxImplV1(None, "sb-1", task_id="ta-1")
+            backend.get_command_router_client = router
+            impl._impl = backend
+            impl._attached = True
         sandbox = synchronizer._translate_out(impl)
         self.assertIsInstance(sandbox, modal.Sandbox)
 
