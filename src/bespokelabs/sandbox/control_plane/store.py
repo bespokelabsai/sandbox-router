@@ -1442,8 +1442,10 @@ class SQLiteStore:
         timestamp: str,
         owner: str,
         stale_before: str,
+        exclude_ids: Iterable[str] = (),
     ) -> list[SandboxRecord]:
-        """Claim expired resources once, including after supervisor restart."""
+        """Claim expired resources, deferring active in-process lifecycle work."""
+        excluded = set(exclude_ids)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
@@ -1458,7 +1460,7 @@ class SQLiteStore:
                    ORDER BY expires_at""",
                 (timestamp, stale_before, stale_before),
             ).fetchall()
-            ids = [row["id"] for row in rows]
+            ids = [row["id"] for row in rows if row["id"] not in excluded]
             for sandbox_id in ids:
                 connection.execute(
                     """UPDATE sandboxes SET status='stopping',

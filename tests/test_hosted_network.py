@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import io
+import threading
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from datetime import timedelta
 from unittest import mock
 
 import pytest
@@ -44,6 +47,7 @@ def hosted(tmp_path):
         sandbox_factory=factory,
         allowed_backends={"daytona", "docker", "local"},
         resource_sampling_interval_secs=0,
+        supervision_interval_secs=0,
     )
     org, key = service.bootstrap_organization("Network tests")
     with TestClient(
@@ -413,3 +417,101 @@ def test_remote_client_rejects_wrong_types_and_conflicting_flags():
         with pytest.raises(SandboxConfigurationError):
             sandbox.set_network({"mode": "none"})
         transport.assert_not_called()
+
+
+@pytest.mark.parametrize("termination", ["api", "shutdown"])
+@pytest.mark.parametrize("phase", ["provider", "persistence"])
+def test_termination_waits_for_network_update(hosted, termination, phase):
+    service, _, org, key, runtimes = hosted
+    record = create(hosted, network={"mode": "public"})
+    principal = service.store.authenticate(key.secret)
+    entered = threading.Event()
+    release = threading.Event()
+    target, method = (
+        (runtimes[0], "set_network")
+        if phase == "provider"
+        else (service.store, "update_sandbox_network")
+    )
+    original = getattr(target, method)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5), "network update was not released"
+        return original(*args, **kwargs)
+
+    def stop():
+        if termination == "api":
+            return service.destroy_sandbox(principal, record["id"])
+        return service.close()
+
+    with mock.patch.object(target, method, side_effect=blocked):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            update = executor.submit(
+                service.set_network,
+                principal,
+                record["id"],
+                NetworkPolicy(mode="none"),
+            )
+            try:
+                assert entered.wait(timeout=2)
+                stopped = executor.submit(stop)
+                with pytest.raises(TimeoutError):
+                    stopped.result(timeout=0.1)
+                assert (
+                    service.store.get_sandbox(org["id"], record["id"]).status
+                    == "running"
+                )
+                assert not runtimes[0].destroyed
+            finally:
+                release.set()
+            assert update.result(timeout=2).config["network"]["mode"] == "none"
+            stopped.result(timeout=2)
+    final = service.store.get_sandbox(org["id"], record["id"])
+    assert final.status == "destroyed"
+    assert final.config["network"]["mode"] == "none"
+
+
+def test_watchdog_defers_busy_network_update_but_cleans_other_sandboxes(hosted):
+    service, _, org, key, runtimes = hosted
+    busy = create(hosted, timeout_secs=1, network={"mode": "public"})
+    idle = create(hosted, timeout_secs=1)
+    principal = service.store.authenticate(key.secret)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked(policy):
+        entered.set()
+        assert release.wait(timeout=5)
+
+    runtimes[0].set_network.side_effect = blocked
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        update = executor.submit(
+            service.set_network,
+            principal,
+            busy["id"],
+            NetworkPolicy(mode="none"),
+        )
+        try:
+            assert entered.wait(timeout=2)
+            future = service._now() + timedelta(seconds=2)
+            service._now = lambda: future
+            result = service.run_watchdog_once()
+            assert result["expired_claimed"] == 1
+            assert result["expired_terminated"] == 1
+            assert (
+                service.store.get_sandbox(org["id"], busy["id"]).status
+                == "running"
+            )
+            assert (
+                service.store.get_sandbox(org["id"], idle["id"]).status
+                == "destroyed"
+            )
+            assert not runtimes[0].destroyed
+        finally:
+            release.set()
+        update.result(timeout=2)
+    result = service.run_watchdog_once()
+    assert result["expired_terminated"] == 1
+    final = service.store.get_sandbox(org["id"], busy["id"])
+    assert final.status == "destroyed"
+    assert final.config["network"]["mode"] == "none"
