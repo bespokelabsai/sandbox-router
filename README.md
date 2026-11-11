@@ -7,8 +7,8 @@
   </a>
 </p>
 
-<h1 align="center">Bespoke Sandbox</h1>
-<h3 align="center">One Python API for code and agents across sandbox providers.</h3>
+<h1 align="center">Universal Sandbox Interface</h1>
+<h3 align="center">One Python API for code and agents across sandbox providers, and observability.</h3>
 <br/>
 
 Create a sandbox, run code or shell commands, move files in and out, and clean
