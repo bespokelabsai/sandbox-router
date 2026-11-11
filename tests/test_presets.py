@@ -32,8 +32,9 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(
             preset.backend_setup_commands["docker"],
             [
-                "(command -v npm >/dev/null 2>&1 && command -v git >/dev/null 2>&1) || "
-                "(apt-get update && apt-get install -y nodejs npm git)",
+                "(command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && command -v git >/dev/null 2>&1) || "
+                "(apt-get update && DEBIAN_FRONTEND=noninteractive "
+                "apt-get install -y --no-install-recommends nodejs npm git)",
                 "npm install -g opencode-ai",
             ],
         )
@@ -54,7 +55,7 @@ class PresetTests(unittest.TestCase):
             [f"{TENSORLAKE_NPM_PREFIX} @xai-official/grok"],
         )
         self.assertIn(
-            "apt-get install -y nodejs npm git",
+            "apt-get install -y --no-install-recommends nodejs npm git",
             preset.backend_setup_commands["docker"][0],
         )
         self.assertEqual(
@@ -71,7 +72,7 @@ class PresetTests(unittest.TestCase):
         preset = get_preset("codex")
 
         self.assertEqual(preset.description, "Sandbox with Codex CLI installed")
-        self.assertEqual(preset.image, "ghcr.io/bespokelabsai/sandbox/codex:v2")
+        self.assertIsNone(preset.image)
         self.assertEqual(
             preset.setup_commands, ["npm install -g @openai/codex"]
         )
@@ -94,9 +95,7 @@ class PresetTests(unittest.TestCase):
             preset.description,
             "Sandbox with Claude Code (Anthropic CLI) installed",
         )
-        self.assertEqual(
-            preset.image, "ghcr.io/bespokelabsai/sandbox/claude-code:v2"
-        )
+        self.assertIsNone(preset.image)
         self.assertEqual(
             preset.setup_commands, ["npm install -g @anthropic-ai/claude-code"]
         )
@@ -119,9 +118,7 @@ class PresetTests(unittest.TestCase):
             preset.description,
             "Sandbox with Claude Code and Codex CLI installed",
         )
-        self.assertEqual(
-            preset.image, "ghcr.io/bespokelabsai/sandbox/claude-code-codex:v2"
-        )
+        self.assertIsNone(preset.image)
         self.assertEqual(
             preset.setup_commands,
             ["npm install -g @anthropic-ai/claude-code @openai/codex"],
@@ -190,6 +187,8 @@ class PresetImageResolutionTests(unittest.TestCase):
             "bespokelabs.sandbox.backends.BACKENDS",
             {
                 "docker": lambda: _make_backend_client(),
+                "daytona": lambda: _make_backend_client(),
+                "modal": lambda: _make_backend_client(),
                 "runpod": lambda: _make_backend_client(),
                 "tensorlake": lambda: _make_backend_client(),
             },
@@ -202,14 +201,17 @@ class PresetImageResolutionTests(unittest.TestCase):
         PRESETS.pop(self.PRESET_NAME, None)
         PRESETS.pop(self.BACKEND_ONLY_PRESET_NAME, None)
 
-    def test_docker_inherits_oci_image_and_skips_setup(self) -> None:
-        sb = Sandbox(backend="docker", preset=self.PRESET_NAME)
-
-        self.assertEqual(sb._config.image, "ghcr.io/test/img:latest")
-        sb._session.execute_command.assert_not_called()
+    def test_custom_oci_image_skips_setup_on_supported_backends(self) -> None:
+        for backend in ("docker", "daytona", "modal"):
+            with self.subTest(backend=backend):
+                with Sandbox(backend=backend, preset=self.PRESET_NAME) as sb:
+                    self.assertEqual(
+                        sb._config.image, "ghcr.io/test/img:latest"
+                    )
+                    sb._session.execute_command.assert_not_called()
 
     def test_runtime_install_precedes_clone_and_files(self):
-        for name in ("opencode", "grok"):
+        for name in BUILT_IN_PRESETS:
             with (
                 self.subTest(preset=name),
                 Sandbox(
@@ -222,6 +224,7 @@ class PresetImageResolutionTests(unittest.TestCase):
                 provisioning, install = get_preset(name).backend_setup_commands[
                     "docker"
                 ]
+                self.assertIsNone(sb._config.image)
                 self.assertEqual(
                     sb._session.mock_calls,
                     [
@@ -238,21 +241,54 @@ class PresetImageResolutionTests(unittest.TestCase):
     def test_early_setup_failure_cleans_up_before_clone(self):
         from bespokelabs.sandbox.exceptions import SandboxCreationError
 
-        session = mock.MagicMock()
-        session.execute_command.return_value = SandboxResult(
-            exit_code=1, stderr="install failed"
-        )
-        client = mock.MagicMock()
-        client.create.return_value = session
-        with self.assertRaises(SandboxCreationError):
-            Sandbox(
-                "docker",
-                preset="opencode",
-                git_repo="https://example.com/repo.git",
-                _backend_client=client,
-            )
-        session.execute_command.assert_called_once()
-        session.destroy.assert_called_once()
+        for name in BUILT_IN_PRESETS:
+            for failed_step in (0, 1):
+                with self.subTest(preset=name, failed_step=failed_step):
+                    session = mock.MagicMock()
+                    session.execute_command.side_effect = [
+                        SandboxResult() for _ in range(failed_step)
+                    ] + [SandboxResult(exit_code=1, stderr="install failed")]
+                    client = mock.MagicMock()
+                    client.create.return_value = session
+                    with self.assertRaises(SandboxCreationError):
+                        Sandbox(
+                            "docker",
+                            preset=name,
+                            git_repo="https://example.com/repo.git",
+                            files={"repo/input.txt": "data"},
+                            _backend_client=client,
+                        )
+                    self.assertEqual(
+                        session.execute_command.call_count, failed_step + 1
+                    )
+                    session.write_file.assert_not_called()
+                    session.destroy.assert_called_once()
+
+    def test_builtin_presets_install_without_registry_images(self):
+        for backend in ("docker", "daytona", "modal"):
+            for name in BUILT_IN_PRESETS:
+                with self.subTest(backend=backend, preset=name):
+                    with Sandbox(backend, preset=name) as sb:
+                        self.assertIsNone(sb._config.image)
+                        commands = sb._session.execute_command.call_args_list
+                        self.assertEqual(len(commands), 2)
+                        self.assertIn("nodejs npm git", commands[0].args[0])
+                        self.assertEqual(
+                            commands[1].args[0],
+                            get_preset(name).setup_commands[0],
+                        )
+
+    def test_builtin_preset_keeps_explicit_base_image_and_installs(self):
+        for backend in ("docker", "daytona", "modal"):
+            with self.subTest(backend=backend):
+                with Sandbox(
+                    backend, preset="codex", image="python:3.12-slim"
+                ) as sb:
+                    self.assertEqual(sb._config.image, "python:3.12-slim")
+                    self.assertEqual(
+                        sb._session.execute_command.call_args_list[-1],
+                        mock.call("npm install -g @openai/codex"),
+                    )
 
     def test_tensorlake_inherits_tensorlake_image_and_skips_setup(self) -> None:
         sb = Sandbox(backend="tensorlake", preset=self.PRESET_NAME)
@@ -261,8 +297,7 @@ class PresetImageResolutionTests(unittest.TestCase):
         sb._session.execute_command.assert_not_called()
 
     def test_tensorlake_without_tensorlake_image_runs_setup(self) -> None:
-        # Built-in `claude-code` preset has image= set but no tensorlake_image,
-        # so Tensorlake falls back to its backend-specific setup commands.
+        # The built-in preset uses Tensorlake's writable npm prefix.
         sb = Sandbox(backend="tensorlake", preset="claude-code")
 
         self.assertIsNone(sb._config.image)

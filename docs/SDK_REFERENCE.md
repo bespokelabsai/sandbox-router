@@ -307,10 +307,11 @@ with Sandbox("daytona", workspace=Manifest(entries={
     ...
 ```
 
-Default creation order is `git_repo` clone → `files` → `workspace` entries →
-preset setup (when needed). OpenCode opts into setup before workspace
-materialization so npm and Git are ready before cloning. All of this happens after the provider resource exists;
-setup/materialization failure triggers a cleanup attempt. Entries materialize
+Custom presets default to `git_repo` clone → `files` → `workspace` entries →
+preset setup (when needed). Built-in agent presets install before workspace
+materialization so npm and Git are ready before cloning. All of this happens
+after the provider resource exists; setup/materialization failure triggers a
+cleanup attempt. Entries materialize
 in insertion order, so a later one overlays an earlier one.
 `GitRepo` clones, `LocalDir` / `LocalFile` upload (preserving the executable
 bit), and `File` writes in-memory content. Subclass `WorkspaceEntry` for custom
@@ -349,8 +350,9 @@ provider performed the operation but its response was lost.
 ### Workspace convenience arguments
 
 Populate the sandbox at creation instead of scripting uploads afterwards.
-`files` are written after any `git_repo` clone. Preset setup normally follows
-workspace materialization; OpenCode runs setup first to install its prerequisites.
+`files` are written after any `git_repo` clone. Built-in agent presets run setup
+before workspace materialization. Custom presets default to setup afterward;
+set `setup_before_workspace=True` when they install workspace prerequisites.
 
 `files` needs nothing special and works on every backend and image:
 
@@ -366,9 +368,10 @@ with Sandbox(
 `files` values may be `str` or `bytes`.
 
 `git_repo` runs `git clone` **inside** the sandbox, so `git` must be present in
-the image. All prebuilt preset images include `git`, so `git_repo` works with
-any preset on Docker/Daytona/Modal. For a custom `image`, make sure `git` is
-installed; the host-based backends (`local`, `safehouse`) use the host's `git`.
+the image. Built-in agent presets install missing Git before cloning on
+Docker/Daytona/Modal when the base image supports their prerequisite setup.
+For other images, make sure `git` is installed; the host-based backends
+(`local`, `safehouse`) use the host's `git`.
 
 ```python
 with Sandbox(
