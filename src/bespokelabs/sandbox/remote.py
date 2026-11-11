@@ -7,10 +7,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from bespokelabs.sandbox.types import SandboxResult
+from bespokelabs.sandbox.exceptions import SandboxConfigurationError
+from bespokelabs.sandbox.types import NetworkPolicy, SandboxResult
 
 
 class RemoteSandboxError(Exception):
@@ -77,9 +78,20 @@ class RemoteSandboxClient:
         backend: str,
         *,
         idempotency_key: str | None = None,
+        network: NetworkPolicy | None = None,
         **config: Any,
     ) -> RemoteSandbox:
         payload = {"backend": backend, **config}
+        if network is not None:
+            if not isinstance(network, NetworkPolicy):
+                raise SandboxConfigurationError(
+                    "network must be a NetworkPolicy"
+                )
+            if config.get("allow_internet") is not None:
+                raise SandboxConfigurationError(
+                    "Pass either network or allow_internet, not both"
+                )
+            payload["network"] = asdict(network)
         record = self._request(
             "POST",
             "/v1/sandboxes",
@@ -255,6 +267,24 @@ class RemoteSandbox:
             request_id=result["request_id"],
             usage=result["usage"],
             agent_usage=result.get("agent_usage", {}),
+        )
+
+    def set_network(self, policy: NetworkPolicy) -> None:
+        """Replace egress policy; requires the ``sandboxes:network`` scope.
+
+        Unsupported policies and provider failures raise RemoteSandboxError.
+        This call does not retry automatically.
+        """
+        if self._destroyed:
+            raise RemoteSandboxError("sandbox has been destroyed")
+        if not isinstance(policy, NetworkPolicy):
+            raise SandboxConfigurationError(
+                "set_network() takes a NetworkPolicy",
+                backend=self.backend_name,
+                op="set_network",
+            )
+        self._client._request(
+            "PUT", f"/v1/sandboxes/{self.id}/network", asdict(policy)
         )
 
     def destroy(self) -> None:

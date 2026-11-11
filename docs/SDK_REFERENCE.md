@@ -429,6 +429,12 @@ accepted everywhere.
 compatibility. Passing both `network` and `allow_internet` is an error; with
 `network`, `allow_internet` is derived from it.
 
+The hosted API and `RemoteSandboxClient.create(network=...)` also accept
+network policies. Remote sandbox handles expose `set_network(policy)`;
+runtime updates require the `sandboxes:network` scope. See the
+[hosted network policy contract](CONTROL_PLANE_API.md#network-policies)
+for JSON payloads, errors, and persistence semantics.
+
 ### Backend-specific options
 
 `backend_options` is an escape hatch: the dict is merged into the backend's

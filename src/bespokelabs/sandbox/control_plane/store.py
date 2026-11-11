@@ -1936,6 +1936,33 @@ class SQLiteStore:
                 (status, error, destroyed_at, sandbox_id),
             )
 
+    def update_sandbox_network(
+        self, organization_id: str, sandbox_id: str, network: dict
+    ) -> None:
+        """Persist the last applied policy without changing the create fingerprint."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT config_json, status FROM sandboxes WHERE id=? AND organization_id=?",
+                (sandbox_id, organization_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("sandbox not found")
+            if row["status"] != "running":
+                raise ConflictError(f"sandbox is {row['status']}")
+            config = json.loads(row["config_json"])
+            config["network"] = network
+            config.pop("allow_internet", None)
+            connection.execute(
+                """UPDATE sandboxes SET config_json=?, version=version+1
+                   WHERE id=? AND organization_id=?""",
+                (
+                    json.dumps(config, sort_keys=True),
+                    sandbox_id,
+                    organization_id,
+                ),
+            )
+
     def get_sandbox(
         self, organization_id: str, sandbox_id: str
     ) -> SandboxRecord:

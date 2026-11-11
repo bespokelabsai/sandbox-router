@@ -25,7 +25,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from bespokelabs.sandbox.control_plane.errors import (
     AuthenticationError,
@@ -41,7 +41,12 @@ from bespokelabs.sandbox.control_plane.security import (
     encode_cursor,
 )
 from bespokelabs.sandbox.control_plane.service import ControlPlane
-from bespokelabs.sandbox.exceptions import ErrorCode, SandboxError
+from bespokelabs.sandbox.exceptions import (
+    ErrorCode,
+    SandboxConfigurationError,
+    SandboxError,
+)
+from bespokelabs.sandbox.types import NetworkPolicy
 
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 _CSV_NUMERIC_COLUMNS = frozenset(
@@ -70,6 +75,29 @@ class APIKeyCreate(BaseModel):
     expires_at: datetime | None = None
 
 
+class NetworkPolicyRequest(BaseModel):
+    """Validated JSON representation of the SDK egress policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["public", "none", "allowlist"] = "public"
+    domains: list[str] = Field(default_factory=list)
+    cidrs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_policy(self) -> NetworkPolicyRequest:
+        try:
+            self.to_policy()
+        except SandboxConfigurationError as exc:
+            raise ValueError(exc.message) from exc
+        return self
+
+    def to_policy(self) -> NetworkPolicy:
+        return NetworkPolicy(
+            mode=self.mode, domains=tuple(self.domains), cidrs=tuple(self.cidrs)
+        )
+
+
 class SandboxCreate(BaseModel):
     backend: str
     preset: str | None = None
@@ -81,6 +109,7 @@ class SandboxCreate(BaseModel):
     image: str | None = None
     env_vars: dict[str, str] | None = None
     allow_internet: bool | None = None
+    network: NetworkPolicyRequest | None = None
     app_name: str | None = None
     template: str | None = None
     snapshot_id: str | None = None
@@ -241,6 +270,10 @@ def create_app(
             ("POST", "/v1/sandboxes"): "sandbox.create",
             ("DELETE", "/v1/sandboxes/{sandbox_id}"): "sandbox.terminate",
             ("POST", "/v1/sandboxes/{sandbox_id}/execute"): "sandbox.execute",
+            (
+                "PUT",
+                "/v1/sandboxes/{sandbox_id}/network",
+            ): "sandbox.set_network",
             ("PUT", "/v1/policies/current"): "policy.update",
             (
                 "POST",
@@ -358,6 +391,7 @@ def create_app(
         if exc.code in {
             ErrorCode.BACKEND_NOT_INSTALLED,
             ErrorCode.CONFIGURATION,
+            ErrorCode.FEATURE_NOT_SUPPORTED,
         }:
             status_code = 422
         return JSONResponse(
@@ -737,6 +771,8 @@ def create_app(
     ) -> dict:
         principal = authenticate(authorization, "sandboxes:create")
         values = body.model_dump(exclude={"backend"}, exclude_none=True)
+        if body.network is not None:
+            values["network"] = body.network.to_policy()
         return _sandbox_response(
             control_plane.create_sandbox(
                 principal,
@@ -787,6 +823,17 @@ def create_app(
     ) -> dict:
         principal = authenticate(authorization, "usage:read")
         return control_plane.resource_usage(principal, sandbox_id)
+
+    @app.put("/v1/sandboxes/{sandbox_id}/network")
+    def set_network(
+        sandbox_id: str,
+        body: NetworkPolicyRequest,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        principal = authenticate(authorization, "sandboxes:network")
+        return _sandbox_response(
+            control_plane.set_network(principal, sandbox_id, body.to_policy())
+        )
 
     @app.post("/v1/sandboxes/{sandbox_id}/execute")
     def execute(
