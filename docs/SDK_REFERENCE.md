@@ -470,6 +470,36 @@ and `auto_hibernate_timeout` are consumed by the adapter. Other keys are
 or `idle_ignore_outbound`; an unknown key is rejected before anything is
 created. `isolated` cannot be turned off.
 
+### Provider objects (`native`)
+
+`backend_options` reaches provider features at creation time. For provider
+features on a running sandbox that the unified API doesn't model, `sb.native`
+returns the provider SDK's own object:
+
+```python
+with Sandbox("docker") as sb:
+    container = sb.native              # docker SDK Container
+    stats = container.stats(stream=False)
+    print(stats["memory_stats"]["usage"])
+```
+
+| Backend | `sb.native` returns |
+|---|---|
+| `daytona` | Daytona SDK `Sandbox` |
+| `e2b` | E2B SDK `Sandbox` |
+| `modal` | `modal.Sandbox` |
+| `tensorlake` | Tensorlake SDK sandbox |
+| `docker` | docker SDK `Container` |
+| `ray` | Ray actor handle |
+| `boxd` | The authenticated `boxd` client; pass `sb.provider_resource_id` as the machine id to `client.machines.*` |
+| `runpod`, `monty`, `local`, `safehouse` | Raises `FeatureNotSupportedError` (no provider object) |
+
+Code that uses `native` only works on one backend, and the object's type
+follows the provider SDK version you have installed. Keep ending the sandbox
+with `sb.destroy()` or the context manager: terminating it through the
+provider object skips this library's cleanup and usage tracking. Reading
+`native` after the sandbox is destroyed raises `SandboxError`.
+
 ### Session state (resume)
 
 A **snapshot** saves state to restore later; **session state** is a
@@ -752,7 +782,10 @@ properties remain synchronous. The wrapper does not expose `agent()` or
 `agent_tools()`.
 
 Backend SDKs are synchronous, so async calls are offloaded to worker
-threads — the event loop is never blocked. Note that the missing-SDK check
+threads — the event loop is never blocked. The exception is
+`sb.native`: it returns the provider's synchronous SDK object, so call its
+methods off the loop, e.g.
+`await asyncio.to_thread(sb.native.stats, stream=False)`. Note that the missing-SDK check
 (`BackendNotInstalledError`) surfaces at the first `await client.create()`
 rather than at `AsyncSandboxClient(...)` construction, which does no I/O.
 

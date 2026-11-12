@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -231,6 +232,14 @@ class ModalSession:
         """Return the Modal sandbox object ID while it is attached."""
         value = getattr(self._sandbox, "object_id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the ``modal.Sandbox`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"
