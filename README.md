@@ -12,8 +12,8 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/sandbox-loop-dark.gif">
-    <img alt="Animation: the same Sandbox code runs on 11 backends, and each run's create, exec, and destroy events appear in a telemetry view" src="docs/images/sandbox-loop-light.gif" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/sandbox-agent-loop-dark.gif">
+    <img alt="Animation: the inside-sandbox agent example runs Codex on 10 backends by changing only the backend string, and each run's create, setup, exec, and destroy events appear in a telemetry view" src="docs/images/sandbox-agent-loop-light.gif" width="100%">
   </picture>
 </p>
 <br/>
