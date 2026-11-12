@@ -201,9 +201,11 @@ The dashboard shows resource usage, compute spend, hosted agent token and model
 cost records, execution history, and cleanup state. Provisioning policies cover
 concurrency, compute spend, allowed providers and GPUs, and requested lifetimes.
 
-![Example Daytona and Modal usage report with runtime, idle hours, and estimated idle cost](docs/images/sandbox-usage-overview.svg)
+![Docker, Monty, and Daytona usage overview with illustrative workload totals and measured resource peaks](docs/images/sandbox-usage-overview.svg)
 
-*Example Daytona + Modal workload report: runtime, idle time, and cost breakdowns.*
+*Illustrative Docker + Monty + Daytona workload, with measured resource peaks from
+small live smoke tests shown separately. Monty resource telemetry is unavailable
+and excluded from idle totals. Cost estimates exclude local host compute.*
 
 <details>
 <summary>See the current per-sandbox dashboard</summary>
