@@ -9,6 +9,13 @@
 
 <h1 align="center">Universal Sandbox Interface</h1>
 <h3 align="center">One Python API for code and agents across sandbox providers, and observability.</h3>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/sandbox-loop-dark.gif">
+    <img alt="Animation: the same Sandbox code runs on 11 backends, and each run's create, exec, and destroy events appear in a telemetry view" src="docs/images/sandbox-loop-light.gif" width="100%">
+  </picture>
+</p>
 <br/>
 
 Create a sandbox, run code or shell commands, move files in and out, and clean
