@@ -12,6 +12,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -560,6 +561,14 @@ class DaytonaSession:
         """Return Daytona's durable sandbox identifier when available."""
         value = getattr(self._sandbox, "id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the Daytona SDK ``Sandbox`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"

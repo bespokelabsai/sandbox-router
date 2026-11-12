@@ -7,6 +7,7 @@ import posixpath
 import threading
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -168,6 +169,15 @@ class MontySession:
     def provider_resource_id(self) -> None:
         """Monty workers have no external provider resource."""
         return None
+
+    @property
+    def native(self) -> Any:
+        """Monty workers have no provider object."""
+        raise FeatureNotSupportedError(
+            "The monty backend has no provider object to expose",
+            backend="monty",
+            op="native",
+        )
 
     def _check_alive(self) -> None:
         if self._closed:

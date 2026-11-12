@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import pathlib
 import shlex
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -84,6 +85,14 @@ class E2BSession:
         """Return the E2B sandbox ID while it is attached."""
         value = getattr(self._sandbox, "sandbox_id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the E2B SDK ``Sandbox`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"

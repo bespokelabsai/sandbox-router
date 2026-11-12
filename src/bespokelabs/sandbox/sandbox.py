@@ -336,6 +336,45 @@ class Sandbox:
         value = getattr(self._session, "provider_resource_id", None)
         return str(value) if value is not None else None
 
+    @property
+    def native(self) -> Any:
+        """Return the provider SDK's own object for this sandbox.
+
+        Use it for provider features this library does not wrap, such as
+        container stats on Docker or extending a sandbox's timeout on E2B.
+        Code that uses it only works on one backend.
+
+        Returns, by backend:
+
+        - ``daytona``, ``e2b``: the provider SDK's ``Sandbox``
+        - ``modal``: ``modal.Sandbox``
+        - ``tensorlake``: the Tensorlake SDK sandbox
+        - ``docker``: the docker SDK ``Container``
+        - ``ray``: the Ray actor handle
+        - ``boxd``: the ``boxd`` client; the machine id is
+          :attr:`provider_resource_id`
+        - ``runpod``, ``monty``, ``local``, ``safehouse``: raises
+          ``FeatureNotSupportedError``
+
+        The returned type depends on the provider SDK version.  Keep using
+        :meth:`destroy` to end the sandbox: terminating it through the
+        provider object skips this library's cleanup and usage tracking.
+
+        Raises:
+            SandboxError: the sandbox has been destroyed.
+            FeatureNotSupportedError: the backend has no provider object.
+
+        """
+        self._check_alive()
+        if not hasattr(type(self._session), "native"):
+            raise FeatureNotSupportedError(
+                f"The {self._config.backend} backend does not expose a "
+                "provider object",
+                backend=self._config.backend,
+                op="native",
+            )
+        return self._session.native
+
     @overload
     def execute_code(
         self, code: str, language: str = "python"

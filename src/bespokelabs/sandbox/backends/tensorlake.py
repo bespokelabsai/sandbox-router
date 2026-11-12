@@ -6,6 +6,7 @@ import base64
 import pathlib
 import shlex
 import threading
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -116,6 +117,14 @@ class TensorlakeSession:
         """Return the Tensorlake sandbox ID while it is attached."""
         value = getattr(self._sandbox, "sandbox_id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the Tensorlake SDK sandbox object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"

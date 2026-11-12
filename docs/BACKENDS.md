@@ -135,6 +135,7 @@ the table below covers the backends that support shell commands.
 | `network=` modes | public | public | public, none | public | all | public, none | all | public | public | all |
 | `set_network()` | No | No | No | No | Yes | No | public, allowlist | No | No | Yes |
 | Isolation | Process-level | macOS `sandbox-exec` | Container | Process | Full VM | Container | Container | Container | Full VM | Full VM |
+| `native` | No | No | `Container` | Actor handle | SDK `Sandbox` | SDK sandbox | `modal.Sandbox` | No | SDK `Sandbox` | `boxd` client |
 | `gpu=` reservation | No | No | No | No | No | No | Yes | Yes | No | No |
 | Needs install | Nothing | `safehouse` CLI | Docker daemon | `ray` | API key | `tl login` | API key | API key + OpenSSH | API key | API key |
 

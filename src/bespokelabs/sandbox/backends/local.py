@@ -7,6 +7,7 @@ import pathlib
 import shutil
 import subprocess
 import tempfile
+from typing import Any
 
 from bespokelabs.sandbox.backends._prelude import (
     PYTHON_PREAMBLE,
@@ -268,6 +269,15 @@ class LocalSession:
     def provider_resource_id(self) -> None:
         """Local sandboxes have no external provider resource."""
         return None
+
+    @property
+    def native(self) -> Any:
+        """Local sandboxes have no provider object."""
+        raise FeatureNotSupportedError(
+            "The local backend has no provider object to expose",
+            backend="local",
+            op="native",
+        )
 
     def destroy(self) -> None:
         try:

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+from typing import Any
 
 from bespokelabs.sandbox.backends._prelude import (
     PYTHON_PREAMBLE,
@@ -300,6 +301,14 @@ class RaySession:
     def provider_resource_id(self) -> None:
         """Anonymous Ray actors expose no stable provider resource ID."""
         return None
+
+    @property
+    def native(self) -> Any:
+        """Return the Ray actor handle that runs this sandbox.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._actor
 
     def destroy(self) -> None:
         try:

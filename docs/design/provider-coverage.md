@@ -1,13 +1,13 @@
 # Design: Provider coverage — core API, optional features, and the `native` escape hatch
 
-- **Status:** Proposed
+- **Status:** Accepted and implemented (`native` in phase 1; capability declaration deferred)
 - **Scope:** `Sandbox`, `AsyncSandbox`, `SandboxBackendSession`, every backend in `backends/`
-- **Code changes:** none in this PR. Implementation follows once this design is approved.
+- **History:** design approved in #57; implemented in the follow-up PR that adds `Sandbox.native`.
 
 ## Problem
 
 `bespokelabs-sandbox` gives one API over many sandbox providers (Daytona, E2B, Modal,
-Tensorlake, Docker, Ray, Local, Safehouse, with Boxd and Maritime in open PRs). Each
+Tensorlake, Docker, Ray, Local, Safehouse, RunPod, Monty, boxd, with Maritime in an open PR). Each
 provider's SDK has far more surface than our API covers: preview URLs and port
 forwarding, streaming and background processes, pause/resume, volumes, network
 policies, GPU controls, and new features every release.
@@ -102,10 +102,10 @@ What exists today:
 ```mermaid
 flowchart LR
     subgraph T1["Tier 1: Portable core"]
-        C1["exec, files, snapshot,<br/>session_state, destroy"]
+        C1["execute_code, execute_command,<br/>file operations, destroy"]
     end
     subgraph T2["Tier 2: Optional portable features"]
-        C2["Same signature everywhere.<br/>Unsupported backends raise<br/>FeatureNotSupportedError"]
+        C2["snapshot, session_state / resume,<br/>expose_port, set_network, ...<br/>Unsupported backends raise<br/>FeatureNotSupportedError"]
     end
     subgraph T3["Tier 3: Native escape hatch"]
         C3["backend_options at create<br/>sb.native after create<br/>Not portable, by design"]
@@ -115,9 +115,13 @@ flowchart LR
 
 | Tier | Contract | Who implements | Portable? |
 |---|---|---|---|
-| 1. Core | Every backend implements every method | Every backend | Yes |
-| 2. Optional | Same signature; may raise `FeatureNotSupportedError` | Backends that can | Yes, with a clear error elsewhere |
-| 3. Native | `backend_options` in, `sb.native` out | Every backend exposes its object | No |
+| 1. Core | Every backend implements every method: `execute_code`, `execute_command`, `list_files`, `read_file`, `write_file`, `upload_file`, `download_file`, `destroy` | Every backend | Yes |
+| 2. Optional | Same signature; may raise `FeatureNotSupportedError`. Today: `snapshot`, `session_state` / `resume`, `expose_port`, `set_network`, `list_sandboxes` | Backends that can | Yes, with a clear error elsewhere |
+| 3. Native | `backend_options` in, `sb.native` out | Every backend with a provider object | No |
+
+`snapshot` and `session_state` sit on the backend protocol so every session has the
+method, but several backends raise `FeatureNotSupportedError` from them, which makes them
+Tier 2, not Tier 1.
 
 ### 2. Add `Sandbox.native` (and `AsyncSandbox.native`)
 
@@ -131,12 +135,18 @@ A read-only property returning the provider's own live object:
 | `tensorlake` | Tensorlake SDK sandbox object |
 | `docker` | `docker.models.containers.Container` |
 | `ray` | The Ray actor handle |
-| `local`, `safehouse` | Raises `FeatureNotSupportedError` (there is no provider object) |
+| `boxd` | The authenticated `boxd` client. boxd has no per-machine object, so callers pass `sb.provider_resource_id` as the machine id |
+| `runpod` | Raises `FeatureNotSupportedError`: driven over REST and SSH, no SDK object |
+| `monty`, `local`, `safehouse` | Raises `FeatureNotSupportedError` (there is no provider object) |
 
 Behaviour:
 
+- `AsyncSandbox.native` returns the same synchronous SDK object. Its methods block, so
+  async callers run them with `asyncio.to_thread(...)` or use the provider's own async
+  API. The async wrapper's no-blocking guarantee covers the methods it wraps, not the
+  object `native` hands out; the docstring and SDK reference say so.
 - Raises the same error as other methods once the sandbox is destroyed (`_check_alive`).
-- Documented as non-portable. The docstring and README section state that code using it
+- Documented as non-portable. The docstring and the SDK reference state that code using it
   is tied to one backend and that its type depends on the provider SDK version.
 - The library still owns the lifecycle. Calling the provider's own terminate/kill through
   `native` is unsupported; use `sb.destroy()` so usage tracking and cleanup stay correct.
@@ -160,7 +170,7 @@ sequenceDiagram
     U->>S: sb.native
     S->>B: session.native
     B-->>U: e2b SDK Sandbox
-    U->>P: native.get_host(8000)  (provider-only feature)
+    U->>P: native.set_timeout(3600)  (provider-only feature)
     U->>S: sb.destroy()
     S->>B: destroy()
     B->>P: kill()
@@ -177,7 +187,7 @@ class SandboxBackendSession(Protocol):
 
 `Sandbox.native` reads `getattr(session, "native", ...)` and raises
 `FeatureNotSupportedError` if a backend does not define it, so out-of-tree backends keep
-working until they add it. All in-tree backends, plus Boxd (#52) and Maritime (#45), add
+working until they add it. All in-tree backends, and Maritime (#45) once it lands, add
 the property.
 
 ### 3. Rule for promoting a feature into the portable API
@@ -257,11 +267,11 @@ Forcing Batch behind this protocol would mean faking a live session (for example
 `sleep` job plus an SSH or agent channel), which loses what Batch is good at: cheap,
 queued, fan-out of many independent runs.
 
-If we need it, it belongs in a separate, small **jobs** API (`submit`, `status`, `logs`,
-`outputs`, `cancel`) with its own backends (GCP Batch, AWS Batch, Kubernetes Jobs, Modal
-functions, Ray jobs). Sandbox and jobs APIs can share config types such as image,
-resources and env, and a job can run the same agent presets this library already has.
-That is a separate design.
+This is how GCP Batch landed on `main`: `GcpBatchClient` sets `supports_sessions = False`
+and implements a separate `SandboxJobBackend` protocol (`submit_job`, `job_status`,
+`job_logs`, `cancel_job`), exposed through `SandboxClient`'s job methods. Other job
+services (AWS Batch, Kubernetes Jobs) would implement that protocol, not
+`SandboxBackendSession`, so `native` does not apply to them.
 
 ## Alternatives considered
 
@@ -273,23 +283,22 @@ That is a separate design.
 - **Do nothing; tell users to read `_session._sandbox`.** Rejected: private, undocumented,
   and differs per backend (`_sandbox`, `_container`, `_actor`).
 
-## Implementation plan (after approval)
+## Implementation (done)
 
 1. Add `native` property to `SandboxBackendSession` and every in-tree backend session.
 2. Add `Sandbox.native` and `AsyncSandbox.native` with alive-checks and the fallback for
    backends that lack the property.
-3. Tests: one per backend asserting the returned type (with SDKs mocked where the suite
-   already mocks them), plus destroyed-sandbox and local/safehouse error cases.
-4. README: a "Provider-specific features" section describing the three tiers, with one
-   `backend_options` and one `sb.native` example.
-5. Ask the Boxd (#52) and Maritime (#45) PRs to add `native`.
-6. Phase 2, separately: capability declaration.
+3. Tests in `tests/test_native.py`: every backend's return value or error, the
+   destroyed-sandbox case, a session without the property, and `AsyncSandbox`.
+4. Docs: a "Provider objects (`native`)" section in `docs/SDK_REFERENCE.md`, an async
+   note, and a `native` row in the `docs/BACKENDS.md` feature matrix.
+5. Still to do: ask the Maritime PR (#45) to add `native`.
+6. Deferred: capability declaration (phase 2).
 
-## Open questions
+## Decisions on the open questions
 
-1. For `local` and `safehouse`, should `native` raise, or return the working directory as
-   a `Path`? This proposal raises, because a path is not a provider object.
-2. Should `native` be typed per backend via `typing.overload` on a `backend` literal, or
-   stay `Any`? This proposal keeps `Any` for simplicity.
-3. Do we want the phase 2 capability declaration now, given cost-based routing is on the
-   roadmap?
+1. `local`, `safehouse`, `monty` and `runpod` raise `FeatureNotSupportedError`: none of them
+   has a provider object, and a working-directory path is not one.
+2. `native` stays typed as `Any`; per-backend overloads can come later without breaking
+   callers.
+3. Capability declaration is deferred to a separate change.
