@@ -182,6 +182,7 @@ the runtime requirements listed below.
 | [Modal](https://modal.com) | `[modal]` | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` |
 | [RunPod](https://www.runpod.io) | _(none)_ | `RUNPOD_API_KEY` + registered SSH key |
 | [E2B](https://e2b.dev) | `[e2b]` | `E2B_API_KEY` |
+| [Novita](https://novita.ai) | `[novita]` | `NOVITA_API_KEY` |
 | [boxd](https://boxd.sh) | `[boxd]` | `BOXD_API_KEY` |
 | [Google Cloud Batch](https://cloud.google.com/batch) (jobs only) | `[gcp-batch]` | Application Default Credentials |
 
@@ -195,7 +196,9 @@ of your selected backend when deciding which workloads to run.
 
 See the [feature matrix](docs/BACKENDS.md#feature-support-matrix),
 [credential setup](docs/BACKENDS.md#environment-variables), and
-[Monty guide](docs/BACKENDS.md#monty-local-python-execution) for adapter details.
+[Monty guide](docs/BACKENDS.md#monty-local-python-execution) and
+[Novita guide](docs/BACKENDS.md#novita-code-interpreter) for adapter details
+(including Novita's native connect lifecycle and protected-service authentication).
 
 ## Hosted control plane
 
