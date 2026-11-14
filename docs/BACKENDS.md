@@ -10,6 +10,7 @@ Provider requirements, Monty usage, adapter capabilities, and authentication set
 - [Local](#local)
 - [Cloud](#cloud)
 - [Monty: local Python execution](#monty-local-python-execution)
+- [Novita: Code Interpreter](#novita-code-interpreter)
 - [Feature Support Matrix](#feature-support-matrix)
 - [Environment Variables](#environment-variables)
 
@@ -37,6 +38,7 @@ the runtime requirements listed below.
 | [Modal](https://modal.com) | `[modal]` | `MODAL_TOKEN_ID` + `MODAL_TOKEN_SECRET` |
 | [RunPod](https://www.runpod.io) | _(none)_ | `RUNPOD_API_KEY` + registered SSH key |
 | [E2B](https://e2b.dev) | `[e2b]` | `E2B_API_KEY` |
+| [Novita](https://novita.ai) | `[novita]` | `NOVITA_API_KEY` |
 | [boxd](https://boxd.sh) | `[boxd]` | `BOXD_API_KEY` |
 | [Google Cloud Batch](https://cloud.google.com/batch) (jobs only) | `[gcp-batch]` | Application Default Credentials |
 
@@ -109,34 +111,173 @@ it does not provide container/VM isolation or full CPython/package compatibility
 See the upstream [language limitations](https://pydantic.dev/docs/monty/limitations/)
 and [security model](https://pydantic.dev/docs/monty/concepts/security/).
 
+## Novita: Code Interpreter
+
+Install `bespokelabs-sandbox[novita]` and supply `NOVITA_API_KEY` through your
+process environment. `NOVITA_DOMAIN` is optional; the adapter leaves endpoint
+selection to the SDK. This is a separate backend; the E2B adapter is unchanged.
+
+```python
+from bespokelabs.sandbox import Sandbox
+
+sb = Sandbox("novita", timeout_secs=600)
+try:
+    result = sb.execute_code("print(6 * 7)")
+    print(result.stdout)
+    sb.write_file("/tmp/data.bin", b"\x00\xff")
+    assert sb.read_file("/tmp/data.bin") == b"\x00\xff"
+finally:
+    sb.destroy()  # Explicit cleanup surfaces errors; context exit is best-effort.
+```
+
+The adapter forwards `timeout_secs` as `timeout` (seconds, router default 600),
+`template` as `template`, and `env_vars` as `envs`. `backend_options` is merged
+last. A custom template must include the Code Interpreter/Jupyter runtime;
+an arbitrary base template is not sufficient. The SDK default is
+`code-interpreter-v1`. The documented default region is `us-phx-1`, domain
+`us-phx-1.sandbox.novita.ai`. This pair passed the dedicated public and protected
+live acceptance tests with SDK 2.1.3; other regions/templates were not tested.
+
+Supported adapter operations are Python execution (`python`/`python3`), synchronous
+shell commands (including nonzero exit results), file listing, binary-safe
+read/write and whole-file upload/download, explicit destruction, and port
+exposure. Python execution errors return exit code 1 and traceback in stderr.
+`expose_port()` returns HTTPS and, for protected services, the
+`Sandbox-Traffic-Access-Token` header recommended by the current
+[secured-access guide](https://docs.novita.ai/guides/sandbox-secured-access).
+This header passed live protected-service checks before and after reconnect;
+missing/wrong tokens were rejected. SDK 2.1.3 itself still uses
+`E2B-Traffic-Access-Token` internally for `run_code`; the adapter does not patch
+SDK internals or change the E2B adapter. `TRAFFIC_ACCESS_TOKEN` in documentation
+examples is a variable holding the credential, not an HTTP header name.
+Headers are secrets; do not log them. Start and bind your service to `0.0.0.0` separately.
+
+No snapshots, jobs, listing protocol, separate pause/resume API, runtime network
+updates, or generic CPU/RAM/disk/GPU/image mappings are provided. Dockerfiles
+and restrictive `NetworkPolicy` modes remain rejected by shared validation.
+`allow_internet=False` is **not mapped** and does not enforce isolation. Native
+creation options are an escape hatch, not portable network-policy support.
+
+### Reattachment and lifecycle
+
+State contains only the sandbox ID and API domain, never credentials or access
+tokens. `Sandbox.resume(state)` creates a fresh `Novita(domain=...)` client and
+calls `code_interpreter.connect(sandbox_id)`. The SDK returns a
+`CodeInterpreterSandbox` and obtains controller/traffic authentication itself.
+The adapter uses no cached handle, raw GET reconstruction, or deprecated handle
+constructor. It does not create a replacement or rerun workspace/preset setup.
+Credentials must be supplied separately in the reconnecting process environment.
+
+This is native SDK connect behavior, not read-only attachment: SDK 2.1.3 POSTs
+`/sandboxes/{id}/connect` with its default `timeout=300`. It may extend a running
+sandbox's expiry and can wake a paused sandbox. The adapter neither gates on
+running state/auto-resume policy nor restores the old expiry. No additional
+pause, snapshot restore, or automatic recreation feature is implemented; recovery
+of paused, deleted, or expired resources is not an adapter acceptance guarantee.
+Paused recovery was not live-tested. Ambiguous connect timeouts/transport errors
+have unknown outcome and are not marked retryable.
+
+State serialization supports domain-based endpoints only: custom
+`api_url`/`sandbox_url` overrides and SDK debug mode cannot be serialized. They
+remain SDK connection settings, not secret-bearing URLs saved in JSON. Reconnect
+uses current environment credentials and SDK connection configuration; callers
+must supply consistent settings in a different process.
+
+The verified SDK baseline is **novita-sandbox 2.1.3** (import `novita_sandbox`,
+package metadata requires Python >=3.9; this project requires >=3.10). Both
+`Novita().code_interpreter.create(...)` and `.connect(id)` return
+`CodeInterpreterSandbox`. The optional dependency remains `>=2.1.3,<2.2` as a
+conservative tested-baseline bound, not because the adapter still needs the old
+internal reconstruction path. Earlier/newer SDK releases and other Python
+versions were not tested, so the supported range has not been broadened.
+
+Files use `read(path, format="bytes")` (SDK `bytearray`, converted to `bytes`)
+and `EntryInfo.type == FileType.DIR` (`"dir"`, versus `"file"`). A completed
+nonzero command raises `CommandExitException` with stdout, stderr and exit code;
+the adapter returns those fields as `SandboxResult`. `kill()` returns `False`
+only for an already-absent resource (HTTP 404); other failures are surfaced.
+
+References: [PyPI 2.1.3](https://pypi.org/project/novita-sandbox/2.1.3/),
+[first Code Interpreter sandbox](https://docs.novita.ai/guides/sandbox-your-first-agent-sandbox),
+[regions](https://docs.novita.ai/guides/sandbox-faq-regions),
+[connect semantics](https://docs.novita.ai/guides/sandbox-connect).
+
+### Dedicated acceptance tests
+
+Offline, from a checkout installed with `[dev,novita]`:
+
+```bash
+python -m pytest -q tests/test_novita_backend.py tests/test_novita_e2e.py
+```
+
+The live tests are skipped unless explicitly opted in. After securely injecting
+`NOVITA_API_KEY`, choose the domain/template deliberately and run **only** this
+Novita target (the general regression suite probes unrelated providers):
+
+```bash
+NOVITA_RUN_E2E=1 \
+NOVITA_DOMAIN=us-phx-1.sandbox.novita.ai \
+NOVITA_E2E_TEMPLATE=code-interpreter-v1 \
+python -m pytest -q tests/test_novita_e2e.py --tb=short --show-capture=no \
+  -o log_cli=false -o log_level=CRITICAL --junitxml=novita-e2e.xml
+```
+
+Do not enable local-variable traceback capture or SDK debug logging. The two
+cases test public and protected services, use test-owned resources with a
+300-second initial lifetime, reconnect through a new SDK client, and explicitly
+destroy and verify absence by GET/404 in `finally`. The report records SDK version,
+domain/template, resource ID, pre/post-connect `end_at`, expiry delta and cleanup
+evidence, not credentials or headers. Expiry equality is not an acceptance
+criterion. Missing credentials or required settings after opting in cause a skip,
+not a pass. A protected reconnect failure remains an acceptance blocker; tests
+must not switch the sandbox to public or bypass authentication.
+
+Dedicated acceptance passed on 2026-11-13 UTC with Python 3.13.14,
+SDK 2.1.3, `us-phx-1.sandbox.novita.ai` / `code-interpreter-v1`:
+
+- Offline adapter and actual SDK `httpx.MockTransport`: **68 passed**, with
+  socket connections blocked; opt-out live tests: **2 skipped**.
+- Public/protected live tests: **2 passed, 0 failed, 0 skipped**. Python state
+  and sandbox ID survived fresh-client and separate-process reconnect. Shell
+  success/nonzero results, binary/empty files, transfers, directory listing and
+  service access passed. Protected services rejected missing/wrong tokens with
+  HTTP 403; both test resources were explicitly destroyed and confirmed absent
+  by GET/404. Native connect extended their lifetimes, as expected.
+
+Paused recovery, other regions/templates, and other SDK versions remain
+unverified and outside this acceptance scope. Other providers' cloud tests
+were not executed. Do not collect `tests/test_regression.py` for Novita-only
+validation: its collection can create unrelated provider resources.
+
 ## Feature Support Matrix
 
 This table describes the adapters in this repository, not every feature offered
 by each provider's native SDK. “Interpreter” means an installed binary that
 accepts `-c`; use shell commands for other language runtimes.
 
-Monty's Python-only capability set is described [above](#monty-local-python-execution);
-the table below covers the backends that support shell commands.
+Monty's Python-only capability set is described [above](#monty-local-python-execution).
+Novita's reattachment limitations are covered in the
+[Novita section](#novita-code-interpreter).
 
-| Feature | Local | Safehouse | Docker | Ray | Daytona | Tensorlake | Modal | RunPod | E2B | boxd |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `execute_code` | Interpreter | Interpreter | Interpreter | Interpreter | Python | Interpreter | Interpreter | Interpreter | Python | Interpreter |
-| `execute_command` | Shell | Shell | Shell | Shell | Shell | Shell | Shell | SSH | Shell | Shell |
-| `list_files` | Native | Native | `find` / `ls` | Native | Native SDK | via `ls` | Native SDK | via SSH | Native SDK | Native SDK |
-| `read_file` | Native | Native | `get_archive` | Native | Native SDK | via `cat` | Native SDK | via SSH | Native SDK | Native SDK |
-| `write_file` | Native | Native | `put_archive` | Native | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Native SDK |
-| `upload_file` | `shutil.copy` | `shutil.copy` | `put_archive` | Actor RPC | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Native SDK |
-| `download_file` | `shutil.copy` | `shutil.copy` | `get_archive` | Actor RPC | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Native SDK |
-| `snapshot` | No | No | Yes | No | No | Yes | Yes | No | No | Yes |
-| `dockerfile=` | Rejected | Rejected | Local build | Rejected | Declarative build | Rejected | `Image.from_dockerfile` | Rejected | Rejected | Rejected |
-| `expose_port` | No | No | Published port | No | Preview link + token | No | Tunnel | No | `get_host` | Public HTTPS proxy |
-| Resource limits | No | No | cpu, memory | cpu (Ray) | cpu, memory, disk | cpu, memory | cpu, memory, gpu | cpu, memory, disk, gpu | Tier-based | cpu, memory (size class) |
-| `allow_internet=False` (legacy, prefer `network=`) | Ignored | Ignored | Yes | Ignored | Ignored | Yes | Ignored | Rejected | Ignored | Yes |
-| `network=` modes | public | public | public, none | public | all | public, none | all | public | public | all |
-| `set_network()` | No | No | No | No | Yes | No | public, allowlist | No | No | Yes |
-| Isolation | Process-level | macOS `sandbox-exec` | Container | Process | Full VM | Container | Container | Container | Full VM | Full VM |
-| `gpu=` reservation | No | No | No | No | No | No | Yes | Yes | No | No |
-| Needs install | Nothing | `safehouse` CLI | Docker daemon | `ray` | API key | `tl login` | API key | API key + OpenSSH | API key | API key |
+| Feature | Local | Safehouse | Docker | Ray | Daytona | Tensorlake | Modal | RunPod | E2B | Novita | boxd |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `execute_code` | Interpreter | Interpreter | Interpreter | Interpreter | Python | Interpreter | Interpreter | Interpreter | Python | Python | Interpreter |
+| `execute_command` | Shell | Shell | Shell | Shell | Shell | Shell | Shell | SSH | Shell | Shell | Shell |
+| `list_files` | Native | Native | `find` / `ls` | Native | Native SDK | via `ls` | Native SDK | via SSH | Native SDK | Native SDK | Native SDK |
+| `read_file` | Native | Native | `get_archive` | Native | Native SDK | via `cat` | Native SDK | via SSH | Native SDK | Binary SDK | Native SDK |
+| `write_file` | Native | Native | `put_archive` | Native | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Native SDK | Native SDK |
+| `upload_file` | `shutil.copy` | `shutil.copy` | `put_archive` | Actor RPC | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Whole file | Native SDK |
+| `download_file` | `shutil.copy` | `shutil.copy` | `get_archive` | Actor RPC | Native SDK | via base64 | Native SDK | via SSH | Native SDK | Whole file | Native SDK |
+| `snapshot` | No | No | Yes | No | No | Yes | Yes | No | No | No | Yes |
+| `dockerfile=` | Rejected | Rejected | Local build | Rejected | Declarative build | Rejected | `Image.from_dockerfile` | Rejected | Rejected | Rejected | Rejected |
+| `expose_port` | No | No | Published port | No | Preview link + token | No | Tunnel | No | `get_host` | `get_host` + token | Public HTTPS proxy |
+| Resource limits | No | No | cpu, memory | cpu (Ray) | cpu, memory, disk | cpu, memory | cpu, memory, gpu | cpu, memory, disk, gpu | Tier-based | Template-defined | cpu, memory (size class) |
+| `allow_internet=False` (legacy, prefer `network=`) | Ignored | Ignored | Yes | Ignored | Ignored | Yes | Ignored | Rejected | Ignored | Ignored | Yes |
+| `network=` modes | public | public | public, none | public | all | public, none | all | public | public | public | all |
+| `set_network()` | No | No | No | No | Yes | No | public, allowlist | No | No | No | Yes |
+| Isolation | Process-level | macOS `sandbox-exec` | Container | Process | Full VM | Container | Container | Container | Full VM | MicroVM | Full VM |
+| `gpu=` reservation | No | No | No | No | No | No | Yes | Yes | No | No | No |
+| Needs install | Nothing | `safehouse` CLI | Docker daemon | `ray` | API key | `tl login` | API key | API key + OpenSSH | API key | API key | API key |
 
 Daytona applies CPU/RAM/disk overrides when creating from `image`; the snapshot
 creation path uses the snapshot's resources. RunPod CPU/RAM values are minimums
@@ -177,6 +318,10 @@ export RUNPOD_API_KEY=your_key
 
 # E2B
 export E2B_API_KEY=your_key
+
+# Novita
+export NOVITA_API_KEY=your_key
+# NOVITA_DOMAIN is optional; omit it to use the SDK default region.
 
 # boxd
 export BOXD_API_KEY=your_key

@@ -28,6 +28,8 @@ daytona = ["daytona>=0.207.0"]
 tensorlake = ["tensorlake>=0.1.0"]
 modal = ["modal>=0.60.0"]
 e2b = ["e2b-code-interpreter>=1.0.0"]
+# 2.1.3 is the tested public Code Interpreter create/connect baseline.
+novita = ["novita-sandbox>=2.1.3,<2.2"]
 docker = ["docker>=7.0.0"]
 monty = ["pydantic-monty>=1.5.0,<2"]
 ray = ["ray>=2.0.0"]
@@ -39,6 +41,7 @@ all = [
     "tensorlake>=0.1.0",
     "modal>=0.60.0",
     "e2b-code-interpreter>=1.0.0",
+    "novita-sandbox>=2.1.3,<2.2",
     "docker>=7.0.0",
     "pydantic-monty>=1.5.0,<2",
     "ray>=2.0.0",
