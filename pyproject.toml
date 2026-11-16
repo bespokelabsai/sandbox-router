@@ -24,7 +24,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-daytona = ["daytona>=0.207.0"]
+daytona = ["daytona>=0.207.0,<1"]
 tensorlake = ["tensorlake>=0.1.0"]
 modal = ["modal>=0.60.0"]
 e2b = ["e2b-code-interpreter>=1.0.0"]
@@ -37,7 +37,7 @@ boxd = ["boxd>=0.2.20"]
 gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0"]
 server = ["fastapi>=0.115.0", "uvicorn>=0.30.0"]
 all = [
-    "daytona>=0.207.0",
+    "daytona>=0.207.0,<1",
     "tensorlake>=0.1.0",
     "modal>=0.60.0",
     "e2b-code-interpreter>=1.0.0",
