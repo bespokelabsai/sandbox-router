@@ -16,6 +16,7 @@ from bespokelabs.sandbox.types import SandboxConfig, SandboxResult
 
 
 class _Session:
+
     def __init__(self, exit_code: int = 0, fail: bool = False) -> None:
         self.exit_code = exit_code
         self.fail = fail
@@ -34,6 +35,7 @@ class _Session:
 
 
 class _Client:
+
     def __init__(self, session=None, error: Exception | None = None):
         self.session = session or _Session()
         self.error = error
@@ -83,6 +85,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_listeners_run_when_logging_fails(self) -> None:
         class Boom(logging.Handler):
+
             def emit(self, record):
                 raise RuntimeError("handler")
 
@@ -97,6 +100,7 @@ class TelemetryTests(unittest.TestCase):
 
     def test_later_listeners_run_when_listener_and_logging_fail(self) -> None:
         class Boom(logging.Handler):
+
             def emit(self, record):
                 raise RuntimeError("handler")
 
