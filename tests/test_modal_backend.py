@@ -4,13 +4,30 @@ import unittest
 from unittest import mock
 
 from bespokelabs.sandbox import Sandbox, SandboxClient
-from bespokelabs.sandbox.backends.modal import ModalClient
+from bespokelabs.sandbox.backends.modal import ModalClient, ModalSession
 from bespokelabs.sandbox.exceptions import (
     FeatureNotSupportedError,
     SandboxConfigurationError,
     SandboxExecutionError,
 )
 from bespokelabs.sandbox.types import SandboxConfig
+
+
+class ModalSessionLegacyCleanupTests(unittest.TestCase):
+
+    def test_default_unowned_session_keeps_legacy_destroy_behavior(self):
+        for failure in (None, RuntimeError("legacy termination failure")):
+            with self.subTest(failure=failure):
+                shared_client = mock.MagicMock()
+                remote = mock.Mock(client=shared_client)
+                remote.terminate.side_effect = failure
+                session = ModalSession(sandbox=remote)
+                session.destroy()
+                session.destroy()
+                remote.terminate.assert_called_once_with()
+                shared_client.__exit__.assert_not_called()
+                self.assertIsNone(session._sandbox)
+                self.assertIsNone(session._owned_client)
 
 
 class ModalClientGpuTests(unittest.TestCase):
@@ -92,11 +109,12 @@ class ModalGpuPublicApiTests(unittest.TestCase):
         self.assertEqual(config.gpu, "L4")
 
 
-
 class ModalListSandboxesTests(unittest.TestCase):
     """list_sandboxes finds running sandboxes by tag and never guesses."""
 
-    def _client(self, *sandboxes: mock.MagicMock) -> tuple[ModalClient, mock.MagicMock]:
+    def _client(
+        self, *sandboxes: mock.MagicMock
+    ) -> tuple[ModalClient, mock.MagicMock]:
         modal = mock.MagicMock()
         modal.Sandbox.list.return_value = iter(sandboxes)
         client = object.__new__(ModalClient)
@@ -110,7 +128,9 @@ class ModalListSandboxesTests(unittest.TestCase):
         return sandbox
 
     def test_lists_running_sandboxes_by_tag(self) -> None:
-        client, modal = self._client(self._sandbox("sb-1", {"team": "x", "run": "1"}))
+        client, modal = self._client(
+            self._sandbox("sb-1", {"team": "x", "run": "1"})
+        )
 
         (only,) = client.list_sandboxes({"team": "x"})
 
@@ -127,7 +147,9 @@ class ModalListSandboxesTests(unittest.TestCase):
 
         self.assertEqual(client.list_sandboxes({"team": "x"}), [])
 
-    def test_an_sdk_without_tag_read_back_keeps_the_server_side_match(self) -> None:
+    def test_an_sdk_without_tag_read_back_keeps_the_server_side_match(
+        self,
+    ) -> None:
         old = mock.MagicMock(spec=["object_id"], object_id="sb-old")
         client, _ = self._client(old)
 
@@ -137,7 +159,9 @@ class ModalListSandboxesTests(unittest.TestCase):
         self.assertEqual(only.labels, {"team": "x"})
         self.assertFalse(only.labels_complete)
 
-    def test_a_failed_tag_read_raises_instead_of_returning_part_of_the_list(self) -> None:
+    def test_a_failed_tag_read_raises_instead_of_returning_part_of_the_list(
+        self,
+    ) -> None:
         broken = self._sandbox("sb-3", {})
         broken.get_tags.side_effect = RuntimeError("gone")
         client, _ = self._client(self._sandbox("sb-1", {"team": "x"}), broken)
@@ -162,6 +186,7 @@ class SandboxClientListSandboxesTests(unittest.TestCase):
 
         with self.assertRaises(FeatureNotSupportedError):
             client.list_sandboxes({"team": "x"})
+
 
 if __name__ == "__main__":
     unittest.main()

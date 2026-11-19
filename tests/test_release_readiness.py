@@ -6,7 +6,7 @@ import csv
 import io
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -22,6 +22,8 @@ from bespokelabs.sandbox.control_plane.reconciliation import ProviderObservation
 from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.types import SandboxResult
+
+UTC = timezone.utc
 
 
 class Clock:
@@ -342,6 +344,28 @@ class ProductionSessionTest(unittest.TestCase):
         ]
         self.service.reconcile(principal, "daytona")
 
+        # Historical refunds remain valid signed export data. A decreasing
+        # cumulative provider observation is no longer authority to create one;
+        # seed an already-recorded adjustment without weakening CSV assertions.
+        with self.store._connect() as connection:
+            connection.execute(
+                """INSERT INTO lifecycle_ledger_entries(
+                    id, organization_id, sandbox_id, observation_id,
+                    provider_delta_usd, customer_delta_usd, cost_state,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "ledger-historical-refund",
+                    principal.organization_id,
+                    sandbox.id,
+                    "numeric-negative-delta-historical-refund",
+                    "-0.50",
+                    "-0.75",
+                    "reconciled",
+                    self.clock.value.isoformat(),
+                ),
+            )
+
         currency_observations = []
         for index, value in enumerate(dangerous, start=1):
             currency_sandbox = self.service.create_sandbox(
@@ -412,6 +436,12 @@ class ProductionSessionTest(unittest.TestCase):
         )
         self.assertTrue(negative["provider_delta_usd"].startswith("-"))
         self.assertFalse(negative["provider_delta_usd"].startswith("'-"))
+        self.assertEqual(
+            Decimal(negative["provider_delta_usd"]), Decimal("-0.50")
+        )
+        self.assertEqual(
+            Decimal(negative["customer_delta_usd"]), Decimal("-0.75")
+        )
         self.assertTrue(
             escaped.issubset({row["currency"] for row in cost_rows})
         )

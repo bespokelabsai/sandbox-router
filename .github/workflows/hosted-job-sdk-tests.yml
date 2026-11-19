@@ -1,0 +1,59 @@
+name: Hosted job SDK offline contracts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: ["0.17.0", "0.22.5"]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Install optional SDKs with exact verified versions
+        run: >-
+          python -m pip install -e '.[dev,server,gcp-batch]'
+          'google-cloud-batch==${{ matrix.batch }}'
+          'google-cloud-logging==3.16.0'
+      - name: Verify real SDK imports and versions
+        run: |
+          python - <<'PY'
+          from importlib.metadata import version
+          from google.cloud import batch_v1, logging_v2
+          assert version("google-cloud-batch") == "${{ matrix.batch }}"
+          assert version("google-cloud-logging") == "3.16.0"
+          assert batch_v1.Job and logging_v2.Client
+          PY
+      - name: Hosted contracts with real SDKs and synthetic offline responses
+        run: >-
+          python -m pytest -q
+          tests/test_hosted_jobs.py tests/test_hosted_jobs_gcp_batch.py
+          tests/test_jobs.py
+      # Existing direct-backend cancellation tests require newer SDK enums;
+      # the floor job tests hosted fail-closed behavior, not that direct API.
+      - name: Public offline test suite (no live provider probes)
+        if: matrix.batch == '0.22.5'
+        run: >-
+          python -m pytest -q
+          --deselect=tests/test_regression.py::TensorlakeRegressionTests
+          --deselect=tests/test_regression.py::DaytonaRegressionTests
+          --deselect=tests/test_regression.py::E2BRegressionTests
+          --deselect=tests/test_regression.py::BoxdRegressionTests
+          --deselect=tests/test_regression.py::ModalRegressionTests
+          --deselect=tests/test_regression.py::DockerRegressionTests
+          --deselect=tests/test_regression.py::SafehouseRegressionTests
+          --ignore=tests/test_novita_e2e.py
+          --deselect=tests/test_boxd_backend.py::BoxdLiveTests

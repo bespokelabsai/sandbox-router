@@ -504,6 +504,8 @@ class SQLiteMigrationTest(unittest.TestCase):
                     "SELECT version FROM schema_migrations ORDER BY version"
                 ).fetchall()
 
+            # Assert the new tip and retain every original phase-5 assertion.
+            self.assertEqual(versions.pop(), (11,))
             self.assertEqual(
                 versions,
                 [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)],
@@ -575,6 +577,8 @@ class SQLiteMigrationTest(unittest.TestCase):
                        'web_sessions', 'alert_configurations', 'alert_events',
                        'audit_log', 'retention_policies') ORDER BY name"""
                 ).fetchall()
+            self.assertFalse(store.resource_is_held(record.id))
+            self.assertEqual(versions.pop(), (11,))
             self.assertEqual(
                 versions,
                 [(1,), (2,), (3,), (4,), (5,), (6,), (7,), (8,), (9,), (10,)],
