@@ -20,15 +20,24 @@ virtual environment, install only the declared development and server extras:
 
 ```sh
 python -m pip install -e '.[dev,server]'
-python -m pytest --ignore=tests/test_regression.py --ignore=tests/test_novita_e2e.py --deselect=tests/test_boxd_backend.py::BoxdLiveTests -ra
+python -m pytest \
+  --deselect=tests/test_regression.py::TensorlakeRegressionTests \
+  --deselect=tests/test_regression.py::DaytonaRegressionTests \
+  --deselect=tests/test_regression.py::E2BRegressionTests \
+  --deselect=tests/test_regression.py::BoxdRegressionTests \
+  --deselect=tests/test_regression.py::ModalRegressionTests \
+  --deselect=tests/test_regression.py::DockerRegressionTests \
+  --deselect=tests/test_regression.py::SafehouseRegressionTests \
+  --ignore=tests/test_novita_e2e.py \
+  --deselect=tests/test_boxd_backend.py::BoxdLiveTests -ra
 python -m ruff check .
 python -m pyink --check .
 ```
 
 Do not install provider extras or supply cloud credentials for this lane.
-The two ignored modules and the deselected class exercise live providers;
-all other tests, including remote-client regression tests using local fake
-HTTP servers, remain eligible. Tests requiring uninstalled optional SDKs
+The ignored module and deselected classes exercise live providers or Docker;
+all other tests, including `LocalRegressionTests` and remote-client regressions
+using local fake HTTP servers, remain eligible. Tests requiring uninstalled optional SDKs
 report skips with their reasons through `-ra`. Local HTTP servers are allowed;
 this lane does not require external services or deploy anything.
 

@@ -35,7 +35,13 @@ jobs:
       - name: Run offline suite
         run: >-
           python -m pytest
-          --ignore=tests/test_regression.py
+          --deselect=tests/test_regression.py::TensorlakeRegressionTests
+          --deselect=tests/test_regression.py::DaytonaRegressionTests
+          --deselect=tests/test_regression.py::E2BRegressionTests
+          --deselect=tests/test_regression.py::BoxdRegressionTests
+          --deselect=tests/test_regression.py::ModalRegressionTests
+          --deselect=tests/test_regression.py::DockerRegressionTests
+          --deselect=tests/test_regression.py::SafehouseRegressionTests
           --ignore=tests/test_novita_e2e.py
           --deselect=tests/test_boxd_backend.py::BoxdLiveTests
           -ra
