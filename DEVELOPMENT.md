@@ -13,6 +13,28 @@ The core ownership boundary is:
 - Integrations should let OpenAI Agents SDK, Claude SDK, LangGraph, custom
   runners, and CLI agents use the same sandbox primitive.
 
+## Offline Python Checks
+
+CI runs the offline test suite on Python 3.10, 3.12, and 3.13. In a fresh
+virtual environment, install only the declared development and server extras:
+
+```sh
+python -m pip install -e '.[dev,server]'
+python -m pytest --ignore=tests/test_regression.py --ignore=tests/test_novita_e2e.py --deselect=tests/test_boxd_backend.py::BoxdLiveTests -ra
+python -m ruff check .
+python -m pyink --check .
+```
+
+Do not install provider extras or supply cloud credentials for this lane.
+The two ignored modules and the deselected class exercise live providers;
+all other tests, including remote-client regression tests using local fake
+HTTP servers, remain eligible. Tests requiring uninstalled optional SDKs
+report skips with their reasons through `-ra`. Local HTTP servers are allowed;
+this lane does not require external services or deploy anything.
+
+Ruff and Pyink check the full repository using `pyproject.toml`; formatting
+failures are errors, not exclusions or automatic rewrites.
+
 ## Stable Core API
 
 Keep the current `Sandbox` primitive stable. Existing users such as Curator
