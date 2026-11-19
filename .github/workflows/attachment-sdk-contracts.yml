@@ -1,0 +1,69 @@
+name: Offline attachment SDK contracts
+
+on:
+  pull_request:
+    paths:
+      - 'src/bespokelabs/sandbox/control_plane/attachments.py'
+      - 'src/bespokelabs/sandbox/backends/**'
+      - 'src/bespokelabs/sandbox/sandbox.py'
+      - 'tests/test_sdk_attachment_contract.py'
+      - '.github/workflows/attachment-sdk-contracts.yml'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: modal
+            release: floor
+            packages: 'modal==0.60.15'
+          - provider: modal
+            release: current
+            packages: 'modal==1.6.4'
+          - provider: daytona
+            release: floor
+            packages: 'daytona==0.207.0 httpx>=0.28,<1'
+          - provider: daytona
+            release: current
+            packages: 'daytona==0.232.0 httpx>=0.28,<1'
+          - provider: tensorlake
+            release: sandbox-floor
+            packages: 'tensorlake==0.3.12'
+          - provider: tensorlake
+            release: current
+            packages: 'tensorlake==0.5.165'
+          - provider: e2b
+            release: floor-disabled
+            packages: 'e2b-code-interpreter==1.0.0 e2b==1.11.1 httpx>=0.27,<0.28'
+          - provider: e2b
+            release: current-disabled
+            packages: 'e2b-code-interpreter==2.11.10 e2b==2.64.0'
+    name: ${{ matrix.provider }} / ${{ matrix.release }} / Python 3.12
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Install only the selected real SDK
+        env:
+          SDK_PACKAGES: ${{ matrix.packages }}
+        run: |
+          python -m pip install -e . pytest
+          # Split fixed matrix package specs without interpreting shell operators.
+          python -c 'import os, subprocess, sys; subprocess.check_call([sys.executable, "-m", "pip", "install", *os.environ["SDK_PACKAGES"].split()])'
+          python -m pip check
+      - name: Offline required-provider contract (no auth or live calls)
+        env:
+          ATTACHMENT_CONTRACT_PROVIDER: ${{ matrix.provider }}
+          PYTHONPATH: ${{ github.workspace }}/src
+        run: python -m pytest tests/test_sdk_attachment_contract.py -q

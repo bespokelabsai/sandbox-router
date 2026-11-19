@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -21,6 +22,17 @@ from bespokelabs.sandbox.control_plane.agent_usage import (
     agent_usage_record,
     empty_agent_summary,
 )
+from bespokelabs.sandbox.control_plane.attachments import (
+    AttachmentConflict,
+    AttachmentCoordinator,
+    AttachmentDescriptor,
+    AttachmentRecord,
+    BindingRegistry,
+    ProviderBinding,
+    SDKAttachmentAdapter,
+    load_sandbox_authority,
+    release_owned_transport,
+)
 from bespokelabs.sandbox.control_plane.errors import (
     AuthorizationError,
     ConflictError,
@@ -35,7 +47,12 @@ from bespokelabs.sandbox.control_plane.models import (
     RetentionPolicy,
     SandboxRecord,
 )
-from bespokelabs.sandbox.control_plane.reconciliation import ProviderReconciler
+from bespokelabs.sandbox.control_plane.reconciliation import (
+    ProviderObservation,
+    ProviderReconciler,
+    lookup_resource,
+    normalize_observation,
+)
 from bespokelabs.sandbox.control_plane.resource_metrics import (
     STALE_SECONDS,
     ResourceMonitor,
@@ -45,6 +62,7 @@ from bespokelabs.sandbox.exceptions import (
     ErrorOutcome,
     FeatureNotSupportedError,
     SandboxConfigurationError,
+    SandboxCreationError,
 )
 from bespokelabs.sandbox.sandbox import Sandbox
 from bespokelabs.sandbox.types import (
@@ -121,6 +139,8 @@ class ControlPlane:
             dict[str, Callable[[dict[str, str]], bool]] | None
         ) = None,
         provider_terminators: dict[str, Callable[[str], None]] | None = None,
+        attachment_bindings: tuple[ProviderBinding, ...] = (),
+        attachment_adapters: dict[str, SDKAttachmentAdapter] | None = None,
         supervision_interval_secs: float = 30,
         resource_sampling_interval_secs: float = 15,
         now: Callable[[], datetime] | None = None,
@@ -147,7 +167,29 @@ class ControlPlane:
                 "allowed_backends includes job-only backends that cannot "
                 f"create sandboxes: {sorted(self._allowed_backends & job_only)}"
             )
+        self._runtime_lock = threading.RLock()
         self._runtimes: dict[str, SandboxRuntime] = {}
+        self._attachment_bindings = tuple(attachment_bindings)
+        self._binding_registry = BindingRegistry(self._attachment_bindings)
+        if self._attachment_bindings or attachment_adapters:
+            self._binding_registry.attach_repository(
+                store.attachment_repository
+            )
+        self._attachment_adapters = dict(attachment_adapters or {})
+        self._attachment_backends = {
+            binding.backend for binding in self._attachment_bindings
+        } | self._attachment_adapters.keys()
+        self._attachment_coordinators = {
+            backend: AttachmentCoordinator(
+                store.attachment_repository,
+                self._binding_registry,
+                adapter=adapter,
+            )
+            for backend, adapter in self._attachment_adapters.items()
+        }
+        self._runtime_attachment_records: dict[
+            str, tuple[AttachmentRecord, ProviderBinding]
+        ] = {}
         self._lifecycle_locks: WeakValueDictionary[str, threading.Lock] = (
             WeakValueDictionary()
         )
@@ -286,12 +328,100 @@ class ControlPlane:
         )
         if not claimed:
             return record
+        runtime = None
+        runtime_verified = False
+        binding = None
+        publication: list[AttachmentRecord] = []
         try:
-            runtime = self._sandbox_factory(backend, **config)
+            if backend in self._attachment_backends:
+                binding = self._creation_binding(principal, backend)
+                adapter = self._attachment_adapters.get(backend)
+                create = getattr(adapter, "create", None)
+                if create is None:
+                    raise FeatureNotSupportedError(
+                        "Bound runtime creation is not configured.",
+                        backend=backend,
+                        op="create",
+                    )
+                try:
+                    runtime = create(binding, **config)
+                    adapter.verify_created(runtime, binding)
+                except Exception:
+                    # Neither an unverified handle nor a create error's claimed
+                    # identity grants cleanup authority. Discard opaque errors.
+                    pass
+                else:
+                    runtime_verified = True
+                if not runtime_verified:
+                    release_owned_transport(runtime, unclaimed_only=True)
+                    # Outside the verifier's handler: do not retain its error
+                    # (which may contain credentials) in exception chaining.
+                    raise SandboxCreationError(
+                        "Runtime creation provenance could not be verified.",
+                        backend=backend,
+                        op="create",
+                        outcome=ErrorOutcome.UNKNOWN,
+                        context={"cleanup_status": "unknown"},
+                    )
+            else:
+                runtime = self._sandbox_factory(backend, **config)
+                runtime_verified = True
+            dynamic_rate = None
+            if backend not in {"docker", "local", "ray", "safehouse", "monty"}:
+                candidate_rate = Decimal(
+                    str(runtime.estimate_compute_cost(3600))
+                )
+                if candidate_rate > 0:
+                    dynamic_rate = candidate_rate
+
+            def publish(connection):
+                assert binding is not None
+                publication.append(
+                    self._attachment_coordinators[backend].publish_created(
+                        principal,
+                        record.id,
+                        runtime,
+                        binding.id,
+                        expected_generation=0,
+                        remote_workdir=config.get("workdir")
+                        if backend in {"daytona", "tensorlake"}
+                        else None,
+                        scope="sandboxes:create",
+                        connection=connection,
+                    )
+                )
+
+            self.store.complete_sandbox_creation(
+                record.id,
+                status="running",
+                provider_resource_id=self._provider_resource_id(runtime),
+                timestamp=self._now().isoformat(),
+                hourly_rate_usd=dynamic_rate,
+                publish_attachment=publish if binding is not None else None,
+            )
         except Exception as exc:
+            failure = exc
+            if runtime is not None and runtime_verified:
+                # Provenance succeeded but publication did not. Keep the known
+                # owned identity and ambiguous cleanup outcome, never an
+                # unverified handle or its claimed provider identity.
+                with self._runtime_lock:
+                    self._runtimes[record.id] = runtime
+                failure = SandboxCreationError(
+                    "Runtime publication failed.",
+                    backend=backend,
+                    op="create",
+                    outcome=ErrorOutcome.UNKNOWN,
+                    context={
+                        "provider_resource_id": self._provider_resource_id(
+                            runtime
+                        ),
+                        "cleanup_status": "unknown",
+                    },
+                )
             completed_at = self._now().isoformat()
             provider_error = normalize_provider_error(
-                exc, backend=backend, op="create"
+                failure, backend=backend, op="create"
             )
             payload = provider_error_payload(provider_error)
             cleanup_status = payload["context"].get("cleanup_status")
@@ -314,23 +444,24 @@ class ControlPlane:
             self._record_lifecycle_estimate(
                 failed, completed_at, observation_id=f"create:{record.id}"
             )
+            if runtime is not None and not runtime_verified:
+                raise provider_error from None
             if provider_error is exc:
                 raise
             raise provider_error from exc
-        with self._lock:
-            self._runtimes[record.id] = runtime
-        dynamic_rate = None
-        if backend not in {"docker", "local", "ray", "safehouse", "monty"}:
-            candidate_rate = Decimal(str(runtime.estimate_compute_cost(3600)))
-            if candidate_rate > 0:
-                dynamic_rate = candidate_rate
-        self.store.complete_sandbox_creation(
-            record.id,
-            status="running",
-            provider_resource_id=self._provider_resource_id(runtime),
-            timestamp=self._now().isoformat(),
-            hourly_rate_usd=dynamic_rate,
-        )
+        with self.store.attachment_repository.transaction() as connection:
+            authority = load_sandbox_authority(
+                connection, principal.organization_id, record.id
+            )
+            if authority.status != "running":
+                raise ConflictError("sandbox stopped during creation")
+            with self._runtime_lock:
+                self._runtimes[record.id] = runtime
+                if binding is not None:
+                    self._runtime_attachment_records[record.id] = (
+                        publication[0],
+                        binding,
+                    )
         return self.store.get_sandbox(principal.organization_id, record.id)
 
     def list_sandboxes(self, principal: Principal) -> list[SandboxRecord]:
@@ -349,6 +480,153 @@ class ControlPlane:
             return self._lifecycle_locks.setdefault(
                 sandbox_id, threading.Lock()
             )
+
+    def _creation_binding(
+        self, principal: Principal, backend: str
+    ) -> ProviderBinding:
+        candidates = [
+            binding
+            for binding in self._attachment_bindings
+            if binding.backend == backend
+            and principal.organization_id in binding.organization_ids
+        ]
+        if len(candidates) != 1:
+            raise FeatureNotSupportedError(
+                "A unique provider account binding is required.",
+                backend=backend,
+                op="create",
+            )
+        selected = candidates[0]
+        # Check shared revocation/version authority before allocation, too.
+        return self._binding_registry.resolve(
+            principal.organization_id,
+            AttachmentDescriptor(
+                backend=selected.backend,
+                binding_id=selected.id,
+                binding_version=selected.version,
+                provider_resource_id="creation",
+            ),
+        )
+
+    def _validate_local_attachment(
+        self,
+        connection: sqlite3.Connection,
+        organization_id: str,
+        sandbox_id: str,
+        local: tuple[AttachmentRecord, ProviderBinding],
+    ) -> None:
+        authority = load_sandbox_authority(
+            connection, organization_id, sandbox_id
+        )
+        current = self.store.attachment_repository.load(
+            organization_id, sandbox_id, connection=connection
+        )
+        if authority.status != "running" or current.descriptor is None:
+            raise AttachmentConflict("Sandbox is not attachable.")
+        binding = self._binding_registry.resolve(
+            organization_id, current.descriptor, connection=connection
+        )
+        if (
+            current != local[0]
+            or binding is not local[1]
+            or authority.provider_resource_id
+            != current.descriptor.provider_resource_id
+            or authority.backend != current.descriptor.backend
+        ):
+            raise AttachmentConflict("Runtime attachment changed.")
+
+    def _resolve_runtime(
+        self, principal: Principal, sandbox_id: str, *, scope: str
+    ) -> SandboxRuntime:
+        """Caller holds the lifecycle lock; install only under DB authority."""
+        record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        if record.status != "running":
+            raise ConflictError(f"sandbox is {record.status}")
+        with self._runtime_lock:
+            runtime = self._runtimes.get(sandbox_id)
+            local = self._runtime_attachment_records.get(sandbox_id)
+        coordinator = self._attachment_coordinators.get(record.backend)
+        if record.backend not in self._attachment_backends:
+            if runtime is not None:
+                return runtime
+            raise ConflictError(
+                "sandbox runtime is unavailable after a control-plane restart"
+            )
+        if coordinator is None:
+            raise FeatureNotSupportedError(
+                "Runtime attachment is not configured.",
+                backend=record.backend,
+                op="attach",
+            )
+        repository = self.store.attachment_repository
+        installed = []
+        resolved = False
+        try:
+            if runtime is not None and local is not None:
+                with repository.transaction() as connection:
+                    self._validate_local_attachment(
+                        connection, principal.organization_id, sandbox_id, local
+                    )
+                    return runtime
+
+            def install(runtime, attachment, binding):
+                with self._runtime_lock:
+                    previous = self._runtimes.get(sandbox_id)
+                    self._runtimes[sandbox_id] = runtime
+                    if previous is not None and previous is not runtime:
+                        release_owned_transport(previous)
+                    self._runtime_attachment_records[sandbox_id] = (
+                        attachment,
+                        binding,
+                    )
+                    installed.append(runtime)
+
+            result = coordinator.resolve(
+                principal, sandbox_id, scope=scope, install=install
+            )
+            resolved = True
+            return result
+        except AttachmentConflict:
+            raise ConflictError(
+                "Sandbox attachment conflicts with its lifecycle."
+            ) from None
+        except Exception:
+            # SDK and adapter errors are never public messages or exception causes.
+            raise FeatureNotSupportedError(
+                "Runtime attachment is unavailable for this scope or provider.",
+                backend=record.backend,
+                op="attach",
+            ) from None
+        finally:
+            if installed and not resolved:
+                with self._runtime_lock:
+                    if self._runtimes.get(sandbox_id) is installed[-1]:
+                        self._runtimes.pop(sandbox_id, None)
+                        self._runtime_attachment_records.pop(sandbox_id, None)
+                release_owned_transport(installed[-1])
+            # _runtimes remains the only local runtime authority used by shutdown,
+            # termination and resource sampling. No second retained handle cache.
+            coordinator.forget(
+                principal.organization_id, sandbox_id, release_transport=False
+            )
+
+    def attach_sandbox(
+        self, principal: Principal, sandbox_id: str
+    ) -> SandboxRecord:
+        """Attach a hosted identity, never a caller-supplied provider document."""
+        self.require(principal, "sandboxes:execute")
+        record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        if record.backend not in self._attachment_backends:
+            raise FeatureNotSupportedError(
+                "Runtime attachment is not configured.",
+                backend=record.backend,
+                op="attach",
+            )
+        with self._lifecycle_lock(sandbox_id):
+            self._resolve_runtime(
+                principal, sandbox_id, scope="sandboxes:execute"
+            )
+            return self.store.get_sandbox(principal.organization_id, sandbox_id)
 
     def set_network(
         self, principal: Principal, sandbox_id: str, policy: NetworkPolicy
@@ -369,12 +647,9 @@ class ControlPlane:
             )
             if record.status != "running":
                 raise ConflictError(f"sandbox is {record.status}")
-            with self._lock:
-                runtime = self._runtimes.get(sandbox_id)
-            if runtime is None:
-                raise ConflictError(
-                    "sandbox runtime is unavailable after a control-plane restart"
-                )
+            runtime = self._resolve_runtime(
+                principal, sandbox_id, scope="sandboxes:network"
+            )
             try:
                 setter = getattr(runtime, "set_network", None)
                 if setter is None:
@@ -411,18 +686,34 @@ class ControlPlane:
         if (code is None) == (command is None):
             raise ValueError("provide exactly one of code or command")
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        # Only the digest is persisted: code and arguments may contain secrets.
+        fingerprint = self.store.fingerprint_execution_request(
+            {
+                "operation": "execute",
+                "code": code,
+                "language": language,
+                "command": command,
+                "args": args,
+            }
+        )
+        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        cached = self.store.cached_execution(
+            principal.organization_id, sandbox_id, request_id, fingerprint
+        )
+        if cached is not None:
+            return cached
         if record.status != "running":
             raise ConflictError(f"sandbox is {record.status}")
-        with self._lock:
-            runtime = self._runtimes.get(sandbox_id)
-        if runtime is None:
-            raise ConflictError(
-                "sandbox runtime is unavailable after a control-plane restart"
+        with self._lifecycle_lock(sandbox_id):
+            runtime = self._resolve_runtime(
+                principal, sandbox_id, scope="sandboxes:execute"
             )
 
-        request_id = request_id or f"req_{uuid.uuid4().hex}"
         execution_id, cached = self.store.begin_execution(
-            principal.organization_id, sandbox_id, request_id
+            principal.organization_id,
+            sandbox_id,
+            request_id,
+            request_fingerprint=fingerprint,
         )
         if cached is not None:
             return cached
@@ -524,11 +815,9 @@ class ControlPlane:
             return visible_response(cached)
         if record.status != "running":
             raise ConflictError(f"sandbox is {record.status}")
-        with self._lock:
-            runtime = self._runtimes.get(sandbox_id)
-        if runtime is None:
-            raise ConflictError(
-                "sandbox runtime is unavailable after a control-plane restart"
+        with self._lifecycle_lock(sandbox_id):
+            runtime = self._resolve_runtime(
+                principal, sandbox_id, scope="sandboxes:execute"
             )
         execution_id, cached = self.store.begin_execution(
             principal.organization_id,
@@ -621,24 +910,33 @@ class ControlPlane:
         if record.status == "destroyed":
             return record
         terminator = self._provider_terminators.get(record.backend)
-        with self._lock:
+        with self._runtime_lock:
             runtime = self._runtimes.get(sandbox_id)
-            if runtime is None and (
-                terminator is None or record.provider_resource_id is None
-            ):
-                raise ConflictError(
-                    "sandbox runtime is not attached and provider termination "
-                    "is not configured"
-                )
-            stopping_at = self._now().isoformat()
-            self.store.begin_termination(
-                principal.organization_id,
-                sandbox_id,
-                timestamp=stopping_at,
-                expected_version=expected_version,
+        if runtime is None and (
+            terminator is None or record.provider_resource_id is None
+        ):
+            raise ConflictError(
+                "sandbox runtime is not attached and provider termination "
+                "is not configured"
             )
+        stopping_at = self._now().isoformat()
+        stopping = self.store.begin_termination(
+            principal.organization_id,
+            sandbox_id,
+            timestamp=stopping_at,
+            expected_version=expected_version,
+        )
+        with self._runtime_lock:
             if runtime is not None:
                 self._runtimes.pop(sandbox_id, None)
+            self._runtime_attachment_records.pop(sandbox_id, None)
+        coordinator = self._attachment_coordinators.get(record.backend)
+        if coordinator is not None:
+            coordinator.forget(
+                principal.organization_id,
+                sandbox_id,
+                release_transport=runtime is None,
+            )
         try:
             if runtime is not None:
                 runtime.destroy()
@@ -655,6 +953,7 @@ class ControlPlane:
                 sandbox_id,
                 timestamp=failed_at,
                 error=provider_error_payload(provider_error),
+                expected_version=stopping.version,
             )
             self._record_lifecycle_estimate(
                 self.store.get_sandbox_internal(sandbox_id),
@@ -664,6 +963,9 @@ class ControlPlane:
             if provider_error is exc:
                 raise
             raise provider_error from exc
+        finally:
+            if runtime is not None:
+                release_owned_transport(runtime)
         terminated_at = self._now().isoformat()
         self.store.mark_lifecycle(
             sandbox_id,
@@ -717,7 +1019,7 @@ class ControlPlane:
             if datetime.fromisoformat(s["collected_at"]) >= cutoff
         ]
         latest = samples[-1] if samples else None
-        with self._lock:
+        with self._runtime_lock:
             attached = sandbox_id in self._runtimes
         if record.status != "running":
             status = "stopped"
@@ -751,13 +1053,32 @@ class ControlPlane:
                 (now - timedelta(hours=24)).isoformat()
             )
             self._resource_pruned_at = now
-        with self._lock:
+        with self._runtime_lock:
             runtimes = list(self._runtimes.items())
+            attachments = dict(self._runtime_attachment_records)
         targets = []
         for sandbox_id, runtime in runtimes:
             record = self.store.get_sandbox_internal(sandbox_id)
-            if record.status == "running":
-                targets.append((record, runtime))
+            if record.status != "running":
+                continue
+            if record.backend in self._attachment_backends:
+                local = attachments.get(sandbox_id)
+                if local is None:
+                    continue
+                try:
+                    with (
+                        self.store.attachment_repository.transaction() as connection
+                    ):
+                        self._validate_local_attachment(
+                            connection,
+                            record.organization_id,
+                            sandbox_id,
+                            local,
+                        )
+                except Exception:
+                    # Sampling never reconnects or revives an invalidated handle.
+                    continue
+            targets.append((record, runtime))
         return targets
 
     def get_policy(self, principal: Principal) -> OrganizationPolicy:
@@ -1079,7 +1400,7 @@ class ControlPlane:
         ]
 
     def reconcile(self, principal: Principal, backend: str) -> dict:
-        """Reconcile one tenant against a provider-filtered resource list."""
+        """Observe one tenant without treating partial inventories as deletion."""
         self.require(principal, "providers:reconcile")
         backend = backend.lower().strip()
         if backend not in self._allowed_backends:
@@ -1087,109 +1408,198 @@ class ControlPlane:
         reconciler = self._provider_reconcilers.get(backend)
         if reconciler is None:
             raise ValueError(f"reconciliation is not configured: {backend}")
+        # Capture before I/O: a delayed missing result must not outrank a newer
+        # positive observation from another reconciliation run.
+        now = self._now().astimezone(timezone.utc)
+        observed_at = now.isoformat()
         try:
-            observations = reconciler.list_resources(principal.organization_id)
+            # Materialize inside the error boundary, including paginated iterators.
+            listed = list(reconciler.list_resources(principal.organization_id))
         except Exception:
+            self._accrue_active(principal, timestamp=observed_at)
             return {
                 "backend": backend,
                 "status": "partial_outage",
                 "updated": 0,
                 "missing": 0,
                 "orphans": 0,
+                "unknown": sum(
+                    record.backend == backend
+                    and (
+                        (
+                            record.provider_resource_id is not None
+                            and record.status
+                            in {"creating", "running", "stopping"}
+                        )
+                        or self.store.resource_is_held(record.id)
+                    )
+                    for record in self.store.list_sandboxes(
+                        principal.organization_id
+                    )
+                ),
+                "rejected": 0,
             }
-        allowed_statuses = {
-            "provisioning",
-            "running",
-            "stopping",
-            "terminated",
-            "failed",
-        }
-        invalid = [
-            item.status
-            for item in observations
-            if item.status.lower().strip() not in allowed_statuses
-        ]
-        if invalid:
-            raise ValueError(
-                f"unsupported provider lifecycle status: {invalid[0]}"
-            )
+        observations = []
+        invalid_resources = set()
+        rejected = 0
+        for item in listed:
+            normalized = normalize_observation(item, now=now)
+            if normalized is None:
+                rejected += 1
+                # A malformed duplicate must not let a contradictory terminal
+                # sibling stop billing. Preserve uncertainty for scoped IDs.
+                if (
+                    isinstance(item, ProviderObservation)
+                    and isinstance(item.provider_resource_id, str)
+                    and item.organization_id
+                    in (None, principal.organization_id)
+                    and item.backend in (None, backend)
+                ):
+                    invalid_resources.add(item.provider_resource_id)
+            elif not normalized.matches(principal.organization_id, backend):
+                rejected += 1
+            else:
+                observations.append(normalized)
         known_records = [
             r
             for r in self.store.list_sandboxes(principal.organization_id)
             if r.backend == backend and r.provider_resource_id
         ]
-        records = [
-            r
-            for r in known_records
-            if r.status in {"creating", "running", "stopping"}
-        ]
         known_resource_ids = {
             record.provider_resource_id for record in known_records
         }
-        by_resource = {o.provider_resource_id: o for o in observations}
-        updated = missing = 0
-        for record in records:
-            observation = by_resource.get(record.provider_resource_id or "")
-            if observation is None:
-                when = self._now().isoformat()
-                observation_id = f"missing:{record.id}:{when}"
-                self.store.record_provider_observation(
-                    principal.organization_id,
-                    record.id,
-                    observation_id=observation_id,
-                    provider_resource_id=record.provider_resource_id,
-                    status="missing",
-                    observed_at=when,
-                    missing=True,
-                )
-                self.store.apply_provider_observation(
-                    principal.organization_id,
-                    record.id,
-                    status="failed",
-                    observed_at=when,
-                    missing=True,
-                )
-                self._record_lifecycle_estimate(
-                    record, when, observation_id=observation_id
-                )
-                missing += 1
+        grouped: dict[str, list[ProviderObservation]] = {}
+        for observation in observations:
+            grouped.setdefault(observation.provider_resource_id, []).append(
+                observation
+            )
+        by_resource = {}
+        for resource_id, group in grouped.items():
+            if resource_id in invalid_resources:
                 continue
-            self.store.record_provider_observation(
+            # Boundary normalization makes these UTC strings comparable. Do not
+            # parse arbitrary provider strings during duplicate selection.
+            latest = max(item.observed_at for item in group)
+            candidates = [item for item in group if item.observed_at == latest]
+            rejected += len(group) - len(candidates)
+            evidence = {
+                (item.status, item.provider_cost_usd, item.currency)
+                for item in candidates
+            }
+            if len(evidence) != 1:
+                # Equal-time contradictory lifecycle/cost evidence is unknown,
+                # regardless of pagination order. In particular terminal never
+                # wins a tie against a live resource.
+                rejected += len(candidates)
+                by_resource[resource_id] = ProviderObservation(
+                    f"conflict:{resource_id}:{latest}",
+                    resource_id,
+                    "unknown",
+                    latest,
+                )
+            else:
+                by_resource[resource_id] = min(
+                    candidates, key=lambda item: item.observation_id
+                )
+        for resource_id in invalid_resources:
+            rejected += len(grouped.get(resource_id, []))
+            by_resource[resource_id] = ProviderObservation(
+                f"invalid:{resource_id}:{observed_at}",
+                resource_id,
+                "unknown",
+                observed_at,
+            )
+        updated = missing = 0
+        unknown = sum(
+            r.backend == backend
+            and not r.provider_resource_id
+            and self.store.resource_is_held(r.id)
+            for r in self.store.list_sandboxes(principal.organization_id)
+        )
+        for record in known_records:
+            observation = by_resource.get(record.provider_resource_id)
+            active = record.status in {
+                "creating",
+                "running",
+                "stopping",
+            } or self.store.resource_is_held(record.id)
+            if not active and observation is None:
+                # Never probe terminal resources or reopen their billable window.
+                continue
+            if not active and observation.status in {"unknown", "missing"}:
+                # A listing tombstone is not authoritative, even for an already
+                # terminal resource. Only retain substantive terminal evidence.
+                unknown += 1
+                rejected += 1
+                continue
+            if active and (
+                observation is None
+                or observation.status == "missing"
+                or (
+                    observation.status == "unknown"
+                    and callable(getattr(reconciler, "get_resource", None))
+                )
+            ):
+                # Even an explicit listing tombstone needs direct confirmation.
+                result = lookup_resource(
+                    reconciler,
+                    organization_id=principal.organization_id,
+                    backend=backend,
+                    provider_resource_id=record.provider_resource_id,
+                    observed_at=observed_at,
+                )
+                observation = normalize_observation(result, now=now)
+                if observation is None or (
+                    observation.provider_resource_id
+                    != record.provider_resource_id
+                    or not observation.matches(
+                        principal.organization_id, backend
+                    )
+                ):
+                    rejected += 1
+                    observation = None
+            if observation is None:
+                observation = ProviderObservation(
+                    f"unknown:{record.id}:{observed_at}",
+                    record.provider_resource_id,
+                    "unknown",
+                    observed_at,
+                )
+            status = observation.status
+            diagnostics: dict[str, bool] = {}
+            applied = self.store.reconcile_provider_observation(
                 principal.organization_id,
                 record.id,
-                observation_id=observation.observation_id,
-                provider_resource_id=observation.provider_resource_id,
-                status=observation.status,
-                observed_at=observation.observed_at,
-                provider_cost_usd=observation.provider_cost_usd,
-                currency=observation.currency,
+                backend=backend,
+                observation=observation,
+                customer_markup=self._customer_markup,
+                now=now,
+                diagnostics=diagnostics,
             )
-            self.store.apply_provider_observation(
-                principal.organization_id,
-                record.id,
-                status=observation.status,
-                observed_at=observation.observed_at,
+            unknown += (
+                status == "unknown"
+                or diagnostics.get("unknown", False)
+                or self.store.resource_is_held(record.id)
             )
-            self._record_lifecycle_estimate(
-                record,
-                observation.observed_at,
-                observation_id=observation.observation_id,
-                provider_cost=observation.provider_cost_usd,
-                currency=observation.currency,
-            )
-            updated += 1
+            if not applied:
+                # Includes stale, terminal, and reused identities (exact replay
+                # is a no-op too). None may masquerade as a successful update.
+                rejected += 1
+            elif status == "missing":
+                missing += 1
+            elif status != "unknown":
+                updated += 1
+        # Uncertainty retains both capacity and the billable window, including
+        # the estimated tail after a cumulative provider cost observation.
+        self._accrue_active(principal, timestamp=observed_at)
         return {
             "backend": backend,
-            "status": "ok",
+            "status": "partial_outage" if unknown or rejected else "ok",
             "updated": updated,
             "missing": missing,
-            "orphans": len(
-                [
-                    o
-                    for o in observations
-                    if o.provider_resource_id not in known_resource_ids
-                ]
-            ),
+            "unknown": unknown,
+            "rejected": rejected,
+            "orphans": len(set(by_resource) - known_resource_ids),
         }
 
     def reconciliation_summary(self, principal: Principal) -> dict:
@@ -1218,12 +1628,13 @@ class ControlPlane:
     def close(self) -> None:
         """Best-effort cleanup of runtimes owned by this process."""
         self.stop_supervision()
-        with self._lock:
+        with self._runtime_lock:
             sandbox_ids = list(self._runtimes)
         for sandbox_id in sandbox_ids:
             with self._lifecycle_lock(sandbox_id):
-                with self._lock:
+                with self._runtime_lock:
                     runtime = self._runtimes.pop(sandbox_id, None)
+                    self._runtime_attachment_records.pop(sandbox_id, None)
                 if runtime is None:
                     continue
                 try:
@@ -1244,11 +1655,28 @@ class ControlPlane:
                     status = "destroyed"
                     reason = "shutdown"
                     observation = f"close:{sandbox_id}"
+                finally:
+                    release_owned_transport(runtime)
                 try:
                     completed_at = self._now().isoformat()
-                    self.store.mark_lifecycle(
-                        sandbox_id, status, completed_at, reason=reason
-                    )
+                    if status == "failed":
+                        self.store.fail_termination(
+                            sandbox_id,
+                            timestamp=completed_at,
+                            error=provider_error_payload(
+                                normalize_provider_error(
+                                    RuntimeError("Shutdown cleanup failed."),
+                                    backend=self.store.get_sandbox_internal(
+                                        sandbox_id
+                                    ).backend,
+                                    op="destroy",
+                                )
+                            ),
+                        )
+                    else:
+                        self.store.mark_lifecycle(
+                            sandbox_id, status, completed_at, reason=reason
+                        )
                     self._record_lifecycle_estimate(
                         self.store.get_sandbox_internal(sandbox_id),
                         completed_at,
@@ -1304,10 +1732,11 @@ class ControlPlane:
     ) -> None:
         timestamp = timestamp or self._now().isoformat()
         for record in self.store.list_sandboxes(organization_id):
-            if (
-                record.status in {"creating", "running", "stopping"}
-                and record.cost_state == "estimated"
-            ):
+            if record.status in {
+                "creating",
+                "running",
+                "stopping",
+            } or self.store.resource_is_held(record.id):
                 self._record_lifecycle_estimate(
                     record,
                     timestamp,
@@ -1363,8 +1792,16 @@ class ControlPlane:
             "orphan_failures": 0,
         }
         for record in expired:
-            with self._lock:
+            with self._runtime_lock:
                 runtime = self._runtimes.pop(record.id, None)
+                self._runtime_attachment_records.pop(record.id, None)
+            coordinator = self._attachment_coordinators.get(record.backend)
+            if coordinator is not None:
+                coordinator.forget(
+                    record.organization_id,
+                    record.id,
+                    release_transport=runtime is None,
+                )
             try:
                 if runtime is not None:
                     runtime.destroy()
@@ -1387,6 +1824,7 @@ class ControlPlane:
                     record.id,
                     timestamp=timestamp,
                     error=provider_error_payload(error),
+                    expected_version=record.version,
                 )
                 configuration = self.store.get_alert_configuration(
                     record.organization_id
@@ -1404,6 +1842,9 @@ class ControlPlane:
                     )
                 result["expired_failed"] += 1
                 continue
+            finally:
+                if runtime is not None:
+                    release_owned_transport(runtime)
             self.store.mark_lifecycle(
                 record.id,
                 "destroyed",

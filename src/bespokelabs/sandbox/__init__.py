@@ -49,6 +49,12 @@ from bespokelabs.sandbox.remote import (
     RemoteSandboxError,
     RemoteSandboxResult,
 )
+from bespokelabs.sandbox.remote_jobs import (
+    RemoteJobClient,
+    RemoteJobError,
+    RemoteJobResult,
+    RemoteJobStatus,
+)
 from bespokelabs.sandbox.sandbox import Sandbox, SandboxClient, json_schema
 from bespokelabs.sandbox.types import (
     AgentRunResult,
@@ -79,6 +85,10 @@ __all__ = [
     "Sandbox",
     "SandboxClient",
     "RemoteAgentRunResult",
+    "RemoteJobClient",
+    "RemoteJobError",
+    "RemoteJobResult",
+    "RemoteJobStatus",
     "RemoteSandbox",
     "RemoteSandboxClient",
     "RemoteSandboxError",

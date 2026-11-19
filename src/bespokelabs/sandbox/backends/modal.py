@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+import threading
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
+    ErrorOutcome,
     FeatureNotSupportedError,
     SandboxConfigurationError,
     SandboxCreationError,
+    SandboxError,
     SandboxExecutionError,
 )
 from bespokelabs.sandbox.types import (
@@ -123,7 +126,9 @@ class ModalClient:
                 # its labels are that filter, not the sandbox's whole tag set.
                 complete = callable(get_tags)
                 tags = get_tags() if complete else labels
-                own = {str(key): str(value) for key, value in (tags or {}).items()}
+                own = {
+                    str(key): str(value) for key, value in (tags or {}).items()
+                }
                 if any(own.get(key) != value for key, value in labels.items()):
                     continue
                 listings.append(
@@ -133,7 +138,8 @@ class ModalClient:
                         state="running",
                         created_at=None,
                         session_state=SandboxSessionState(
-                            backend="modal", data={"sandbox_id": str(sandbox_id)}
+                            backend="modal",
+                            data={"sandbox_id": str(sandbox_id)},
                         ),
                         labels_complete=complete,
                     )
@@ -223,8 +229,20 @@ def _network_kwargs(policy: NetworkPolicy | None) -> dict:
 class ModalSession:
     """One live Modal sandbox."""
 
-    def __init__(self, *, sandbox: object) -> None:
+    def __init__(
+        self, *, sandbox: object, owned_client: object | None = None
+    ) -> None:
         self._sandbox: object = sandbox
+        # Only hosted reconnect's explicit factory client is owned. Native SDK
+        # sessions (including implicit/shared clients) retain legacy behavior.
+        self._owned_client = owned_client
+        # Custody can be consumed, but a hosted handle must never fall back to
+        # legacy exception-swallowing semantics after transport disposal.
+        self._hosted_strict = owned_client is not None
+        self._owned_client_lock = threading.Lock()
+        # One immutable local cache-publication claim for this hosted wrapper.
+        # Never clear it on transfer/disposal: aliases must not be republished.
+        self._attachment_custody: object | None = None
 
     @property
     def provider_resource_id(self) -> str | None:
@@ -394,7 +412,65 @@ class ModalSession:
     def session_state(self) -> dict:
         return {"sandbox_id": self._sandbox.object_id}
 
+    def _claim_attachment_custody(self, custody: object) -> bool:
+        """Claim one cache publication, not provider ownership/delete rights."""
+        with self._owned_client_lock:
+            if not self._hosted_strict:
+                return True
+            if self._owned_client is None:
+                return False
+            if self._attachment_custody is None:
+                self._attachment_custody = custody
+            return self._attachment_custody is custody
+
+    def _release_owned_client(
+        self, *, custody: object | None = None, unclaimed_only: bool = False
+    ) -> None:
+        """Release local custody only; never delete a provider resource.
+
+        Rejected reconnects may dispose only unclaimed clients. Published cache
+        custody must match its immutable claim, even after cache displacement.
+        Direct session/service owners retain the existing no-argument disposal.
+        """
+        with self._owned_client_lock:
+            if custody is not None and self._attachment_custody is not custody:
+                return
+            if unclaimed_only and self._attachment_custody is not None:
+                return
+            client, self._owned_client = self._owned_client, None
+        if client is not None:
+            try:
+                client.__exit__(None, None, None)
+            except Exception:
+                # Transport cleanup cannot change a confirmed provider outcome
+                # or expose credentials. Consume ownership even if exit fails.
+                pass
+
     def destroy(self) -> None:
+        if self._hosted_strict:
+            if self._sandbox is None:
+                # A prior confirmed termination stays idempotent after disposal.
+                return
+            if self._owned_client is not None:
+                try:
+                    self._sandbox.terminate()
+                except Exception:
+                    # Keep owned transport for an explicit retry until disposed.
+                    # Raise outside the handler so SDK text is not chained.
+                    pass
+                else:
+                    self._sandbox = None
+                    self._release_owned_client()
+                    return
+            # A released hosted client is not a native/shared session. Refuse
+            # without an RPC, rather than silently claiming cloud termination.
+            raise SandboxError(
+                "Modal sandbox termination could not be confirmed.",
+                backend="modal",
+                op="destroy",
+                outcome=ErrorOutcome.UNKNOWN,
+            )
+        # Preserve native/default SDK cleanup semantics for unowned clients.
         try:
             if self._sandbox:
                 self._sandbox.terminate()
