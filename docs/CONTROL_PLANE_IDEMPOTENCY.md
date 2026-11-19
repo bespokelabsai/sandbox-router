@@ -12,12 +12,15 @@ can be used independently in another sandbox or organization. Authentication,
 execution scope, and sandbox ownership are checked before delivering a cached
 result; a cache hit does not bypass authorization.
 
-New executions persist a SHA-256 digest of canonical, sorted-key JSON containing
-an `execute` operation discriminator and the `code`, `language`, `command`, and
-`args` fields, including their defaults. Raw code and arguments are not stored
-in the fingerprint column. Fingerprints are hashes, not encryption; do not
-assume they protect low-entropy values from guessing. Existing result storage
-still contains stdout and stderr, which may themselves contain sensitive data.
+New code/command executions persist a keyed HMAC-SHA-256 digest of canonical,
+sorted-key JSON containing an `execute` operation discriminator and the `code`,
+`language`, `command`, and `args` fields, including their defaults. Raw code and arguments are not stored
+in the fingerprint column or separate request payload columns. The digest uses
+the store's configured key pepper: keep that pepper stable across restarts and
+service instances. Rotating it changes request verification, so even a matching
+payload for a retained key will conflict. This is not a confidentiality
+guarantee or encryption. Existing result storage still contains stdout and
+stderr, which may themselves contain sensitive data.
 
 Use the same payload when retrying. Changing code, language, command, argument
 values or order, or switching between code and command conflicts. Fields are
@@ -51,13 +54,15 @@ external side effects or durable response delivery. Inspect the sandbox and
 verify that the prior run has stopped before deliberately submitting a new
 key; doing so may repeat external work.
 
+## Upgrade compatibility
+
 Historical execution rows with a `NULL` request fingerprint fail closed for
 code/command retries, including rows with saved completed responses. The
-service cannot verify their original payload, so it returns a conflict
+service cannot verify their original payload, so it returns `409` over HTTP
 explaining that the prior payload cannot be verified. It neither replays nor
 reruns these rows, and does not invent or backfill a fingerprint. Existing
-`cached_agent_execution` callers retain their fingerprint comparison and
-agent-specific conflict behavior.
+agent requests retain their fingerprint comparison and agent-specific conflict
+behavior.
 
 This behavior uses the existing execution fingerprint column and unique key;
 it requires no schema version change or historical data rewrite. Guarantees

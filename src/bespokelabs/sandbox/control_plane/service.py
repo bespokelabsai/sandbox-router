@@ -412,19 +412,15 @@ class ControlPlane:
             raise ValueError("provide exactly one of code or command")
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
         # Only the digest is persisted: code and arguments may contain secrets.
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                {
-                    "operation": "execute",
-                    "code": code,
-                    "language": language,
-                    "command": command,
-                    "args": args,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        fingerprint = self.store.fingerprint_execution_request(
+            {
+                "operation": "execute",
+                "code": code,
+                "language": language,
+                "command": command,
+                "args": args,
+            }
+        )
         request_id = request_id or f"req_{uuid.uuid4().hex}"
         cached = self.store.cached_execution(
             principal.organization_id, sandbox_id, request_id, fingerprint

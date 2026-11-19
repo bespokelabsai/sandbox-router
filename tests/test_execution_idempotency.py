@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 import threading
@@ -17,6 +18,7 @@ from bespokelabs.sandbox.control_plane.errors import (
     AuthorizationError,
     ConflictError,
     NotFoundError,
+    provider_error_payload,
 )
 from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
@@ -104,7 +106,8 @@ def accounting(store):
 
 
 def fingerprint(payload):
-    return hashlib.sha256(
+    return hmac.new(
+        b"test-pepper",
         json.dumps(
             {
                 "operation": "execute",
@@ -116,8 +119,31 @@ def fingerprint(payload):
             },
             sort_keys=True,
             separators=(",", ":"),
-        ).encode()
+        ).encode(),
+        hashlib.sha256,
     ).hexdigest()
+
+
+def test_execution_fingerprint_is_keyed_and_canonical(tmp_path):
+    payload = {"operation": "execute", **COMMAND}
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode()
+    digests = []
+    for pepper in ("first-pepper", "second-pepper"):
+        store = SQLiteStore(tmp_path / f"{pepper}.db", key_pepper=pepper)
+        expected = hmac.new(
+            pepper.encode(), canonical, hashlib.sha256
+        ).hexdigest()
+        assert store.fingerprint_execution_request(payload) == expected
+        assert (
+            store.fingerprint_execution_request(
+                dict(reversed(list(payload.items())))
+            )
+            == expected
+        )
+        digests.append(expected)
+    assert digests[0] != digests[1]
 
 
 @pytest.mark.parametrize("payload", [CODE, COMMAND], ids=["code", "command"])
@@ -136,12 +162,22 @@ def test_replay_after_restart_and_termination_never_calls_provider_or_billing(
     assert first["usage"]["provider_cost_usd"] == "0.25"
     assert first["usage"]["customer_cost_usd"] == "0.375"
     with hosted.store._connect() as connection:
-        saved = connection.execute(
-            "SELECT request_fingerprint FROM executions"
-        ).fetchone()[0]
+        row = dict(connection.execute("SELECT * FROM executions").fetchone())
+    saved = row["request_fingerprint"]
     assert saved == fingerprint(payload)
     assert re.fullmatch(r"[0-9a-f]{64}", saved)
-    assert "secret" not in saved
+    # Result/error storage is intentionally allowed to contain sensitive output.
+    metadata = {
+        key: value
+        for key, value in row.items()
+        if key not in {"response_json", "error"}
+    }
+    serialized = json.dumps(metadata)
+    assert "payload-secret" not in serialized
+    assert "argument-secret" not in serialized
+    assert (
+        not {"code", "command", "args", "payload", "request_json"} & row.keys()
+    )
 
     # Re-open after completion, rather than reusing the original store object.
     hosted.restarted.close()
@@ -301,16 +337,73 @@ def test_failed_execution_is_never_rerun_or_charged_twice(hosted, payload):
     with patch.object(
         hosted.runtime, method, side_effect=SandboxExecutionError("failed")
     ) as call:
-        with pytest.raises(SandboxExecutionError):
+        with pytest.raises(SandboxExecutionError) as failure:
             execute(hosted, payload)
+        expected = json.dumps(
+            provider_error_payload(failure.value), sort_keys=True
+        )
+        with hosted.store._connect() as connection:
+            assert (
+                connection.execute("SELECT error FROM executions").fetchone()[0]
+                == expected
+            )
         before = accounting(hosted.store)
         for service in (hosted.service, hosted.restarted):
-            with pytest.raises(ConflictError, match="has no saved result"):
+            with pytest.raises(ConflictError) as conflict:
                 execute(hosted, payload, service=service)
+            assert str(conflict.value) == expected
         call.assert_called_once()
     assert len(before["usage_events"]) == 1
     assert len(before["ledger_entries"]) == 2
     assert accounting(hosted.store) == before
+
+
+@pytest.mark.parametrize("saved_error", [None, "saved interruption detail"])
+def test_running_execution_preserves_prior_conflict_detail(hosted, saved_error):
+    hosted.store.begin_execution(
+        hosted.principal.organization_id,
+        hosted.sandbox.id,
+        "once",
+        request_fingerprint=fingerprint(CODE),
+    )
+    with hosted.store._connect() as connection:
+        connection.execute("UPDATE executions SET error = ?", (saved_error,))
+    for service in (hosted.service, hosted.restarted):
+        with pytest.raises(ConflictError) as conflict:
+            execute(hosted, CODE, service=service)
+        assert str(conflict.value) == (
+            saved_error or "execution is already in progress"
+        )
+    assert hosted.runtime.calls == 0
+
+
+@pytest.mark.skipif(TestClient is None, reason="server dependencies missing")
+def test_http_failed_execution_preserves_stored_error_json_detail(hosted):
+    path = f"/v1/sandboxes/{hosted.sandbox.id}/execute"
+    headers = {
+        "Authorization": f"Bearer {hosted.key.secret}",
+        "Idempotency-Key": "once",
+    }
+    with patch.object(
+        hosted.runtime,
+        "execute_code",
+        side_effect=SandboxExecutionError("failed"),
+    ) as call:
+        with pytest.raises(SandboxExecutionError):
+            execute(hosted, CODE)
+        with hosted.store._connect() as connection:
+            expected = connection.execute(
+                "SELECT error FROM executions"
+            ).fetchone()[0]
+        for service in (hosted.service, hosted.restarted):
+            with (
+                patch.object(service, "start_supervision"),
+                TestClient(create_app(service)) as client,
+            ):
+                response = client.post(path, headers=headers, json=CODE)
+                assert response.status_code == 409
+                assert response.json() == {"detail": expected}
+        call.assert_called_once()
 
 
 @pytest.mark.parametrize("payload", [CODE, COMMAND], ids=["code", "command"])
@@ -331,7 +424,7 @@ def test_crash_after_provider_and_accounting_but_before_completion_is_ambiguous(
     assert len(before["usage_events"]) == 1
     for service in (hosted.service, hosted.restarted):
         with pytest.raises(
-            ConflictError, match="verify the prior run has stopped"
+            ConflictError, match="^execution is already in progress$"
         ):
             execute(hosted, payload, service=service)
     assert hosted.runtime.calls == 1
@@ -360,6 +453,13 @@ def test_legacy_null_fingerprints_fail_closed_without_claiming_payload_match(
     with pytest.raises(ConflictError, match="prior payload cannot be verified"):
         hosted.store.begin_execution(
             hosted.principal.organization_id, hosted.sandbox.id, "once"
+        )
+    with pytest.raises(ConflictError, match="prior payload cannot be verified"):
+        hosted.store.begin_execution(
+            hosted.principal.organization_id,
+            hosted.sandbox.id,
+            "once",
+            request_fingerprint=fingerprint(payload),
         )
     assert accounting(hosted.store) == before
     assert hosted.runtime.calls == 0

@@ -2139,14 +2139,14 @@ class SQLiteStore:
                 ).fetchone()
             if row is None:
                 raise
-            if row["request_fingerprint"] != request_fingerprint:
-                raise ConflictError(
-                    "idempotency key was used for a different request"
-                ) from None
             if row["request_fingerprint"] is None:
                 raise ConflictError(
                     "execution has no request fingerprint; the prior payload "
                     "cannot be verified and this key will not rerun it"
+                ) from None
+            if row["request_fingerprint"] != request_fingerprint:
+                raise ConflictError(
+                    "idempotency key was used for a different request"
                 ) from None
             if row["status"] == "completed":
                 return row["id"], json.loads(row["response_json"])
@@ -2221,7 +2221,7 @@ class SQLiteStore:
     ) -> dict | None:
         with self._connect() as connection:
             row = connection.execute(
-                "SELECT status, response_json, request_fingerprint FROM executions "
+                "SELECT status, response_json, error, request_fingerprint FROM executions "
                 "WHERE organization_id=? AND sandbox_id=? AND request_id=?",
                 (organization_id, sandbox_id, request_id),
             ).fetchone()
@@ -2237,7 +2237,11 @@ class SQLiteStore:
                 "idempotency key was used for a different request"
             ) from None
         if row["status"] != "completed":
-            kind = "agent execution" if agent else "execution"
+            if not agent:
+                raise ConflictError(
+                    row["error"] or "execution is already in progress"
+                ) from None
+            kind = "agent execution"
             raise ConflictError(
                 f"{kind} has no saved result (in progress, interrupted, "
                 "or failed); this key will not rerun it. Inspect the sandbox "
@@ -2655,6 +2659,10 @@ class SQLiteStore:
             hashlib.sha256,
         ).hexdigest()
         return f"csrf_{digest}"
+
+    def fingerprint_execution_request(self, payload: dict) -> str:
+        """Key an ordinary execution's canonical request digest with the store pepper."""
+        return self._request_fingerprint(payload)
 
     def _request_fingerprint(self, payload: dict) -> str:
         canonical = json.dumps(
