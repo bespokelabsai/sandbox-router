@@ -15,7 +15,7 @@ The core ownership boundary is:
 
 ## Offline Python Checks
 
-CI runs the offline test suite on Python 3.10, 3.12, and 3.13. In a fresh
+CI runs the offline test suite on Python 3.10, 3.11, 3.12, and 3.13. In a fresh
 virtual environment, install only the declared development and server extras:
 
 ```sh
