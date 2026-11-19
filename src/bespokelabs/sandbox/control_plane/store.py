@@ -2143,6 +2143,11 @@ class SQLiteStore:
                 raise ConflictError(
                     "idempotency key was used for a different request"
                 ) from None
+            if row["request_fingerprint"] is None:
+                raise ConflictError(
+                    "execution has no request fingerprint; the prior payload "
+                    "cannot be verified and this key will not rerun it"
+                ) from None
             if row["status"] == "completed":
                 return row["id"], json.loads(row["response_json"])
             detail = row["error"] or "execution is already in progress"
@@ -2181,6 +2186,18 @@ class SQLiteStore:
             if agent_usage is not None:
                 self._insert_agent_usage(connection, execution_id, agent_usage)
 
+    def cached_execution(
+        self,
+        organization_id: str,
+        sandbox_id: str,
+        request_id: str,
+        fingerprint: str,
+    ) -> dict | None:
+        """Replay a verified result without needing a live sandbox runtime."""
+        return self._cached_execution(
+            organization_id, sandbox_id, request_id, fingerprint, agent=False
+        )
+
     def cached_agent_execution(
         self,
         organization_id: str,
@@ -2189,6 +2206,19 @@ class SQLiteStore:
         fingerprint: str,
     ) -> dict | None:
         """Replay completed agent requests even after runtime shutdown/restart."""
+        return self._cached_execution(
+            organization_id, sandbox_id, request_id, fingerprint, agent=True
+        )
+
+    def _cached_execution(
+        self,
+        organization_id: str,
+        sandbox_id: str,
+        request_id: str,
+        fingerprint: str,
+        *,
+        agent: bool,
+    ) -> dict | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT status, response_json, request_fingerprint FROM executions "
@@ -2197,13 +2227,19 @@ class SQLiteStore:
             ).fetchone()
         if row is None:
             return None
+        if not agent and row["request_fingerprint"] is None:
+            raise ConflictError(
+                "execution has no request fingerprint; the prior payload "
+                "cannot be verified and this key will not rerun it"
+            )
         if row["request_fingerprint"] != fingerprint:
             raise ConflictError(
                 "idempotency key was used for a different request"
             ) from None
         if row["status"] != "completed":
+            kind = "agent execution" if agent else "execution"
             raise ConflictError(
-                "agent execution has no saved result (in progress, interrupted, "
+                f"{kind} has no saved result (in progress, interrupted, "
                 "or failed); this key will not rerun it. Inspect the sandbox "
                 "and verify the prior run has stopped before deliberately "
                 "submitting a new request with a new idempotency key"

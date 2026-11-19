@@ -411,6 +411,26 @@ class ControlPlane:
         if (code is None) == (command is None):
             raise ValueError("provide exactly one of code or command")
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
+        # Only the digest is persisted: code and arguments may contain secrets.
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "operation": "execute",
+                    "code": code,
+                    "language": language,
+                    "command": command,
+                    "args": args,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        request_id = request_id or f"req_{uuid.uuid4().hex}"
+        cached = self.store.cached_execution(
+            principal.organization_id, sandbox_id, request_id, fingerprint
+        )
+        if cached is not None:
+            return cached
         if record.status != "running":
             raise ConflictError(f"sandbox is {record.status}")
         with self._lock:
@@ -420,9 +440,11 @@ class ControlPlane:
                 "sandbox runtime is unavailable after a control-plane restart"
             )
 
-        request_id = request_id or f"req_{uuid.uuid4().hex}"
         execution_id, cached = self.store.begin_execution(
-            principal.organization_id, sandbox_id, request_id
+            principal.organization_id,
+            sandbox_id,
+            request_id,
+            request_fingerprint=fingerprint,
         )
         if cached is not None:
             return cached
