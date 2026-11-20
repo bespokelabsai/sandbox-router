@@ -8,6 +8,7 @@ import tomllib
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -18,10 +19,11 @@ def _daytona_pins(extra: str) -> list[Requirement]:
     return [pin for pin in pins if pin.name == "daytona"]
 
 
-def test_daytona_extras_exclude_sdk_2():
+def test_daytona_extras_exclude_sdk_1_and_later():
     for extra in ("daytona", "all"):
         pins = _daytona_pins(extra)
         assert pins, extra
-        for version in ("1.0.0", "2.0.0", "2.1.0"):
-            assert not all(pin.specifier.contains(version) for pin in pins), (extra, version)
+        # An upper bound `<X` with X <= 1: no 1.x, 2.x or later release can pass.
+        assert [s for pin in pins for s in pin.specifier
+                if s.operator == "<" and Version(s.version) <= Version("1")], (extra, pins)
         assert all(pin.specifier.contains("0.233.0") for pin in pins), extra
