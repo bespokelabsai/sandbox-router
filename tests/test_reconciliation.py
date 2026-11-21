@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -14,6 +14,8 @@ from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import ErrorOutcome, SandboxTimeoutError
 from bespokelabs.sandbox.types import SandboxResult
+
+UTC = timezone.utc
 
 
 class _Clock:

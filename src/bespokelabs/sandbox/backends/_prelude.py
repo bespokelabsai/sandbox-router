@@ -48,7 +48,7 @@ done
 
 PYTHON_PREAMBLE = """\
 def _sb_setup():
-    import builtins, io, os
+    import builtins, io, os, pathlib
     root = os.environ.get("SANDBOX_ROOT", "")
     if not root:
         return
@@ -70,6 +70,12 @@ def _sb_setup():
     def _open(f, *a, **k):
         return _orig(rp(f), *a, **k)
     builtins.open = io.open = _open
+    # Python 3.10 caches io.open in pathlib\'s accessor at import time. Patch
+    # the public method too, rather than depending on version-private accessors.
+    def _path_open(self, mode="r", buffering=-1, encoding=None,
+                   errors=None, newline=None):
+        return _orig(rp(self), mode, buffering, encoding, errors, newline)
+    pathlib.Path.open = _path_open
     for _n in ("stat", "lstat", "listdir", "scandir", "mkdir", "makedirs",
                "remove", "unlink", "rmdir", "open", "chmod"):
         _f = getattr(os, _n, None)
