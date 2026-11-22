@@ -64,6 +64,18 @@ GROK_OUTPUT = json.dumps(
         "total_cost_usd": 1.25,
     }
 )
+ANTIGRAVITY_ENVELOPE = {
+    "conversation_id": "agy-1",
+    "status": "SUCCESS",
+    "response": "Done.",
+    "usage": {
+        "input_tokens": 100,
+        "output_tokens": 30,
+        "thinking_tokens": 20,
+        "cache_read_tokens": 80,
+        "total_tokens": 130,
+    },
+}
 
 
 class AgentDashboardTests(unittest.TestCase):
@@ -197,6 +209,39 @@ class AgentDashboardTests(unittest.TestCase):
                 start="2026-01-03T00:00:00Z",
                 end="2026-01-02T00:00:00Z",
             )
+
+    def test_antigravity_runs_are_metered_without_a_cost(self):
+        self.sessions[0].execute_command.return_value = SandboxResult(
+            stdout=json.dumps(ANTIGRAVITY_ENVELOPE)
+        )
+        response = self.service.run_agent(
+            self.principal,
+            self.sb.id,
+            prompt="Explain",
+            harness="antigravity",
+            model="gemini-3.8-flash-medium",
+        )
+        self.sessions[0].execute_command.assert_called_once_with(
+            "agy",
+            [
+                "--output-format",
+                "json",
+                "--model",
+                "gemini-3.8-flash-medium",
+                "--print=Explain",
+            ],
+        )
+        self.assertEqual(response["text"], "Done.")
+        usage = response["agent_usage"]
+        self.assertEqual(usage["harness"], "antigravity")
+        self.assertEqual(usage["total_tokens"], 210)
+        self.assertEqual(usage["cache_read_tokens"], 80)
+        self.assertTrue(usage["tokens_known"])
+        self.assertFalse(usage["usage_is_incomplete"])
+        self.assertEqual(usage["cost_state"], "unavailable")
+        self.assertIsNone(usage["cost_usd"])
+        detail = self.service.sandbox_detail(self.principal, self.sb.id)
+        self.assertEqual(detail["agent_usage"]["unknown_cost_runs"], 1)
 
     def test_isolation_read_scope_and_request_conflicts(self):
         self.run_agent(request_id="once")
@@ -371,6 +416,18 @@ class AgentDashboardTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {self.key.secret}"},
         )
         self.assertEqual(response.status_code, 422)
+        self.sessions[0].execute_command.return_value = SandboxResult(
+            stdout=json.dumps(ANTIGRAVITY_ENVELOPE)
+        )
+        response = client.post(
+            f"/v1/sandboxes/{self.sb.id}/agent",
+            json={"prompt": "x", "harness": "antigravity"},
+            headers={"Authorization": f"Bearer {self.key.secret}"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["agent_usage"]["cost_state"], "unavailable"
+        )
         client.close()
 
 
@@ -496,6 +553,123 @@ class EstimateTests(unittest.TestCase):
         )
         self.assertTrue(row["usage_is_incomplete"])
         self.assertIsNone(row["cost_usd"])
+
+    def test_antigravity_usage_is_complete_only_after_success(self):
+        from bespokelabs.sandbox._usage import (
+            parse_antigravity_result,
+            usage_from_result,
+        )
+
+        step = {
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "agy-1",
+                "step_index": 2,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "usage": ANTIGRAVITY_ENVELOPE["usage"],
+            },
+        }
+        done = {"event": "result", "result": ANTIGRAVITY_ENVELOPE}
+        for name, events, incomplete in [
+            ("json", [ANTIGRAVITY_ENVELOPE], False),
+            ("stream", [step, done], False),
+            ("interrupted stream", [step], True),
+            ("error", [{**ANTIGRAVITY_ENVELOPE, "status": "ERROR"}], True),
+            (
+                "print timeout",
+                [{**ANTIGRAVITY_ENVELOPE, "finished_reason": "print_timeout"}],
+                True,
+            ),
+        ]:
+            with self.subTest(name):
+                raw = parse_antigravity_result(
+                    "\n".join(map(json.dumps, events))
+                )
+                row = agent_usage_record(
+                    AgentRunResult(raw=raw, usage=usage_from_result(raw)),
+                    harness="antigravity",
+                    model="gemini-3.8-flash-medium",
+                )
+                self.assertTrue(row["tokens_known"])
+                self.assertEqual(row["usage_is_incomplete"], incomplete)
+                self.assertEqual(row["total_tokens"], 210)
+                self.assertEqual(row["cost_state"], "unavailable")
+                self.assertIsNone(row["cost_usd"])
+
+    def test_real_antigravity_error_output_is_incomplete(self):
+        # Output of agy 1.5.14 with an invalid GEMINI_API_KEY, which exited
+        # with code 3. The error text is shortened.
+        from bespokelabs.sandbox._usage import (
+            parse_antigravity_result,
+            usage_from_result,
+        )
+
+        envelope = {
+            "conversation_id": "c-1",
+            "status": "ERROR",
+            "response": "",
+            "error": "agent executor error: generating and executing: "
+            "Error 400, Message: API key not valid. Please pass a valid "
+            "API key., Status: INVALID_ARGUMENT",
+            "duration_seconds": 0,
+            "num_turns": 1,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "thinking_tokens": 0,
+                "cache_read_tokens": 0,
+                "total_tokens": 0,
+            },
+            "finished_reason": "error",
+        }
+
+        def step(index, step_type):
+            return {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "c-1",
+                    "step_index": index,
+                    "state": "DONE",
+                    "step_type": step_type,
+                },
+            }
+
+        init = {
+            "event": "init",
+            "conversation_id": "c-1",
+            "init": {
+                "cwd": "/",
+                "tools": ["run_command"],
+                "permission_mode": "request-review",
+            },
+        }
+        result = {"event": "result", "result": envelope}
+        for name, events in [
+            ("json", [envelope]),
+            (
+                "stream-json",
+                [init, step(0, "user_input"), step(1, "error_message"), result],
+            ),
+        ]:
+            with self.subTest(name):
+                raw = parse_antigravity_result(
+                    "\n".join(map(json.dumps, events))
+                )
+                self.assertEqual(raw["result"], "")
+                self.assertEqual(raw["error"], envelope["error"])
+                self.assertEqual(raw["finished_reason"], "error")
+                row = agent_usage_record(
+                    AgentRunResult(
+                        raw=raw, usage=usage_from_result(raw), exit_code=3
+                    ),
+                    harness="antigravity",
+                    model=None,
+                )
+                self.assertTrue(row["tokens_known"])
+                self.assertTrue(row["usage_is_incomplete"])
+                self.assertEqual(row["total_tokens"], 0)
+                self.assertEqual(row["cost_state"], "unavailable")
 
     def test_reported_cost_wins_over_codex_estimate(self):
         result = self.result(

@@ -89,6 +89,60 @@ def _tensorlake_npm_install(packages: str) -> str:
     )
 
 
+_ANTIGRAVITY_INSTALLER_URL = "https://antigravity.google/cli/install.sh"
+
+
+def _antigravity_install(*, sudo_link: bool = False) -> str:
+    """Install `agy` with Google's script unless it is already on PATH.
+
+    The script's default directory, ~/.local/bin, is often not on PATH for
+    the non-login commands that backends run, so prefer /usr/local/bin. In
+    isolated containers, a non-root user with passwordless sudo also links a
+    ~/.local/bin install there. The binary stays user-owned so the CLI can
+    update itself. The local backend rewrites absolute-path redirects and
+    `rm` arguments, so these commands avoid both.
+    """
+    link = (
+        'command -v agy || sudo -n ln -sf "$dir/agy" /usr/local/bin/agy; '
+        if sudo_link
+        else ""
+    )
+    return (
+        "if command -v agy; then agy --version; else "
+        'dir=/usr/local/bin; [ -w "$dir" ] || dir="$HOME/.local/bin"; '
+        "installer=$(mktemp) && "
+        f'curl -fsSL {_ANTIGRAVITY_INSTALLER_URL} -o "$installer" && '
+        'bash "$installer" --dir "$dir"; '
+        'status=$?; command rm -f "$installer"; '
+        '[ "$status" -eq 0 ] || exit "$status"; '
+        f"{link}"
+        'command -v agy || echo "agy is in $dir, which is not on PATH. '
+        'Pass command=$dir/agy to run_agent." >&2; '
+        '"$dir/agy" --version; fi'
+    )
+
+
+_ANTIGRAVITY_CONTAINER_PREREQUISITES = (
+    "(command -v curl >/dev/null 2>&1 && "
+    "command -v git >/dev/null 2>&1) || "
+    "(apt-get update && DEBIAN_FRONTEND=noninteractive "
+    "apt-get install -y --no-install-recommends ca-certificates curl git)"
+)
+# A GEMINI_API_KEY is ignored unless settings select the "gemini" provider,
+# and the CLI will not start with that provider but no key. Select it only
+# when the key is present at creation, ADC is not requested, and no settings
+# file exists yet. Relative paths keep the local backend's HOME rebasing out.
+_ANTIGRAVITY_API_KEY_SETTINGS = (
+    'if [ -n "${GEMINI_API_KEY:-}" ] && [ -z "${AGY_ADC_AUTH:-}" ]; then '
+    'cd "$HOME" && '
+    "if [ ! -e .gemini/antigravity-cli/settings.json ]; then "
+    "mkdir -p .gemini/antigravity-cli && "
+    "printf '%s\\n' '{\"modelProvider\": \"gemini\"}' "
+    "> .gemini/antigravity-cli/settings.json; "
+    "fi; fi"
+)
+
+
 # -- Agent presets ---------------------------------------------------------
 
 register_preset(
@@ -163,6 +217,28 @@ register_preset(
                 _tensorlake_npm_install("@openai/codex"),
             ],
             "boxd": ["codex --version"],
+        },
+        memory_mb=2048,
+        timeout_secs=1800,
+        setup_before_workspace=True,
+    )
+)
+
+register_preset(
+    SandboxPreset(
+        name="antigravity",
+        description="Sandbox with Google Antigravity CLI (agy) installed",
+        setup_commands=[
+            _antigravity_install(),
+            _ANTIGRAVITY_API_KEY_SETTINGS,
+        ],
+        backend_setup_commands={
+            backend: [
+                _ANTIGRAVITY_CONTAINER_PREREQUISITES,
+                _antigravity_install(sudo_link=True),
+                _ANTIGRAVITY_API_KEY_SETTINGS,
+            ]
+            for backend in ("docker", "daytona", "modal")
         },
         memory_mb=2048,
         timeout_secs=1800,

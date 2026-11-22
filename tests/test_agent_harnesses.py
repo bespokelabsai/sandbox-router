@@ -1,8 +1,9 @@
-"""Contracts for Codex exec and Grok Build headless output.
+"""Contracts for Codex exec, Grok Build, and Antigravity CLI headless output.
 
 Wire references:
 https://developers.openai.com/codex/noninteractive
 https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md
+https://antigravity.google/docs/cli/headless/
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 from bespokelabs.sandbox import AsyncSandbox, Sandbox, Usage
 from bespokelabs.sandbox._usage import (
+    parse_antigravity_result,
     parse_codex_result,
     parse_grok_result,
     usage_from_result,
@@ -73,6 +75,76 @@ GROK_RESULT = {
     "total_cost_usd": 0.125,
     "total_cost_usd_ticks": 1250000000,
 }
+# Antigravity output already includes thinking, and input excludes cache
+# reads; its own total_tokens is input + output.
+ANTIGRAVITY_USAGE = {
+    "input_tokens": 100,
+    "output_tokens": 30,
+    "thinking_tokens": 20,
+    "cache_read_tokens": 80,
+    "total_tokens": 130,
+}
+ANTIGRAVITY_RESULT = {
+    "conversation_id": "agy-1",
+    "status": "SUCCESS",
+    "response": "Done.",
+    "duration_seconds": 7.16,
+    "num_turns": 1,
+    "usage": ANTIGRAVITY_USAGE,
+}
+
+
+def antigravity_step(index, **fields):
+    return {
+        "event": "step_update",
+        "step_update": {
+            "conversation_id": "agy-1",
+            "step_index": index,
+            "state": "DONE",
+            **fields,
+        },
+    }
+
+
+ANTIGRAVITY_EVENTS = [
+    {
+        "event": "init",
+        "conversation_id": "agy-1",
+        "init": {
+            "cwd": "/workspace",
+            "tools": ["run_command"],
+            "permission_mode": "request-review",
+        },
+    },
+    antigravity_step(0, step_type="user_input"),
+    antigravity_step(
+        2, state="ACTIVE", step_type="agent_response", text_delta="Do"
+    ),
+    antigravity_step(
+        2,
+        step_type="agent_response",
+        text_delta="ne.",
+        usage={
+            "input_tokens": 90,
+            "output_tokens": 25,
+            "thinking_tokens": 20,
+            "cache_read_tokens": 80,
+            "total_tokens": 115,
+        },
+    ),
+    antigravity_step(
+        3,
+        step_type="checkpoint",
+        usage={
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "thinking_tokens": 0,
+            "cache_read_tokens": 0,
+            "total_tokens": 15,
+        },
+    ),
+    {"event": "result", "result": ANTIGRAVITY_RESULT},
+]
 
 
 def sandbox(stdout, exit_code=0):
@@ -236,6 +308,70 @@ class GrokParsingTests(unittest.TestCase):
                 self.assertEqual(usage_from_result(record).total_tokens, 135)
 
 
+class AntigravityParsingTests(unittest.TestCase):
+
+    def test_json_envelope_keeps_metadata_and_disjoint_buckets(self):
+        record = parse_antigravity_result(json.dumps(ANTIGRAVITY_RESULT))
+        self.assertEqual(record["result"], "Done.")
+        self.assertEqual(record["conversation_id"], "agy-1")
+        self.assertEqual(record["status"], "SUCCESS")
+        self.assertEqual(record["events"], [ANTIGRAVITY_RESULT])
+        # Thinking is part of output and is not added again.
+        self.assertEqual(
+            usage_from_result(record),
+            Usage(input_tokens=100, output_tokens=30, cache_read_tokens=80),
+        )
+        self.assertNotIn("total_cost_usd", record)
+
+    def test_stream_result_is_authoritative_over_step_reports(self):
+        record = parse_antigravity_result(stream(*ANTIGRAVITY_EVENTS))
+        self.assertEqual(record["result"], "Done.")
+        self.assertEqual(record["events"], ANTIGRAVITY_EVENTS)
+        self.assertEqual(usage_from_result(record).total_tokens, 210)
+
+    def test_latest_cumulative_result_wins_in_multi_turn_stream(self):
+        second = {
+            **ANTIGRAVITY_RESULT,
+            "response": "Again.",
+            "num_turns": 2,
+            "usage": {**ANTIGRAVITY_USAGE, "input_tokens": 150},
+        }
+        record = parse_antigravity_result(
+            stream(*ANTIGRAVITY_EVENTS, {"event": "result", "result": second})
+        )
+        self.assertEqual(record["result"], "Again.")
+        self.assertEqual(record["num_turns"], 2)
+        self.assertEqual(usage_from_result(record).input_tokens, 150)
+
+    def test_interrupted_stream_counts_each_step_once(self):
+        events = ANTIGRAVITY_EVENTS[:-1]
+        record = parse_antigravity_result(stream(*events, events[-1]))
+        self.assertEqual(record["result"], "Done.")
+        self.assertNotIn("status", record)
+        self.assertEqual(
+            usage_from_result(record),
+            Usage(input_tokens=100, output_tokens=30, cache_read_tokens=80),
+        )
+
+    def test_error_envelope_and_undocumented_cost(self):
+        record = parse_antigravity_result(
+            json.dumps(
+                {
+                    "conversation_id": "",
+                    "status": "ERROR",
+                    "response": "",
+                    "error": "invalid model selection",
+                    "usage": dict.fromkeys(ANTIGRAVITY_USAGE, 0),
+                    "total_cost_usd": 1.5,
+                }
+            )
+        )
+        self.assertEqual(record["result"], "")
+        self.assertEqual(record["error"], "invalid model selection")
+        self.assertNotIn("total_cost_usd", record)
+        self.assertEqual(usage_from_result(record), Usage())
+
+
 class MalformedOutputTests(unittest.TestCase):
 
     def test_invalid_json_shapes_and_noise(self):
@@ -243,6 +379,7 @@ class MalformedOutputTests(unittest.TestCase):
         for parser, payload in [
             (parse_codex_result, stream(*CODEX_EVENTS)),
             (parse_grok_result, json.dumps(GROK_RESULT)),
+            (parse_antigravity_result, json.dumps(ANTIGRAVITY_RESULT)),
         ]:
             with self.subTest(parser=parser.__name__):
                 self.assertIsNone(parser(noise))
@@ -266,6 +403,7 @@ class MalformedOutputTests(unittest.TestCase):
             for parser, event in [
                 (parse_codex_result, {"type": "turn.completed"}),
                 (parse_grok_result, {"text": "Done."}),
+                (parse_antigravity_result, {"status": "SUCCESS"}),
             ]:
                 with self.subTest(parser=parser.__name__, value=str(value)):
                     event.update(
@@ -276,6 +414,7 @@ class MalformedOutputTests(unittest.TestCase):
                             "cached_input_tokens": value,
                             "cache_read_input_tokens": value,
                             "cache_creation_input_tokens": value,
+                            "cache_read_tokens": value,
                         },
                     )
                     self.assertEqual(
@@ -372,8 +511,62 @@ class HarnessCommandTests(unittest.TestCase):
                     self.assertEqual(result.text, "plain answer")
                     self.assertEqual(result.usage.total_tokens, 0)
 
+    def test_antigravity_command_model_resume_and_prompt_form(self):
+        sb, session = sandbox(json.dumps(ANTIGRAVITY_RESULT), exit_code=1)
+        with sb, patch.object(sb, "estimate_compute_cost", return_value=0.25):
+            for command in (None, "/opt/bin/agy"):
+                result = sb.run_agent(
+                    "--review 'quotes' $text",
+                    harness="antigravity",
+                    model="test-model",
+                    resume=True,
+                    command=command,
+                    extra_args=["--print-timeout", "10m"],
+                )
+                session.execute_command.assert_called_with(
+                    command or "agy",
+                    [
+                        "--output-format",
+                        "json",
+                        "-c",
+                        "--model",
+                        "test-model",
+                        "--print-timeout",
+                        "10m",
+                        "--print=--review 'quotes' $text",
+                    ],
+                )
+                self.assertEqual(result.text, "Done.")
+                self.assertEqual(result.stderr, "diagnostic")
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(result.usage.llm_cost_usd, 0)
+            self.assertEqual(sb.usage.total_tokens, 420)
+            self.assertEqual(sb.usage.compute_cost_usd, 0.5)
+
+    def test_antigravity_stream_and_text_formats(self):
+        for fmt, stdout, text, tokens in [
+            ("stream-json", stream(*ANTIGRAVITY_EVENTS), "Done.", 210),
+            ("text", "plain answer", "plain answer", 0),
+        ]:
+            with self.subTest(fmt=fmt):
+                sb, session = sandbox(stdout)
+                with sb:
+                    result = sb.run_agent(
+                        "hi", harness="antigravity", output_format=fmt
+                    )
+                session.execute_command.assert_called_once_with(
+                    "agy", ["--output-format", fmt, "--print=hi"]
+                )
+                self.assertEqual(result.text, text)
+                self.assertEqual(result.usage.total_tokens, tokens)
+
     def test_invalid_formats_fail_before_execution(self):
-        for harness, fmt in [("codex", "stream-json"), ("grok", "stream-json")]:
+        for harness, fmt in [
+            ("codex", "stream-json"),
+            ("grok", "stream-json"),
+            ("antigravity", "streaming-json"),
+            ("antigravity", "plain"),
+        ]:
             sb, session = sandbox("")
             with sb, self.assertRaises(ValueError):
                 sb.run_agent("hi", harness=harness, output_format=fmt)
@@ -383,9 +576,10 @@ class HarnessCommandTests(unittest.TestCase):
 class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_async_forwards_new_harnesses_and_resume(self):
-        for harness, payload in [
-            ("grok", json.dumps(GROK_RESULT)),
-            ("codex", stream(*CODEX_EVENTS)),
+        for harness, binary, payload in [
+            ("grok", "grok", json.dumps(GROK_RESULT)),
+            ("codex", "codex", stream(*CODEX_EVENTS)),
+            ("antigravity", "agy", json.dumps(ANTIGRAVITY_RESULT)),
         ]:
             sb, session = sandbox(payload)
             async with AsyncSandbox(sb) as async_sb:
@@ -397,7 +591,7 @@ class AsyncHarnessTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(async_sb.usage, result.usage)
             command, args = session.execute_command.call_args.args
-            self.assertEqual(command, harness)
+            self.assertEqual(command, binary)
             self.assertIn("test-model", args)
             self.assertIn("--last" if harness == "codex" else "-c", args)
             self.assertEqual(result.text, "Done.")

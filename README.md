@@ -153,7 +153,7 @@ directory, or prompt delivery mode. For an agent running in your own process,
 use `agent_tools()` or `AgentSpec.outside(...)` to drive the sandbox.
 
 The [agent guide](docs/AGENT_GUIDE.md) covers Claude Code, Codex, OpenCode, Grok,
-custom runners, presets, and resuming conversations. Direct SDK runs are not
+Antigravity CLI, custom runners, presets, and resuming conversations. Direct SDK runs are not
 uploaded to the dashboard; use the
 [hosted agent workflow](docs/AGENT_GUIDE.md#token-usage--cost) to persist usage
 in the control plane.

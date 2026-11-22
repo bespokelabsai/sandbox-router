@@ -497,7 +497,13 @@ class ControlPlane:
                 return response
             return {k: v for k, v in response.items() if k != "agent_usage"}
 
-        if harness not in {"claude-code", "opencode", "grok", "codex"}:
+        if harness not in {
+            "claude-code",
+            "opencode",
+            "grok",
+            "codex",
+            "antigravity",
+        }:
             raise ValueError("unsupported agent harness")
         record = self.store.get_sandbox(principal.organization_id, sandbox_id)
         options = {
