@@ -671,6 +671,44 @@ class EstimateTests(unittest.TestCase):
                 self.assertEqual(row["total_tokens"], 0)
                 self.assertEqual(row["cost_state"], "unavailable")
 
+    def test_antigravity_stream_cut_before_any_usage_is_incomplete(self):
+        from bespokelabs.sandbox._usage import (
+            parse_antigravity_result,
+            usage_from_result,
+        )
+
+        # The stream stopped after the prompt step, before any step reported
+        # tokens, e.g., because the sandbox timeout ended the command.
+        events = [
+            {"event": "init", "conversation_id": "c-1", "init": {"cwd": "/"}},
+            {
+                "event": "step_update",
+                "step_update": {
+                    "conversation_id": "c-1",
+                    "step_index": 0,
+                    "state": "DONE",
+                    "step_type": "user_input",
+                },
+            },
+        ]
+        raw = parse_antigravity_result("\n".join(map(json.dumps, events)))
+        row = agent_usage_record(
+            AgentRunResult(
+                raw=raw, usage=usage_from_result(raw), exit_code=124
+            ),
+            harness="antigravity",
+            model=None,
+        )
+        self.assertFalse(row["tokens_known"])
+        self.assertTrue(row["usage_is_incomplete"])
+        self.assertEqual(row["cost_state"], "unavailable")
+        # Text output has no events, so it is not marked incomplete.
+        row = agent_usage_record(
+            AgentRunResult(text="done"), harness="antigravity", model=None
+        )
+        self.assertFalse(row["tokens_known"])
+        self.assertFalse(row["usage_is_incomplete"])
+
     def test_reported_cost_wins_over_codex_estimate(self):
         result = self.result(
             {"usage": {"input_tokens": 100}, "total_cost_usd": 0.75}

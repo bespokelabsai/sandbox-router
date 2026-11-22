@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -182,6 +184,81 @@ class PresetTests(unittest.TestCase):
         presets = Sandbox.list_presets()
 
         self.assertEqual(set(presets), BUILT_IN_PRESETS)
+
+
+class AntigravityContainerPrerequisiteTests(unittest.TestCase):
+    """Run the container prerequisite step against stub system commands.
+
+    PATH holds only the stubs, so curl and git are missing unless a test
+    adds them. Like the real sudo, the stub sudo drops the caller's
+    environment before it runs the command.
+    """
+
+    INSTALL = (
+        "apt-get install -y --no-install-recommends ca-certificates curl git"
+    )
+
+    def run_step(self, shell, uid, tools=()):
+        stubs = {
+            "id": 'echo "$FAKE_UID"',
+            "sudo": (
+                'echo "sudo $*" >> "$LOG"; [ "$1" = -n ] && shift; '
+                'exec /usr/bin/env -i PATH="$PATH" LOG="$LOG" "$@"'
+            ),
+            "apt-get": 'echo "apt-get $* (${DEBIAN_FRONTEND:-unset})" >> "$LOG"',
+            **dict.fromkeys(tools, "exit 0"),
+        }
+        step = get_preset("antigravity").backend_setup_commands["docker"][0]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, body in stubs.items():
+                stub = root / name
+                stub.write_text(f"#!/bin/sh\n{body}\n")
+                stub.chmod(0o755)
+            (root / "env").symlink_to("/usr/bin/env")
+            log = root / "log"
+            subprocess.run(
+                [shell, "-c", step],
+                env={"PATH": temp, "LOG": str(log), "FAKE_UID": str(uid)},
+                check=True,
+            )
+            return log.read_text().splitlines() if log.exists() else []
+
+    def shells(self):
+        found = {name: shutil.which(name) for name in ("sh", "bash", "dash")}
+        return {name: path for name, path in found.items() if path}
+
+    def test_root_runs_apt_get_directly(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 0),
+                    [
+                        "apt-get update (unset)",
+                        f"{self.INSTALL} (noninteractive)",
+                    ],
+                )
+
+    def test_non_root_user_runs_apt_get_with_sudo(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 1000),
+                    [
+                        "sudo -n apt-get update",
+                        "apt-get update (unset)",
+                        "sudo -n env DEBIAN_FRONTEND=noninteractive "
+                        + self.INSTALL,
+                        f"{self.INSTALL} (noninteractive)",
+                    ],
+                )
+
+    def test_installed_tools_skip_apt_get(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 1000, tools=("curl", "git")), []
+                )
 
 
 class AntigravityLocalSetupTests(unittest.TestCase):

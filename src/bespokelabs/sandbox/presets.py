@@ -122,10 +122,13 @@ def _antigravity_install(*, sudo_link: bool = False) -> str:
     )
 
 
+# apt-get needs root, so a non-root container user runs it with passwordless
+# sudo. sudo resets the environment, so env passes DEBIAN_FRONTEND through.
 _ANTIGRAVITY_CONTAINER_PREREQUISITES = (
     "(command -v curl >/dev/null 2>&1 && "
     "command -v git >/dev/null 2>&1) || "
-    "(apt-get update && DEBIAN_FRONTEND=noninteractive "
+    '(s=; [ "$(id -u)" -eq 0 ] || s="sudo -n"; '
+    "$s apt-get update && $s env DEBIAN_FRONTEND=noninteractive "
     "apt-get install -y --no-install-recommends ca-certificates curl git)"
 )
 # A GEMINI_API_KEY is ignored unless settings select the "gemini" provider,

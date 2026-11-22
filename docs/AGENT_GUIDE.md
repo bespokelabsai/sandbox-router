@@ -306,9 +306,15 @@ of time, add rules under
 `extra_args=["--dangerously-skip-permissions"]`. Use that flag only in an
 isolated sandbox with credentials you are willing to expose.
 
-A headless run has no time limit by default. Pass
-`extra_args=["--print-timeout", "15m"]` for unattended runs. A run stopped by
-this limit exits with code 3, and its answer is partial. Its
+The CLI sets no time limit on a headless run. The sandbox's `timeout_secs` can
+still stop a run. The `antigravity` preset sets it to 1800 seconds unless you
+pass your own value. On Docker, for example, `timeout_secs` is a timeout for
+each command, so a `run_agent` call stops after 30 minutes. The
+[SDK reference](SDK_REFERENCE.md#creating-a-sandbox) explains how each backend
+uses it. When the sandbox stops a run this way, the CLI does not print its
+final result. To get a final result, give the CLI a shorter limit, e.g.,
+`extra_args=["--print-timeout", "15m"]`. A run stopped by the CLI's limit
+exits with code 3, and its answer is partial. Its
 `result.raw["finished_reason"]` is `"print_timeout"`.
 
 Usage follows the Antigravity report:

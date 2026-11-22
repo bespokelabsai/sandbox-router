@@ -143,6 +143,24 @@ def agent_usage_record(
             or result.exit_code != 0
             or any(e.get("type") == "error" for e in events)
         )
+    elif harness == "antigravity" and events:
+        # Usage is complete only when the final envelope reports success
+        # and the turn was not cut short (print timeout, interrupt). This
+        # also covers a stream that stopped before any step reported tokens.
+        finals = [
+            e if e.get("event") is None else e["result"]
+            for e in events
+            if (e.get("event") is None and isinstance(e.get("status"), str))
+            or (
+                e.get("event") == "result" and isinstance(e.get("result"), dict)
+            )
+        ]
+        final = finals[-1] if finals else {}
+        incomplete = (
+            incomplete
+            or final.get("status") != "SUCCESS"
+            or bool(final.get("finished_reason"))
+        )
     partial_cost = any(s.get("cost_is_partial") for s in sources)
     known = _has_tokens(raw, harness)
     if events and known:
@@ -162,24 +180,6 @@ def agent_usage_record(
             incomplete = incomplete or not any(
                 e.get("type") in {"end", "result", "error"} or "text" in e
                 for e in events
-            )
-        elif harness == "antigravity":
-            # Usage is complete only when the final envelope reports success
-            # and the turn was not cut short (print timeout, interrupt).
-            finals = [
-                e if e.get("event") is None else e["result"]
-                for e in events
-                if (e.get("event") is None and isinstance(e.get("status"), str))
-                or (
-                    e.get("event") == "result"
-                    and isinstance(e.get("result"), dict)
-                )
-            ]
-            final = finals[-1] if finals else {}
-            incomplete = (
-                incomplete
-                or final.get("status") != "SUCCESS"
-                or bool(final.get("finished_reason"))
             )
     record = {
         "harness": harness,
