@@ -1,8 +1,8 @@
 <p align="center">
   <a href="https://bespokelabs.ai/" target="_blank">
     <picture>
-      <source media="(prefers-color-scheme: light)" width="100px" srcset="https://github.com/bespokelabsai/curator/blob/main/docs/Bespoke-Labs-Logomark-Red-crop.png">
-      <img alt="Bespoke Labs Logo" width="100px" src="https://github.com/bespokelabsai/curator/blob/main/docs/Bespoke-Labs-Logomark-Red-crop.png">
+      <source media="(prefers-color-scheme: light)" width="100px" srcset="https://raw.githubusercontent.com/bespokelabsai/curator/main/docs/Bespoke-Labs-Logomark-Red-crop.png">
+      <img alt="Bespoke Labs Logo" width="100px" src="https://raw.githubusercontent.com/bespokelabsai/curator/main/docs/Bespoke-Labs-Logomark-Red-crop.png">
     </picture>
   </a>
 </p>
@@ -12,8 +12,8 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/sandbox-agent-loop-dark.gif">
-    <img alt="Animation: the inside-sandbox agent example runs Codex on 10 backends by changing only the backend string, and each run's create, setup, exec, and destroy events appear in a telemetry view" src="docs/images/sandbox-agent-loop-light.gif" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/bespokelabsai/sandbox-router/main/docs/images/sandbox-agent-loop-dark.gif">
+    <img alt="Animation: the inside-sandbox agent example runs Codex on 10 backends by changing only the backend string, and each run's create, setup, exec, and destroy events appear in a telemetry view" src="https://raw.githubusercontent.com/bespokelabsai/sandbox-router/main/docs/images/sandbox-agent-loop-light.gif" width="100%">
   </picture>
 </p>
 <br/>
@@ -35,7 +35,7 @@ the core package requires only Pydantic.
 pip install bespokelabs-sandbox
 ```
 
-See [installation options](docs/INSTALLATION.md) for provider extras, the
+See [installation options](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/INSTALLATION.md) for provider extras, the
 server (Python 3.11+), and using Sandbox alongside other Bespoke packages.
 
 ## Quickstart
@@ -99,13 +99,13 @@ Docker pulls the image on the first run if it is not already available.
 For shell commands, use `sb.execute_command("python", ["/path/to/script.py"])`.
 Code and command results expose `stdout`, `stderr`, and `exit_code`; inspect the
 exit code for command failures. Provider or transport failures can raise
-[`SandboxError`](docs/SDK_REFERENCE.md#errors).
+[`SandboxError`](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/SDK_REFERENCE.md#errors).
 
 The same API works with configured cloud providers, subject to their
-[feature support](docs/BACKENDS.md#feature-support-matrix). See the reference for
-[repository and directory setup](docs/SDK_REFERENCE.md#workspace-convenience-arguments),
-[file operations](docs/SDK_REFERENCE.md#file-operations), and
-[async execution](docs/SDK_REFERENCE.md#async).
+[feature support](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md#feature-support-matrix). See the reference for
+[repository and directory setup](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/SDK_REFERENCE.md#workspace-convenience-arguments),
+[file operations](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/SDK_REFERENCE.md#file-operations), and
+[async execution](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/SDK_REFERENCE.md#async).
 
 ## Run your first agent
 
@@ -152,10 +152,10 @@ Use `agent(AgentSpec.inside(...))` when you need a custom command, working
 directory, or prompt delivery mode. For an agent running in your own process,
 use `agent_tools()` or `AgentSpec.outside(...)` to drive the sandbox.
 
-The [agent guide](docs/AGENT_GUIDE.md) covers Claude Code, Codex, OpenCode, Grok,
+The [agent guide](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/AGENT_GUIDE.md) covers Claude Code, Codex, OpenCode, Grok,
 custom runners, presets, and resuming conversations. Direct SDK runs are not
 uploaded to the dashboard; use the
-[hosted agent workflow](docs/AGENT_GUIDE.md#token-usage--cost) to persist usage
+[hosted agent workflow](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/AGENT_GUIDE.md#token-usage--cost) to persist usage
 in the control plane.
 
 ## Supported Backends
@@ -194,10 +194,10 @@ security boundary. Safehouse wraps subprocesses with its macOS policy, while
 its file helpers still access the host directly. Use the isolation properties
 of your selected backend when deciding which workloads to run.
 
-See the [feature matrix](docs/BACKENDS.md#feature-support-matrix),
-[credential setup](docs/BACKENDS.md#environment-variables), and
-[Monty guide](docs/BACKENDS.md#monty-local-python-execution) and
-[Novita guide](docs/BACKENDS.md#novita-code-interpreter) for adapter details
+See the [feature matrix](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md#feature-support-matrix),
+[credential setup](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md#environment-variables), and
+[Monty guide](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md#monty-local-python-execution) and
+[Novita guide](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md#novita-code-interpreter) for adapter details
 (including Novita's native connect lifecycle and protected-service authentication).
 
 ## Hosted control plane
@@ -211,7 +211,7 @@ The dashboard shows resource usage, compute spend, hosted agent token and model
 cost records, execution history, and cleanup state. Provisioning policies cover
 concurrency, compute spend, allowed providers and GPUs, and requested lifetimes.
 
-![Docker, Monty, and Daytona usage overview with illustrative workload totals and measured resource peaks](docs/images/sandbox-usage-overview.svg)
+![Docker, Monty, and Daytona usage overview with illustrative workload totals and measured resource peaks](https://raw.githubusercontent.com/bespokelabsai/sandbox-router/main/docs/images/sandbox-usage-overview.svg)
 
 *Illustrative Docker + Monty + Daytona workload, with measured resource peaks from
 small live smoke tests shown separately. Monty resource telemetry is unavailable
@@ -220,14 +220,14 @@ and excluded from idle totals. Cost estimates exclude local host compute.*
 <details>
 <summary>See the current per-sandbox dashboard</summary>
 
-![Per-sandbox CPU, RAM, GPU utilization, and GPU memory charts](docs/images/sandbox-resource-dashboard.jpg)
+![Per-sandbox CPU, RAM, GPU utilization, and GPU memory charts](https://raw.githubusercontent.com/bespokelabsai/sandbox-router/main/docs/images/sandbox-resource-dashboard.jpg)
 
 *Actual dashboard with fixture data. Resource charts refresh every 15 seconds;
 available metrics depend on the provider and sandbox image.*
 
 </details>
 
-Follow the [control plane setup guide](docs/CONTROL_PLANE_GUIDE.md) to install
+Follow the [control plane setup guide](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_GUIDE.md) to install
 the server, configure a provider, issue a product key, run a client job, and
 open the dashboard.
 
@@ -235,20 +235,20 @@ This is a service you operate. Run one API process per SQLite database;
 execution handles do not survive a server restart. Resource metrics require a
 compatible image, and restart reconciliation and cleanup require
 deployment-supplied adapters. Compute budget checks apply at creation and
-exclude model spend. See the [operations runbook](docs/CONTROL_PLANE_OPERATIONS.md)
+exclude model spend. See the [operations runbook](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_OPERATIONS.md)
 before deploying.
 
 ## Documentation
 
 | Guide | Contents |
 |---|---|
-| [Installation](docs/INSTALLATION.md) | Python versions, provider extras, server installation, package compatibility |
-| [Backends and feature support](docs/BACKENDS.md) | Provider requirements, Monty, feature matrix, environment variables |
-| [Python SDK reference](docs/SDK_REFERENCE.md) | Creation options, execution, files, workspaces, networking, GPUs, jobs, snapshots, lifecycle, async, errors, telemetry |
-| [Running agents](docs/AGENT_GUIDE.md) | Agent placement, CLI harnesses, presets, token usage, cost reporting, Envy |
-| [Control plane setup](docs/CONTROL_PLANE_GUIDE.md) | Server setup, product keys, remote execution, dashboard, policies |
-| [Control plane operations](docs/CONTROL_PLANE_OPERATIONS.md) | Deployment, supervision, recovery, and operating limits |
-| [HTTP API contract](docs/CONTROL_PLANE_API.md) | Endpoints, authentication, request semantics, and exports |
+| [Installation](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/INSTALLATION.md) | Python versions, provider extras, server installation, package compatibility |
+| [Backends and feature support](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/BACKENDS.md) | Provider requirements, Monty, feature matrix, environment variables |
+| [Python SDK reference](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/SDK_REFERENCE.md) | Creation options, execution, files, workspaces, networking, GPUs, jobs, snapshots, lifecycle, async, errors, telemetry |
+| [Running agents](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/AGENT_GUIDE.md) | Agent placement, CLI harnesses, presets, token usage, cost reporting, Envy |
+| [Control plane setup](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_GUIDE.md) | Server setup, product keys, remote execution, dashboard, policies |
+| [Control plane operations](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_OPERATIONS.md) | Deployment, supervision, recovery, and operating limits |
+| [HTTP API contract](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_API.md) | Endpoints, authentication, request semantics, and exports |
 
 ## Examples
 
@@ -257,12 +257,12 @@ lists its own provider and agent prerequisites.
 
 | Example | Demonstrates |
 |---|---|
-| [move_files_into_sandbox.py](examples/move_files_into_sandbox.py) | Generated local directory, file-map seeding, and live transfers |
-| [find_cheapest.py](examples/find_cheapest.py) | Cold-start/execution benchmarks and bundled compute estimates |
-| [sandbox_repo.py](examples/sandbox_repo.py) | Claude Code or Codex inside Daytona/Tensorlake, with a clone or web input |
-| [claude_code_outside.py](examples/claude_code_outside.py) | Host-side agent driving sandbox commands through a local bridge |
-| [claude_code_persona.py](examples/claude_code_persona.py) | Declarative workspace and agent persona files |
-| [github_stats.py](examples/github_stats.py) | Parsing agent output into a Pydantic model |
+| [move_files_into_sandbox.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/move_files_into_sandbox.py) | Generated local directory, file-map seeding, and live transfers |
+| [find_cheapest.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/find_cheapest.py) | Cold-start/execution benchmarks and bundled compute estimates |
+| [sandbox_repo.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/sandbox_repo.py) | Claude Code or Codex inside Daytona/Tensorlake, with a clone or web input |
+| [claude_code_outside.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/claude_code_outside.py) | Host-side agent driving sandbox commands through a local bridge |
+| [claude_code_persona.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/claude_code_persona.py) | Declarative workspace and agent persona files |
+| [github_stats.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/github_stats.py) | Parsing agent output into a Pydantic model |
 
 A local transfer demo needs no cloud credentials or agent CLI:
 
@@ -272,10 +272,10 @@ python examples/move_files_into_sandbox.py --backend local
 
 ## Development
 
-See the [development setup guide](docs/DEVELOPMENT_GUIDE.md) for environment
-setup, tests, linting, and the codebase map. [DEVELOPMENT.md](DEVELOPMENT.md)
+See the [development setup guide](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/DEVELOPMENT_GUIDE.md) for environment
+setup, tests, linting, and the codebase map. [DEVELOPMENT.md](https://github.com/bespokelabsai/sandbox-router/blob/main/DEVELOPMENT.md)
 describes design direction and compatibility rules.
 
 ## License
 
-[Apache License 2.0](LICENSE).
+[Apache License 2.0](https://github.com/bespokelabsai/sandbox-router/blob/main/LICENSE).
