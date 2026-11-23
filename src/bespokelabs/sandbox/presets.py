@@ -80,11 +80,21 @@ def _container_npm_install(packages: str) -> list[str]:
     usually owned by root, e.g., apt puts them under /usr/local. In the
     daytonaio/sandbox:latest image, root also installed some of these CLIs
     into npm folders that the `daytona` user owns. npm cannot replace those
-    copies as that user. env passes PATH through, because an npm installed
-    with nvm is not on sudo's PATH. A user without passwordless sudo runs npm
-    directly, which works when that user owns the global npm folders.
+    copies as that user. A user without passwordless sudo runs npm directly,
+    which works when that user owns the global npm folders.
+
+    The sudo command keeps the user's npm settings:
+    - The -E flag keeps the user's environment, e.g., npm_config_* and proxy
+      variables. sudo-rs ignores -E, so these variables are lost there.
+    - env passes PATH through, because sudo sets its own PATH, and that PATH
+      does not include an npm installed with nvm.
+    - The -H flag sets HOME to root's home, so root does not write files into
+      the user's home, e.g., the npm cache.
+    - HOME is different, so the command sets npm_config_userconfig to the
+      user's npm config file. That file can hold registry settings and tokens.
     """
     install = f"npm install -g {packages}"
+    sudo = "sudo -n -E -H"
     return [
         "(command -v node >/dev/null 2>&1 && "
         "command -v npm >/dev/null 2>&1 && "
@@ -92,8 +102,10 @@ def _container_npm_install(packages: str) -> list[str]:
         '(s=; [ "$(id -u)" -eq 0 ] || s="sudo -n"; '
         "$s apt-get update && $s env DEBIAN_FRONTEND=noninteractive "
         "apt-get install -y --no-install-recommends nodejs npm git)",
-        'if [ "$(id -u)" -ne 0 ] && sudo -n true 2>/dev/null; then '
-        f'sudo -n env PATH="$PATH" {install}; else {install}; fi',
+        f'if [ "$(id -u)" -ne 0 ] && {sudo} true 2>/dev/null; then '
+        f'{sudo} env PATH="$PATH" '
+        'npm_config_userconfig="$(npm config get userconfig)" '
+        f"{install}; else {install}; fi",
     ]
 
 

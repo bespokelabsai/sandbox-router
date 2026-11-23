@@ -4,6 +4,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,7 +28,7 @@ BUILT_IN_PRESETS = {
 TENSORLAKE_NPM_PREFIX = "mkdir -p $HOME/.npm-global && npm config set prefix $HOME/.npm-global && npm install -g"
 # These are the setup commands for npm presets on Docker, Daytona, and Modal.
 # A non-root user runs apt-get with sudo, and npm with sudo when passwordless
-# sudo works.
+# sudo works. npm under sudo keeps the user's environment and npm config file.
 CONTAINER_PREREQUISITES = (
     "(command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && "
     "command -v git >/dev/null 2>&1) || "
@@ -36,8 +37,10 @@ CONTAINER_PREREQUISITES = (
     "apt-get install -y --no-install-recommends nodejs npm git)"
 )
 CONTAINER_NPM_INSTALL = (
-    'if [ "$(id -u)" -ne 0 ] && sudo -n true 2>/dev/null; then '
-    'sudo -n env PATH="$PATH" {install}; else {install}; fi'
+    'if [ "$(id -u)" -ne 0 ] && sudo -n -E -H true 2>/dev/null; then '
+    'sudo -n -E -H env PATH="$PATH" '
+    'npm_config_userconfig="$(npm config get userconfig)" {install}; '
+    "else {install}; fi"
 )
 
 
@@ -164,14 +167,32 @@ class ContainerNpmInstallTests(unittest.TestCase):
 
     The user's PATH has two folders. The first has a stub npm, as nvm
     installs it, and the second has the system stubs. node and git are
-    missing unless a test adds them. Like the real sudo, the stub sudo drops
-    the caller's environment and sets a PATH without the npm folder. It also
-    runs the command as root, so the stub id prints 0.
+    missing unless a test adds them. The user also sets an npm registry in
+    the environment.
+
+    The stub sudo runs the command as root, so the stub id prints 0. Like the
+    real sudo, it sets a PATH without the npm folder. Without -E, it drops
+    the caller's environment and sets HOME to /root. With -E, it keeps the
+    environment, and it sets HOME to /root only with -H.
     """
 
     PACKAGES = "@anthropic-ai/claude-code @openai/codex"
     APT_INSTALL = "apt-get install -y --no-install-recommends nodejs npm git"
     NPM_INSTALL = f"npm install -g {PACKAGES}"
+    REGISTRY = "https://registry.example.test/"
+    # The stub npm prints the default npm config file path, like the real
+    # npm. For an install, it logs the HOME and npm settings it sees.
+    NPM_STUB = textwrap.dedent(
+        """\
+        if [ "$*" = "config get userconfig" ]; then
+          echo "${npm_config_userconfig:-$HOME/.npmrc}"
+          exit
+        fi
+        echo "npm $* (uid $(id -u), HOME=$HOME," \\
+          "userconfig=${npm_config_userconfig:-default}," \\
+          "registry=${npm_config_registry:-default})" >> "$LOG"
+    """
+    )
 
     def run_steps(self, shell, uid, *, sudo="nopasswd", tools=()):
         """Run each setup step in its own shell and return the stub log."""
@@ -180,11 +201,24 @@ class ContainerNpmInstallTests(unittest.TestCase):
             system, nvm = Path(temp, "system"), Path(temp, "nvm")
             system.mkdir()
             nvm.mkdir()
+            root = f"PATH={shlex.quote(str(system))} FAKE_UID=0"
             sudo_stubs = {
-                "nopasswd": (
-                    'echo "sudo $*" >> "$LOG"; [ "$1" = -n ] && shift; '
-                    f"exec /usr/bin/env -i PATH={shlex.quote(str(system))} "
-                    'LOG="$LOG" FAKE_UID=0 "$@"'
+                "nopasswd": textwrap.dedent(
+                    f"""\
+                    echo "sudo $*" >> "$LOG"
+                    keep=
+                    while :; do
+                      case $1 in
+                        -n) shift ;;
+                        -E) keep=1; shift ;;
+                        -H) HOME=/root; shift ;;
+                        *) break ;;
+                      esac
+                    done
+                    [ -n "$keep" ] ||
+                      exec /usr/bin/env -i {root} HOME=/root LOG="$LOG" "$@"
+                    exec /usr/bin/env {root} "$@"
+                """
                 ),
                 "password": (
                     'echo "sudo $*" >> "$LOG"; '
@@ -195,7 +229,7 @@ class ContainerNpmInstallTests(unittest.TestCase):
             stubs = {
                 system / "id": 'echo "$FAKE_UID"',
                 system / "apt-get": apt_get,
-                nvm / "npm": 'echo "npm $* (uid $(id -u))" >> "$LOG"',
+                nvm / "npm": self.NPM_STUB,
                 **{system / tool: "exit 0" for tool in tools},
             }
             if sudo:
@@ -208,8 +242,10 @@ class ContainerNpmInstallTests(unittest.TestCase):
             log = Path(temp, "log")
             env = {
                 "PATH": f"{nvm}:{system}",
+                "HOME": str(Path(temp, "home")),
                 "LOG": str(log),
                 "FAKE_UID": str(uid),
+                "npm_config_registry": self.REGISTRY,
             }
             for step in steps:
                 subprocess.run([shell, "-c", step], env=env, check=True)
@@ -220,6 +256,24 @@ class ContainerNpmInstallTests(unittest.TestCase):
         found = {name: shutil.which(name) for name in ("sh", "bash", "dash")}
         return {name: path for name, path in found.items() if path}
 
+    def npm_log(self, uid, home, userconfig="default"):
+        """Return the line the stub npm logs for the install."""
+        return (
+            f"{self.NPM_INSTALL} (uid {uid}, HOME={home}, "
+            f"userconfig={userconfig}, registry={self.REGISTRY})"
+        )
+
+    def sudo_npm_log(self):
+        """Return the log lines for npm with passwordless sudo."""
+        return [
+            "sudo -n -E -H true",
+            "sudo -n -E -H env PATH=$TMP/nvm:$TMP/system "
+            f"npm_config_userconfig=$TMP/home/.npmrc {self.NPM_INSTALL}",
+            # npm runs as root with root's HOME, the user's registry setting,
+            # and the user's npm config file.
+            self.npm_log(0, "/root", "$TMP/home/.npmrc"),
+        ]
+
     def test_root_runs_apt_get_and_npm_directly(self):
         for name, shell in self.shells().items():
             with self.subTest(shell=name):
@@ -228,7 +282,7 @@ class ContainerNpmInstallTests(unittest.TestCase):
                     [
                         "apt-get update (unset)",
                         f"{self.APT_INSTALL} (noninteractive)",
-                        f"{self.NPM_INSTALL} (uid 0)",
+                        self.npm_log(0, "$TMP/home"),
                     ],
                 )
 
@@ -243,10 +297,7 @@ class ContainerNpmInstallTests(unittest.TestCase):
                         "sudo -n env DEBIAN_FRONTEND=noninteractive "
                         + self.APT_INSTALL,
                         f"{self.APT_INSTALL} (noninteractive)",
-                        "sudo -n true",
-                        "sudo -n env PATH=$TMP/nvm:$TMP/system "
-                        + self.NPM_INSTALL,
-                        f"{self.NPM_INSTALL} (uid 0)",
+                        *self.sudo_npm_log(),
                     ],
                 )
 
@@ -255,19 +306,17 @@ class ContainerNpmInstallTests(unittest.TestCase):
             with self.subTest(shell=name):
                 self.assertEqual(
                     self.run_steps(shell, 1000, tools=("node", "git")),
-                    [
-                        "sudo -n true",
-                        "sudo -n env PATH=$TMP/nvm:$TMP/system "
-                        + self.NPM_INSTALL,
-                        f"{self.NPM_INSTALL} (uid 0)",
-                    ],
+                    self.sudo_npm_log(),
                 )
 
     def test_user_without_passwordless_sudo_runs_npm_directly(self):
         # npm works without sudo when the user owns its global prefix.
         expected = {
-            "password": ["sudo -n true", f"{self.NPM_INSTALL} (uid 1000)"],
-            None: [f"{self.NPM_INSTALL} (uid 1000)"],
+            "password": [
+                "sudo -n -E -H true",
+                self.npm_log(1000, "$TMP/home"),
+            ],
+            None: [self.npm_log(1000, "$TMP/home")],
         }
         for name, shell in self.shells().items():
             for sudo, log in expected.items():
