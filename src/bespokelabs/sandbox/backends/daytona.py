@@ -237,7 +237,9 @@ class DaytonaClient:
                 )
             own = {
                 str(key): str(value)
-                for key, value in (getattr(sandbox, "labels", None) or {}).items()
+                for key, value in (
+                    getattr(sandbox, "labels", None) or {}
+                ).items()
             }
             if any(own.get(key) != value for key, value in labels.items()):
                 continue
@@ -248,7 +250,9 @@ class DaytonaClient:
                     provider_resource_id=str(sandbox_id),
                     labels=own,
                     state=None if state is None else str(state),
-                    created_at=_aware_time(getattr(sandbox, "created_at", None)),
+                    created_at=_aware_time(
+                        getattr(sandbox, "created_at", None)
+                    ),
                     session_state=SandboxSessionState(
                         backend="daytona", data={"sandbox_id": str(sandbox_id)}
                     ),
@@ -361,7 +365,11 @@ def _aware_time(value: object) -> datetime | None:
             return None
     if not isinstance(value, datetime):
         return None
-    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return (
+        value
+        if value.tzinfo is not None
+        else value.replace(tzinfo=timezone.utc)
+    )
 
 
 def _create_kwargs(config: SandboxConfig) -> dict:

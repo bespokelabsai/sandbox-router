@@ -1,6 +1,6 @@
 [project]
 name = "bespokelabs-sandbox"
-version = "0.4.0"
+version = "0.4.1"
 description = "OpenRouter for Sandboxes - Unified Python API for cloud sandbox providers"
 readme = "README.md"
 license = "Apache-2.0"
@@ -24,10 +24,12 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-daytona = ["daytona>=0.207.0"]
+daytona = ["daytona>=0.207.0,<1"]
 tensorlake = ["tensorlake>=0.1.0"]
 modal = ["modal>=0.60.0"]
 e2b = ["e2b-code-interpreter>=1.0.0"]
+# 2.1.3 is the tested public Code Interpreter create/connect baseline.
+novita = ["novita-sandbox>=2.1.3,<2.2"]
 docker = ["docker>=7.0.0"]
 monty = ["pydantic-monty>=1.5.0,<2"]
 ray = ["ray>=2.0.0"]
@@ -35,10 +37,11 @@ boxd = ["boxd>=0.2.20"]
 gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0"]
 server = ["fastapi>=0.115.0", "uvicorn>=0.30.0"]
 all = [
-    "daytona>=0.207.0",
+    "daytona>=0.207.0,<1",
     "tensorlake>=0.1.0",
     "modal>=0.60.0",
     "e2b-code-interpreter>=1.0.0",
+    "novita-sandbox>=2.1.3,<2.2",
     "docker>=7.0.0",
     "pydantic-monty>=1.5.0,<2",
     "ray>=2.0.0",

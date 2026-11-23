@@ -7,7 +7,7 @@
 ## Problem
 
 `bespokelabs-sandbox` gives one API over many sandbox providers (Daytona, E2B, Modal,
-Tensorlake, Docker, Ray, Local, Safehouse, RunPod, Monty, boxd, with Maritime in an open PR). Each
+Tensorlake, Docker, Ray, Local, Safehouse, RunPod, Monty, boxd, Novita, with Maritime in an open PR). Each
 provider's SDK has far more surface than our API covers: preview URLs and port
 forwarding, streaming and background processes, pause/resume, volumes, network
 policies, GPU controls, and new features every release.
@@ -131,6 +131,7 @@ A read-only property returning the provider's own live object:
 |---|---|
 | `daytona` | Daytona SDK `Sandbox` |
 | `e2b` | E2B SDK `Sandbox` |
+| `novita` | Novita SDK `Sandbox` |
 | `modal` | `modal.Sandbox` |
 | `tensorlake` | Tensorlake SDK sandbox object |
 | `docker` | `docker.models.containers.Container` |

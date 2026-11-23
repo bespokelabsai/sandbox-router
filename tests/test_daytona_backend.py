@@ -542,7 +542,6 @@ class TimeoutSecsExplicitnessTests(unittest.TestCase):
         self.assertFalse(config.timeout_secs_explicit)
 
 
-
 @unittest.skipUnless(_HAS_DAYTONA, "Daytona SDK not installed")
 class DaytonaListSandboxesTests(unittest.TestCase):
     """list_sandboxes finds a caller's sandboxes by label and never guesses."""
@@ -566,15 +565,18 @@ class DaytonaListSandboxesTests(unittest.TestCase):
         only = listed[0]
         self.assertEqual(only.labels, {"team": "x", "run": "1"})
         self.assertEqual(only.state, "started")
-        self.assertEqual(only.created_at.isoformat(), "2026-01-02T03:04:05+00:00")
+        self.assertEqual(
+            only.created_at.isoformat(), "2026-01-02T03:04:05+00:00"
+        )
         self.assertEqual(only.session_state.backend, "daytona")
         self.assertEqual(only.session_state.data, {"sandbox_id": "sbx-a"})
 
     def test_a_sandbox_whose_own_labels_do_not_match_is_dropped(self) -> None:
         class _LooseFilter(_FakeDaytona):
+
             def list(self, query=None, request_timeout=None):
                 self.list_queries.append(query)
-                return iter(self.live)   # a server that ignored the filter
+                return iter(self.live)  # a server that ignored the filter
 
         fake = _LooseFilter()
         fake.live.append(_FakeSandbox("sbx-stray", {"team": "y"}))
@@ -607,6 +609,7 @@ class DaytonaListSandboxesTests(unittest.TestCase):
 
         self.assertIsNone(only.created_at)
         self.assertIsNone(only.state)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ from bespokelabs.sandbox.backends.gcp_batch import GcpBatchClient
 from bespokelabs.sandbox.backends.local import LocalClient
 from bespokelabs.sandbox.backends.modal import ModalClient
 from bespokelabs.sandbox.backends.monty import MontyClient
+from bespokelabs.sandbox.backends.novita import NovitaClient
 from bespokelabs.sandbox.backends.ray import RayClient
 from bespokelabs.sandbox.backends.runpod import RunpodClient
 from bespokelabs.sandbox.backends.safehouse import SafehouseClient
@@ -24,6 +25,7 @@ BACKENDS: dict[str, type] = {
     "tensorlake": TensorlakeClient,
     "modal": ModalClient,
     "e2b": E2BClient,
+    "novita": NovitaClient,
     "docker": DockerClient,
     "local": LocalClient,
     "monty": MontyClient,

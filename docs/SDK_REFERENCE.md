@@ -487,6 +487,7 @@ with Sandbox("docker") as sb:
 |---|---|
 | `daytona` | Daytona SDK `Sandbox` |
 | `e2b` | E2B SDK `Sandbox` |
+| `novita` | Novita SDK `Sandbox` |
 | `modal` | `modal.Sandbox` |
 | `tensorlake` | Tensorlake SDK sandbox |
 | `docker` | docker SDK `Container` |

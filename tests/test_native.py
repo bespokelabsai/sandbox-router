@@ -14,6 +14,7 @@ from bespokelabs.sandbox.backends.e2b import E2BSession
 from bespokelabs.sandbox.backends.local import LocalSession
 from bespokelabs.sandbox.backends.modal import ModalSession
 from bespokelabs.sandbox.backends.monty import MontySession
+from bespokelabs.sandbox.backends.novita import NovitaSession
 from bespokelabs.sandbox.backends.ray import RaySession
 from bespokelabs.sandbox.backends.runpod import RunpodSession
 from bespokelabs.sandbox.backends.safehouse import SafehouseSession
@@ -40,6 +41,7 @@ class NativeReturnsProviderObjectTests(unittest.TestCase):
             ),
             ("e2b", E2BSession(sandbox=provider), provider),
             ("modal", ModalSession(sandbox=provider), provider),
+            ("novita", NovitaSession(sandbox=provider), provider),
             (
                 "tensorlake",
                 TensorlakeSession(client=object(), sandbox=provider),

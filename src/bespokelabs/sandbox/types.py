@@ -80,7 +80,7 @@ class SandboxConfig:
         build), Modal (``Image.from_dockerfile``).  Local paths; the context
         defaults to the Dockerfile's directory.  Mutually exclusive with
         ``image`` and ``snapshot_id``.
-      - template: E2B and RunPod
+      - template: E2B, Novita (Code Interpreter compatible), and RunPod
       - app_name: Modal only
       - allow_internet: legacy best-effort flag, mapped by Docker,
         Tensorlake and boxd, rejected when false on RunPod, ignored
@@ -104,7 +104,8 @@ class SandboxConfig:
                  /home/boxd); Monty uses an absolute in-memory virtual path.
       - backend_options: provider-specific escape hatch, merged last into the
         backend's underlying create call (Docker containers.run, Modal
-        Sandbox.create, E2B Sandbox.create, Tensorlake create_and_connect,
+        Sandbox.create, E2B Sandbox.create, Novita code_interpreter.create,
+        Tensorlake create_and_connect,
         Daytona create params, RunPod REST create payload, boxd
         machines.create). Monty accepts only its documented resource/output
         options and binary_path. Ignored by local/safehouse/ray.

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 from bespokelabs.sandbox import (
     AgentSpec,
@@ -9,6 +13,7 @@ from bespokelabs.sandbox import (
     Sandbox,
     SandboxError,
 )
+from bespokelabs.sandbox.backends._prelude import PYTHON_PREAMBLE
 from bespokelabs.sandbox.types import SandboxResult
 
 
@@ -178,7 +183,7 @@ class InsideAgentSessionTests(unittest.TestCase):
                 AgentSpec.inside(
                     name="absolute-path-python",
                     command=[
-                        "python3",
+                        sys.executable,
                         "-c",
                         "import pathlib; print(pathlib.Path('/workspace/marker.txt').read_text())",
                     ],
@@ -190,6 +195,28 @@ class InsideAgentSessionTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.stdout.strip(), "ok")
+
+    def test_python_preamble_rebases_preimported_pathlib(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "workspace" / "marker.txt"
+            marker.parent.mkdir()
+            marker.write_text("cached accessor works")
+            # Preload pathlib before rebasing, including its cached 3.10 accessor.
+            code = (
+                "import pathlib\n"
+                + PYTHON_PREAMBLE
+                + "print(pathlib.Path('/workspace/marker.txt').read_text())"
+            )
+            result = subprocess.run(
+                [sys.executable, "-I", "-c", code],
+                env={"SANDBOX_ROOT": root},
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "cached accessor works")
 
     def test_inside_agent_wrapper_rebases_nested_shell_absolute_paths(
         self,

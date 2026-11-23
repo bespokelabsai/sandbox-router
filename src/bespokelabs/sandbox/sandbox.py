@@ -14,6 +14,7 @@ from typing import Any, TypeVar, overload
 
 from bespokelabs.sandbox import _jobs, _transfer, pricing, telemetry
 from bespokelabs.sandbox._usage import (
+    parse_antigravity_result,
     parse_claude_result,
     parse_codex_result,
     parse_grok_result,
@@ -346,7 +347,7 @@ class Sandbox:
 
         Returns, by backend:
 
-        - ``daytona``, ``e2b``: the provider SDK's ``Sandbox``
+        - ``daytona``, ``e2b``, ``novita``: the provider SDK's ``Sandbox``
         - ``modal``: ``modal.Sandbox``
         - ``tensorlake``: the Tensorlake SDK sandbox
         - ``docker``: the docker SDK ``Container``
@@ -657,25 +658,27 @@ class Sandbox:
         output_format: str = "json",
         resume: bool = False,
     ) -> AgentRunResult:
-        """Run Claude Code, OpenCode, Grok Build, or Codex on *prompt*.
+        """Run Claude Code, OpenCode, Grok Build, Codex, or Antigravity CLI.
 
         JSON output is the default; CLI-reported tokens/cost and estimated
         sandbox compute cost are returned and added to :attr:`usage`.
         Unreported LLM cost is zero, not a claim that the run was free. Codex
-        normally reports tokens only. Cached input is counted separately;
+        and Antigravity report tokens only. Cached input is counted separately;
         reasoning is included in output tokens, never counted twice.
 
-        ``command`` overrides the selected CLI binary. ``model`` selects the
-        model (provider/model for OpenCode); ``extra_args`` forwards CLI flags.
-        ``resume=True`` continues the latest conversation in the workspace
-        (``codex exec resume --last`` for Codex, ``-c`` for the other CLIs).
-        CLI auth, permissions, and session persistence remain caller-owned.
+        ``command`` overrides the selected CLI binary (``agy`` for
+        Antigravity). ``model`` selects the model (provider/model for
+        OpenCode); ``extra_args`` forwards CLI flags. ``resume=True``
+        continues the latest conversation in the workspace (``codex exec
+        resume --last`` for Codex, ``-c`` for the other CLIs). CLI auth,
+        permissions, and session persistence remain caller-owned.
 
         Codex accepts ``json`` or ``text``. Grok accepts ``json``,
         ``streaming-json``, ``streaming-messages-json``, or ``plain`` (``text``
         aliases ``plain``). OpenCode accepts ``json`` or ``default`` (``text``
-        aliases ``default``). Plain text has no usage metadata. On non-zero
-        exit, any parsed partial usage is retained; inspect ``exit_code``.
+        aliases ``default``). Antigravity accepts ``json``, ``stream-json``,
+        or ``text``. Plain text has no usage metadata. On non-zero exit, any
+        parsed partial usage is retained; inspect ``exit_code``.
         """
         self._check_alive()
         parsers = {
@@ -683,10 +686,12 @@ class Sandbox:
             "opencode": parse_opencode_result,
             "grok": parse_grok_result,
             "codex": parse_codex_result,
+            "antigravity": parse_antigravity_result,
         }
         if harness not in parsers:
             raise ValueError(f"Unsupported agent harness: {harness!r}")
-        command = command or ("claude" if harness == "claude-code" else harness)
+        binaries = {"claude-code": "claude", "antigravity": "agy"}
+        command = command or binaries.get(harness, harness)
         if harness == "opencode":
             if output_format not in {"json", "default", "text"}:
                 raise ValueError(
@@ -722,6 +727,13 @@ class Sandbox:
                 "--output-format",
                 "plain" if output_format == "text" else output_format,
             ]
+        elif harness == "antigravity":
+            if output_format not in {"json", "stream-json", "text"}:
+                raise ValueError(
+                    "Antigravity output_format must be json, stream-json, "
+                    "or text"
+                )
+            args = ["--output-format", output_format]
         else:
             args = ["-p", prompt, "--output-format", output_format]
         if resume and harness != "codex":
@@ -735,6 +747,12 @@ class Sandbox:
         elif harness == "grok":
             # Equals form keeps leading hyphens in prompts from becoming flags.
             args.append(f"--single={prompt}")
+        elif harness == "antigravity":
+            # Same for agy's -p/--print, but agy still rejects a prompt that
+            # is exactly one of its flag names, e.g. "-c" (exit code 2). The
+            # equals form also keeps the local backend from rebasing a prompt
+            # that starts with "/" as if it were a path.
+            args.append(f"--print={prompt}")
 
         start = time.monotonic()
         with telemetry.span(telemetry.OP_EXEC, self._config.backend) as sp:

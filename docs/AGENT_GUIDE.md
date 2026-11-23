@@ -126,7 +126,10 @@ with client.create(
 ```
 
 Use `harness="grok"` with the `grok` preset and `XAI_API_KEY` to record
-Grok's reported spend. JSON output is selected automatically. Hosted runs
+Grok's reported spend. Use `harness="antigravity"` with the `antigravity`
+preset and `GEMINI_API_KEY` to record Antigravity token counts. The
+Antigravity CLI does not report a dollar cost, so the dashboard shows its cost
+as unavailable. JSON output is selected automatically. Hosted runs
 are persisted once per idempotency key; repeating the same request returns
 its saved response. A changed request with the same key is rejected.
 An in-progress, failed, or interrupted request without a saved result returns
@@ -155,8 +158,8 @@ Direct `Sandbox.run_agent` calls and raw shell commands are not uploaded to
 the control plane; earlier runs cannot be backfilled automatically.
 
 `run_agent` supports `harness="claude-code"` (default), `"opencode"`,
-`"grok"`, and `"codex"`. Select the installation preset and runtime harness
-separately. The sync and async clients expose the same options.
+`"grok"`, `"codex"`, and `"antigravity"`. Select the installation preset and
+runtime harness separately. The sync and async clients expose the same options.
 
 For [Grok Build](https://docs.x.ai/build/cli/headless-scripting):
 
@@ -223,6 +226,112 @@ Usage normalization follows the CLI reports:
 - Raw events and session metadata remain in `result.raw`; inspect Grok's
   `usage_is_incomplete` / `cost_is_partial` flags when present. stdout, stderr,
   exit status, and any parsed usage are retained on failure.
+
+For the [Antigravity CLI](https://antigravity.google/docs/cli/headless/), use
+the `antigravity` preset with `harness="antigravity"`. The CLI command is `agy`.
+
+```python
+import os
+from bespokelabs.sandbox import Sandbox
+
+with Sandbox(
+    "docker", preset="antigravity",
+    env_vars={"GEMINI_API_KEY": os.environ["GEMINI_API_KEY"]},
+) as sb:
+    result = sb.run_agent(
+        "Summarize what a git rebase does.", harness="antigravity",
+        model="gemini-3.8-flash-medium", extra_args=["--print-timeout", "15m"],
+    )
+    print(result.text, result.usage.total_tokens)
+    print(result.raw["status"], result.raw["conversation_id"])
+    sb.run_agent("Show an example.", harness="antigravity", resume=True)
+```
+
+The preset runs Google's install script, which downloads a native `agy`
+binary. Node.js is not needed. If `agy` is already on `PATH`, setup skips the
+download. On Docker, Daytona, and Modal, setup first uses `apt-get` to install
+`curl` and Git when they are missing. On other backends, the sandbox must
+already have these tools:
+
+- `bash` and `curl`
+- `tar` and `sha512sum`, which most Linux images include
+
+`run_agent` calls `agy` by name, so setup tries to put `agy` on `PATH`. `agy`
+is installed in `/usr/local/bin` when that directory is writable, and in
+`~/.local/bin` otherwise. On Docker, Daytona, and Modal, if `agy` is then not
+on `PATH` and the user has passwordless `sudo`, setup links `agy` into
+`/usr/local/bin`. If `agy` is still not on `PATH`, pass its full path to
+`run_agent`, e.g., `command="/home/user/.local/bin/agy"`.
+
+Pass `GEMINI_API_KEY` when you create the sandbox. The Antigravity CLI reads
+this key only when its settings file selects the `gemini` provider. The CLI
+also refuses to start when that provider is selected without a key. So the
+preset writes `{"modelProvider": "gemini"}` to
+`~/.gemini/antigravity-cli/settings.json` only when `GEMINI_API_KEY` is set at
+creation. It skips this step when that file already exists or when
+`AGY_ADC_AUTH` is set. On the local backend, `~` is the sandbox working
+directory, so your own Antigravity settings are not changed. To use Google
+Cloud Application Default Credentials instead, set `AGY_ADC_AUTH=true` and put
+the credentials in the sandbox yourself. You create these credentials with
+`gcloud auth application-default login`. Signing in with a Google account needs
+a browser, so it does not work in a new sandbox. Without a key or other
+credentials, `agy` prints a Google sign-in link to stderr and waits 60 seconds
+for someone to sign in. Then the run fails with exit code 1.
+
+`run_agent` runs `agy --output-format json --print=<prompt>`. The prompt is
+passed with `--print=` so that a prompt that starts with `-` is not read as a
+flag. The CLI still rejects a prompt that is only one of its flag names, e.g.,
+`--version`, and exits with code 2. A prompt that starts with `/` runs a CLI
+slash command. To send such a prompt as plain text, pass
+`extra_args=["--disable-slash-commands"]`.
+`resume=True` adds `-c`, which continues the most recent conversation in the
+working directory. `model=` adds `--model`. Run `agy models` in the sandbox to
+list the model names.
+
+`output_format` accepts these values:
+
+- `"json"` is the default. The CLI prints one JSON result when the run ends.
+- `"stream-json"` prints one JSON event per line. The SDK reads the events
+  after the command finishes, not while it runs.
+- `"text"` prints only the answer, with no token counts.
+
+The helper adds no flags that skip permission checks. In headless mode, there
+is no prompt where someone can approve a tool call. The CLI refuses each
+action that needs approval. It prints a notice about each refused action to
+stderr. The run continues and can still exit with code 0. Check
+`result.stderr` when a run did less than you expected. To allow actions ahead
+of time, add rules under
+`permissions.allow` in `~/.gemini/antigravity-cli/settings.json`, e.g.,
+`"command(git)"`. To approve every tool call, pass
+`extra_args=["--dangerously-skip-permissions"]`. Use that flag only in an
+isolated sandbox with credentials you are willing to expose.
+
+The CLI sets no time limit on a headless run. The sandbox's `timeout_secs` can
+still stop a run. The `antigravity` preset sets it to 1800 seconds unless you
+pass your own value. On Docker, for example, `timeout_secs` is a timeout for
+each command, so a `run_agent` call stops after 30 minutes. The
+[SDK reference](SDK_REFERENCE.md#creating-a-sandbox) explains how each backend
+uses it. When the sandbox stops a run this way, the CLI does not print its
+final result. To get a final result, give the CLI a shorter limit, e.g.,
+`extra_args=["--print-timeout", "15m"]`. A run stopped by the CLI's limit
+exits with code 3, and its answer is partial. Its
+`result.raw["finished_reason"]` is `"print_timeout"`.
+
+Usage follows the Antigravity report:
+
+- Antigravity's `input_tokens` already excludes cache reads. Its
+  `output_tokens` already includes thinking tokens, so the SDK does not add
+  `thinking_tokens` again.
+- `result.usage.total_tokens` includes cache reads. The CLI's own
+  `total_tokens` does not, so the two totals differ.
+- The CLI reports no dollar cost. `llm_cost_usd` stays `0`, which means
+  unknown, not free.
+- In `stream-json` output, the final `result` event holds the totals for the
+  run. If the stream stops early, the SDK adds up the usage reported for each
+  step and counts each step once.
+- `result.raw` keeps the fields of the CLI's JSON result, e.g.,
+  `conversation_id`. A failed run has a `status` other than `"SUCCESS"` and an
+  `error` message.
 
 To run GLM through the [OpenCode harness](https://opencode.ai/docs/cli/#run):
 
@@ -318,8 +427,8 @@ cold-start and execution time, then estimates cost with the same pricing data.
 ## Presets
 
 Presets combine agent installation commands with resource and environment
-defaults. The built-in presets are `codex`, `grok`, `claude-code`,
-`claude-code-codex`, and `opencode`.
+defaults. The built-in presets are `antigravity`, `codex`, `grok`,
+`claude-code`, `claude-code-codex`, and `opencode`.
 
 ### Installation and custom images
 
@@ -339,14 +448,21 @@ missing prerequisites with `apt-get` on Debian/Ubuntu base images before
 running `npm install -g`. Custom images need those tools already available or
 root access to a working `apt-get`. Choose a Node.js version supported by the
 CLI you install. Setup runs before repository cloning and file/workspace
-materialization. A failed setup triggers sandbox cleanup.
+materialization. A failed setup triggers sandbox cleanup. The `antigravity`
+preset does not use npm. It installs `curl` and Git when they are missing and
+then runs Google's install script, as described in
+[Token usage & cost](#token-usage--cost).
 
 Installation requires network access, adds startup time, and uses the npm
-package version resolved at creation. Credentials are supplied separately.
+package version resolved at creation. The `antigravity` preset installs the
+newest `agy` release at creation. The CLI also updates itself in the
+background, so a long-lived sandbox can move to a newer version. Credentials
+are supplied separately.
 Tensorlake uses a writable npm prefix; boxd checks the tools already present
 for its supported presets. Other backends need Node.js/npm and installation
 permissions. On Local and Ray, setup runs on the host/worker and can install
-global npm packages.
+global npm packages. The `antigravity` preset can also put `agy` in the
+host's `/usr/local/bin` when that folder is writable.
 
 Passing `image=` with a built-in preset changes the base image and still runs
 installation. To use your own image with the tools already installed and skip
@@ -380,6 +496,7 @@ Built-in presets:
 
 | Preset | What it installs | Defaults |
 |---|---|---|
+| `antigravity` | `agy` from Google's install script (native binary, no Node.js) | 2GB RAM, 30min timeout |
 | `claude-code` | `@anthropic-ai/claude-code` via npm | 2GB RAM, 30min timeout |
 | `claude-code-codex` | `@anthropic-ai/claude-code` and `@openai/codex` via npm | 2GB RAM, 30min timeout |
 | `codex` | `@openai/codex` via npm | 2GB RAM, 30min timeout |
