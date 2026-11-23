@@ -70,14 +70,30 @@ def get_preset(name: str) -> SandboxPreset:
 
 
 def _container_npm_install(packages: str) -> list[str]:
-    """Install prerequisites on Debian/Ubuntu base images, then the CLI."""
+    """Install prerequisites on Debian/Ubuntu base images, then the CLI.
+
+    Root runs both steps directly. A non-root user, such as Daytona's
+    `daytona` user, runs apt-get with passwordless sudo, because apt-get needs
+    root. sudo resets the environment, so env passes DEBIAN_FRONTEND through.
+
+    A non-root user runs npm with sudo too, because the global npm folders are
+    usually owned by root, e.g., apt puts them under /usr/local. In the
+    daytonaio/sandbox:latest image, root also installed some of these CLIs
+    into npm folders that the `daytona` user owns. npm cannot replace those
+    copies as that user. env passes PATH through, because an npm installed
+    with nvm is not on sudo's PATH. A user without passwordless sudo runs npm
+    directly, which works when that user owns the global npm folders.
+    """
+    install = f"npm install -g {packages}"
     return [
         "(command -v node >/dev/null 2>&1 && "
         "command -v npm >/dev/null 2>&1 && "
         "command -v git >/dev/null 2>&1) || "
-        "(apt-get update && DEBIAN_FRONTEND=noninteractive "
+        '(s=; [ "$(id -u)" -eq 0 ] || s="sudo -n"; '
+        "$s apt-get update && $s env DEBIAN_FRONTEND=noninteractive "
         "apt-get install -y --no-install-recommends nodejs npm git)",
-        f"npm install -g {packages}",
+        'if [ "$(id -u)" -ne 0 ] && sudo -n true 2>/dev/null; then '
+        f'sudo -n env PATH="$PATH" {install}; else {install}; fi',
     ]
 
 
