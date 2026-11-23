@@ -529,6 +529,18 @@ class RunpodSession:
         """Return the RunPod Pod ID while it is attached."""
         return self._pod_id
 
+    @property
+    def native(self) -> Any:
+        """RunPod is driven over REST and SSH; there is no SDK object.
+
+        Use ``Sandbox.provider_resource_id`` (the Pod ID) with RunPod's own API.
+        """
+        raise FeatureNotSupportedError(
+            "The runpod backend has no provider object to expose",
+            backend="runpod",
+            op="native",
+        )
+
     def destroy(self) -> None:
         pod_id = self._pod_id
         if pod_id is None:

@@ -296,6 +296,17 @@ class AsyncSandbox:
         return self._sandbox.is_alive
 
     @property
+    def native(self) -> Any:
+        """Return the provider SDK's own object; see :attr:`Sandbox.native`.
+
+        The object is the provider's synchronous SDK object, so its methods
+        block.  Call them off the event loop, for example
+        ``await asyncio.to_thread(sb.native.stats, stream=False)``, or use the
+        provider's own async API.
+        """
+        return self._sandbox.native
+
+    @property
     def usage(self) -> Usage:
         """Cumulative token + cost usage across all :meth:`run_agent` calls."""
         return self._sandbox.usage

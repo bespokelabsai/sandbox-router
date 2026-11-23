@@ -7,6 +7,7 @@ import os
 import pathlib
 import tarfile
 import threading
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -157,6 +158,14 @@ class DockerSession:
         """Return the Docker container ID while it is attached."""
         value = getattr(self._container, "id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the docker SDK ``Container`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._container
 
     def execute_code(
         self, code: str, language: str = "python"

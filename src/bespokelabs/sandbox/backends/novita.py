@@ -7,7 +7,7 @@ import pathlib
 import re
 import shlex
 from contextlib import contextmanager
-from typing import Iterator
+from typing import Any, Iterator
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -226,6 +226,14 @@ class NovitaSession:
     @property
     def provider_resource_id(self) -> str:
         return self._sandbox.sandbox_id
+
+    @property
+    def native(self) -> Any:
+        """Return the Novita SDK ``Sandbox`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"
