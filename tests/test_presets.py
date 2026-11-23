@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from bespokelabs.sandbox import Sandbox
@@ -13,6 +19,7 @@ from bespokelabs.sandbox.presets import (
 from bespokelabs.sandbox.types import SandboxResult
 
 BUILT_IN_PRESETS = {
+    "antigravity",
     "claude-code",
     "claude-code-codex",
     "codex",
@@ -61,6 +68,45 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(
             preset.backend_setup_commands["docker"][1], preset.setup_commands[0]
         )
+        self.assertEqual(preset.memory_mb, 2048)
+        self.assertEqual(preset.timeout_secs, 1800)
+        self.assertTrue(preset.allow_internet)
+
+    def test_antigravity_installs_native_cli_on_path(self):
+        preset = get_preset("antigravity")
+        install, settings = preset.setup_commands
+        self.assertIsNone(preset.image)
+        self.assertTrue(preset.setup_before_workspace)
+        self.assertIn(
+            "curl -fsSL https://antigravity.google/cli/install.sh", install
+        )
+        # ~/.local/bin is only the fallback because exec calls often miss it.
+        self.assertIn("dir=/usr/local/bin", install)
+        self.assertIn('--dir "$dir"', install)
+        self.assertTrue(
+            install.startswith("if command -v agy; then agy --version; else")
+        )
+        self.assertTrue(install.endswith('"$dir/agy" --version; fi'))
+        # Hosts never get sudo; only isolated containers may link with it.
+        self.assertNotIn("sudo", install)
+        self.assertIn('[ -n "${GEMINI_API_KEY:-}" ]', settings)
+        self.assertIn('{"modelProvider": "gemini"}', settings)
+        link = (
+            'command -v agy || sudo -n ln -sf "$dir/agy" /usr/local/bin/agy; '
+        )
+        for backend in ("docker", "daytona", "modal"):
+            prerequisites, container_install, container_settings = (
+                preset.backend_setup_commands[backend]
+            )
+            self.assertIn(
+                "apt-get install -y --no-install-recommends "
+                "ca-certificates curl git",
+                prerequisites,
+            )
+            self.assertIn(link, container_install)
+            self.assertEqual(container_install.replace(link, ""), install)
+            self.assertEqual(container_settings, settings)
+        self.assertNotIn("tensorlake", preset.backend_setup_commands)
         self.assertEqual(preset.memory_mb, 2048)
         self.assertEqual(preset.timeout_secs, 1800)
         self.assertTrue(preset.allow_internet)
@@ -138,6 +184,171 @@ class PresetTests(unittest.TestCase):
         presets = Sandbox.list_presets()
 
         self.assertEqual(set(presets), BUILT_IN_PRESETS)
+
+
+class AntigravityContainerPrerequisiteTests(unittest.TestCase):
+    """Run the container prerequisite step against stub system commands.
+
+    PATH holds only the stubs, so curl and git are missing unless a test
+    adds them. Like the real sudo, the stub sudo drops the caller's
+    environment before it runs the command.
+    """
+
+    INSTALL = (
+        "apt-get install -y --no-install-recommends ca-certificates curl git"
+    )
+
+    def run_step(self, shell, uid, tools=()):
+        stubs = {
+            "id": 'echo "$FAKE_UID"',
+            "sudo": (
+                'echo "sudo $*" >> "$LOG"; [ "$1" = -n ] && shift; '
+                'exec /usr/bin/env -i PATH="$PATH" LOG="$LOG" "$@"'
+            ),
+            "apt-get": 'echo "apt-get $* (${DEBIAN_FRONTEND:-unset})" >> "$LOG"',
+            **dict.fromkeys(tools, "exit 0"),
+        }
+        step = get_preset("antigravity").backend_setup_commands["docker"][0]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name, body in stubs.items():
+                stub = root / name
+                stub.write_text(f"#!/bin/sh\n{body}\n")
+                stub.chmod(0o755)
+            (root / "env").symlink_to("/usr/bin/env")
+            log = root / "log"
+            subprocess.run(
+                [shell, "-c", step],
+                env={"PATH": temp, "LOG": str(log), "FAKE_UID": str(uid)},
+                check=True,
+            )
+            return log.read_text().splitlines() if log.exists() else []
+
+    def shells(self):
+        found = {name: shutil.which(name) for name in ("sh", "bash", "dash")}
+        return {name: path for name, path in found.items() if path}
+
+    def test_root_runs_apt_get_directly(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 0),
+                    [
+                        "apt-get update (unset)",
+                        f"{self.INSTALL} (noninteractive)",
+                    ],
+                )
+
+    def test_non_root_user_runs_apt_get_with_sudo(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 1000),
+                    [
+                        "sudo -n apt-get update",
+                        "apt-get update (unset)",
+                        "sudo -n env DEBIAN_FRONTEND=noninteractive "
+                        + self.INSTALL,
+                        f"{self.INSTALL} (noninteractive)",
+                    ],
+                )
+
+    def test_installed_tools_skip_apt_get(self):
+        for name, shell in self.shells().items():
+            with self.subTest(shell=name):
+                self.assertEqual(
+                    self.run_step(shell, 1000, tools=("curl", "git")), []
+                )
+
+
+class AntigravityLocalSetupTests(unittest.TestCase):
+    """Run the setup commands through the local backend's shell prelude.
+
+    A stub ``agy`` on PATH skips the download. The local backend sets HOME
+    to the workdir and rewrites absolute paths, so this also checks that
+    the settings file lands in the sandbox HOME exactly once.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.bin = root / "bin"
+        self.bin.mkdir()
+        agy = self.bin / "agy"
+        agy.write_text('#!/bin/sh\necho "agy 1.5.13"\n')
+        agy.chmod(0o755)
+        self.workdir = root / "work"
+        self.workdir.mkdir()
+        self.settings = self.workdir / ".gemini/antigravity-cli/settings.json"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def create(self, **env):
+        path = os.pathsep.join([str(self.bin), "/usr/bin", "/bin"])
+        return Sandbox(
+            "local",
+            preset="antigravity",
+            workdir=str(self.workdir),
+            env_vars={"PATH": path, "AGY_ADC_AUTH": "", **env},
+        )
+
+    def test_api_key_selects_gemini_provider_in_sandbox_home(self):
+        with self.create(GEMINI_API_KEY="test-key"):
+            self.assertEqual(
+                json.loads(self.settings.read_text()),
+                {"modelProvider": "gemini"},
+            )
+
+    def test_install_passes_target_dir_to_google_script(self):
+        # A stub curl serves a fake installer, and a temp directory stands
+        # in for /usr/local/bin, so the test needs no network or root.
+        (self.bin / "agy").unlink()
+        target = Path(self.temp.name) / "target"
+        target.mkdir()
+        installer = (
+            'while [ $# -gt 0 ]; do [ "$1" = --dir ] && dir=$2; shift; done\n'
+            "printf '#!/bin/sh\\necho agy 1.5.13\\n' > \"$dir/agy\"\n"
+            'chmod +x "$dir/agy"\n'
+        )
+        curl = self.bin / "curl"
+        curl.write_text(
+            "#!/bin/sh\n"
+            'while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
+            f"cat > \"$out\" <<'EOF'\n{installer}EOF\n"
+        )
+        curl.chmod(0o755)
+        preset = SandboxPreset(
+            name="_antigravity_install_check",
+            description="Antigravity install with a stub installer",
+            setup_commands=[
+                command.replace("/usr/local/bin", str(target))
+                for command in get_preset("antigravity").setup_commands
+            ],
+        )
+        path = os.pathsep.join([str(self.bin), str(target), "/usr/bin", "/bin"])
+        with Sandbox(
+            "local",
+            preset=preset,
+            workdir=str(self.workdir),
+            env_vars={"PATH": path, "GEMINI_API_KEY": ""},
+        ) as sb:
+            self.assertEqual(
+                sb.execute_command("agy", ["--version"]).stdout,
+                "agy 1.5.13\n",
+            )
+
+    def test_settings_untouched_without_key_with_adc_or_existing(self):
+        for env in (
+            {"GEMINI_API_KEY": ""},
+            {"GEMINI_API_KEY": "test-key", "AGY_ADC_AUTH": "true"},
+        ):
+            with self.subTest(env=env), self.create(**env):
+                self.assertFalse(self.settings.exists())
+        self.settings.parent.mkdir(parents=True)
+        self.settings.write_text('{"keep": true}')
+        with self.create(GEMINI_API_KEY="test-key"):
+            self.assertEqual(self.settings.read_text(), '{"keep": true}')
 
 
 class PresetImageResolutionTests(unittest.TestCase):
@@ -221,15 +432,12 @@ class PresetImageResolutionTests(unittest.TestCase):
                     files={"repo/input.txt": "data"},
                 ) as sb,
             ):
-                provisioning, install = get_preset(name).backend_setup_commands[
-                    "docker"
-                ]
+                setup = get_preset(name).backend_setup_commands["docker"]
                 self.assertIsNone(sb._config.image)
                 self.assertEqual(
                     sb._session.mock_calls,
-                    [
-                        mock.call.execute_command(provisioning),
-                        mock.call.execute_command(install),
+                    [mock.call.execute_command(command) for command in setup]
+                    + [
                         mock.call.execute_command(
                             "git clone --depth 1 https://example.com/repo.git repo",
                             None,
@@ -242,7 +450,8 @@ class PresetImageResolutionTests(unittest.TestCase):
         from bespokelabs.sandbox.exceptions import SandboxCreationError
 
         for name in BUILT_IN_PRESETS:
-            for failed_step in (0, 1):
+            setup = get_preset(name).backend_setup_commands["docker"]
+            for failed_step in range(len(setup)):
                 with self.subTest(preset=name, failed_step=failed_step):
                     session = mock.MagicMock()
                     session.execute_command.side_effect = [
@@ -268,15 +477,27 @@ class PresetImageResolutionTests(unittest.TestCase):
         for backend in ("docker", "daytona", "modal"):
             for name in BUILT_IN_PRESETS:
                 with self.subTest(backend=backend, preset=name):
+                    preset = get_preset(name)
                     with Sandbox(backend, preset=name) as sb:
                         self.assertIsNone(sb._config.image)
-                        commands = sb._session.execute_command.call_args_list
-                        self.assertEqual(len(commands), 2)
-                        self.assertIn("nodejs npm git", commands[0].args[0])
+                        commands = [
+                            call.args[0]
+                            for call in sb._session.execute_command.call_args_list
+                        ]
                         self.assertEqual(
-                            commands[1].args[0],
-                            get_preset(name).setup_commands[0],
+                            commands, preset.backend_setup_commands[backend]
                         )
+                        self.assertIn(
+                            "apt-get install -y --no-install-recommends",
+                            commands[0],
+                        )
+                        # After provisioning, npm presets run the same install
+                        # as other backends. Antigravity's container install
+                        # adds a sudo link step, covered by its own test.
+                        if name != "antigravity":
+                            self.assertEqual(
+                                commands[1:], preset.setup_commands
+                            )
 
     def test_builtin_preset_keeps_explicit_base_image_and_installs(self):
         for backend in ("docker", "daytona", "modal"):
