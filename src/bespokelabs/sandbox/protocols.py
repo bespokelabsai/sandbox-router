@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from bespokelabs.sandbox.types import (
     FileInfo,
@@ -22,6 +22,16 @@ class SandboxBackendSession(Protocol):
     @property
     def provider_resource_id(self) -> str | None:
         """Provider-owned resource ID, or ``None`` for local-only sessions."""
+        ...
+
+    @property
+    def native(self) -> Any:
+        """The provider SDK's own object for this sandbox (not portable).
+
+        Raise ``FeatureNotSupportedError`` when the backend has no provider
+        object.  ``Sandbox.native`` also raises it for sessions that do not
+        define this property, so out-of-tree backends keep working.
+        """
         ...
 
     def execute_code(self, code: str, language: str) -> SandboxResult:

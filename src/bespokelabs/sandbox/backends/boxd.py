@@ -644,6 +644,17 @@ class BoxdSession:
         """Return the boxd machine ID until the machine is destroyed."""
         return self._machine_id
 
+    @property
+    def native(self) -> Any:
+        """Return the authenticated ``boxd`` SDK client.
+
+        boxd has no per-machine object: pass ``Sandbox.provider_resource_id``
+        as the machine id to ``client.machines.*`` calls.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._client
+
     # -- Internal ----------------------------------------------------------
 
     def _call(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import pathlib
+from typing import Any
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -123,7 +124,9 @@ class ModalClient:
                 # its labels are that filter, not the sandbox's whole tag set.
                 complete = callable(get_tags)
                 tags = get_tags() if complete else labels
-                own = {str(key): str(value) for key, value in (tags or {}).items()}
+                own = {
+                    str(key): str(value) for key, value in (tags or {}).items()
+                }
                 if any(own.get(key) != value for key, value in labels.items()):
                     continue
                 listings.append(
@@ -133,7 +136,8 @@ class ModalClient:
                         state="running",
                         created_at=None,
                         session_state=SandboxSessionState(
-                            backend="modal", data={"sandbox_id": str(sandbox_id)}
+                            backend="modal",
+                            data={"sandbox_id": str(sandbox_id)},
                         ),
                         labels_complete=complete,
                     )
@@ -231,6 +235,14 @@ class ModalSession:
         """Return the Modal sandbox object ID while it is attached."""
         value = getattr(self._sandbox, "object_id", None)
         return str(value) if value is not None else None
+
+    @property
+    def native(self) -> Any:
+        """Return the ``modal.Sandbox`` object.
+
+        Not portable: see ``Sandbox.native``.
+        """
+        return self._sandbox
 
     def execute_code(
         self, code: str, language: str = "python"

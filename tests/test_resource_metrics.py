@@ -5,7 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -24,6 +24,9 @@ from bespokelabs.sandbox.control_plane.service import ControlPlane
 from bespokelabs.sandbox.control_plane.store import SQLiteStore
 from bespokelabs.sandbox.exceptions import SandboxError
 from bespokelabs.sandbox.types import SandboxConfig, SandboxResult
+
+UTC = timezone.utc
+
 
 RAW = {
     "cpu_seconds": 10,

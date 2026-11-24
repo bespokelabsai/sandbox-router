@@ -147,7 +147,9 @@ class RetentionPolicyUpdate(BaseModel):
 
 class AgentRequest(BaseModel):
     prompt: str = Field(min_length=1)
-    harness: Literal["claude-code", "opencode", "grok", "codex"] = "claude-code"
+    harness: Literal[
+        "claude-code", "opencode", "grok", "codex", "antigravity"
+    ] = "claude-code"
     model: str | None = None
     command: str | None = None
     extra_args: list[str] | None = None

@@ -7,7 +7,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -30,6 +30,9 @@ try:
 except ImportError:  # pragma: no cover - server extra is optional
     TestClient = None
     create_app = None
+
+
+UTC = timezone.utc
 
 
 class MutableClock:

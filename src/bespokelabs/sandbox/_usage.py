@@ -1,7 +1,7 @@
 """Parse agent CLI output into a normalized :class:`Usage`.
 
-Supports Claude Code, OpenCode, Grok Build, and Codex JSON output.
-``Sandbox.run_agent`` is the single caller.
+Supports Claude Code, OpenCode, Grok Build, Codex, and Antigravity CLI JSON
+output. ``Sandbox.run_agent`` is the single caller.
 """
 
 from __future__ import annotations
@@ -263,6 +263,68 @@ def parse_grok_result(stdout: str) -> dict | None:
         )
     ):
         record["total_cost_usd"] = usage.llm_cost_usd
+    return record
+
+
+def parse_antigravity_result(stdout: str) -> dict | None:
+    """Normalize Antigravity CLI ``json`` output and ``stream-json`` events.
+
+    The ``json`` envelope, or a stream's terminal ``result`` event, carries
+    the run's cumulative usage and is authoritative. If a stream is cut
+    short, recover usage from per-step reports, keeping the latest report for
+    each step so a repeated update is counted once. Antigravity input
+    already excludes cache reads and output already includes thinking
+    tokens, so neither is adjusted. The CLI reports no dollar cost; an
+    undocumented cost field is dropped rather than trusted.
+    """
+    events = []
+    terminal = None
+    steps = {}
+    answers = {}
+    for index, event in enumerate(_json_records(stdout)):
+        kind = event.get("event")
+        payload = event.get(kind) if isinstance(kind, str) else None
+        if kind is None and isinstance(event.get("status"), str):
+            terminal = event  # The --output-format json envelope.
+        elif kind == "result" and isinstance(payload, dict):
+            terminal = payload
+        elif kind == "step_update" and isinstance(payload, dict):
+            conversation = payload.get("conversation_id")
+            step = payload.get("step_index")
+            key = (
+                (conversation if isinstance(conversation, str) else None, step)
+                if isinstance(step, int) and not isinstance(step, bool)
+                else index
+            )
+            if isinstance(payload.get("usage"), dict):
+                steps[key] = payload["usage"]
+            if payload.get("step_type") == "agent_response" and isinstance(
+                payload.get("text_delta"), str
+            ):
+                answers.setdefault(key, []).append(payload["text_delta"])
+        elif not (kind == "init" and isinstance(payload, dict)):
+            continue
+        events.append(event)
+    if not events:
+        return None
+    if terminal is not None and isinstance(terminal.get("usage"), dict):
+        reports = [terminal["usage"]]
+    else:
+        reports = list(steps.values())
+    usage = Usage()
+    for tokens in reports:
+        usage += Usage(
+            input_tokens=_int(tokens.get("input_tokens")),
+            output_tokens=_int(tokens.get("output_tokens")),
+            cache_read_tokens=_int(tokens.get("cache_read_tokens")),
+        )
+    terminal = terminal or {}
+    text = terminal.get("response")
+    if not isinstance(text, str):
+        # Without a result, the latest response step is the partial answer.
+        text = "".join(next(reversed(answers.values()), []))
+    record = {**terminal, **_normalized_result(text, usage, events)}
+    record.pop("total_cost_usd", None)
     return record
 
 
