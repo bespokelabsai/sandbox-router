@@ -31,7 +31,8 @@ BUILT_IN_PRESETS = {
 TENSORLAKE_NPM_PREFIX = "mkdir -p $HOME/.npm-global && npm config set prefix $HOME/.npm-global && npm install -g"
 # These are the setup commands for npm presets on Docker, Daytona, and Modal.
 # A non-root user runs apt-get with sudo, and npm with sudo when passwordless
-# sudo works. npm under sudo keeps the user's environment and npm config file.
+# sudo works. npm under sudo keeps the user's environment and npm config file,
+# and it installs into the user's global npm folder.
 CONTAINER_PREREQUISITES = (
     "(command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && "
     "command -v git >/dev/null 2>&1) || "
@@ -42,7 +43,8 @@ CONTAINER_PREREQUISITES = (
 CONTAINER_NPM_INSTALL = (
     'if [ "$(id -u)" -ne 0 ] && sudo -n -E -H true 2>/dev/null; then '
     'sudo -n -E -H env PATH="$PATH" '
-    'npm_config_userconfig="$(npm config get userconfig)" {install}; '
+    'npm_config_userconfig="$(npm config get userconfig)" '
+    'npm_config_prefix="$(npm prefix -g)" {install}; '
     "else {install}; fi"
 )
 
@@ -222,27 +224,51 @@ class ContainerNpmInstallTests(unittest.TestCase):
     APT_INSTALL = "apt-get install -y --no-install-recommends nodejs npm git"
     NPM_INSTALL = f"npm install -g {PACKAGES}"
     REGISTRY = "https://registry.example.test/"
-    # The stub npm prints the default npm config file path, like the real
-    # npm. For an install, it logs the HOME and npm settings it sees.
+    # Like the real npm, the stub npm reads its global folder (prefix) from
+    # the environment, and then from the user's npm config file. It reads a
+    # leading ~/ relative to HOME. Without a setting, the folder is
+    # /usr/local. The stub prints the npm config file path and the global
+    # folder. For an install, it logs the HOME and npm settings it sees.
     NPM_STUB = textwrap.dedent(
         """\
-        if [ "$*" = "config get userconfig" ]; then
-          echo "${npm_config_userconfig:-$HOME/.npmrc}"
-          exit
+        config=${npm_config_userconfig:-$HOME/.npmrc}
+        prefix=$npm_config_prefix
+        if [ -z "$prefix" ] && [ -f "$config" ]; then
+          while IFS= read -r line; do
+            case $line in prefix=*) prefix=${line#prefix=} ;; esac
+          done < "$config"
         fi
+        case $prefix in
+          "~/"*) prefix=$HOME/${prefix#"~/"} ;;
+          "") prefix=/usr/local ;;
+        esac
+        case "$*" in
+          "config get userconfig") echo "$config"; exit ;;
+          "prefix -g") echo "$prefix"; exit ;;
+        esac
         echo "npm $* (uid $(id -u), HOME=$HOME," \\
           "userconfig=${npm_config_userconfig:-default}," \\
-          "registry=${npm_config_registry:-default})" >> "$LOG"
+          "prefix=$prefix, registry=${npm_config_registry:-default})" >> "$LOG"
     """
     )
 
-    def run_steps(self, shell, uid, *, sudo="nopasswd", tools=()):
-        """Run each setup step in its own shell and return the stub log."""
+    def run_steps(
+        self, shell, uid, *, sudo="nopasswd", tools=(), npmrc=None, user_env=()
+    ):
+        """Run each setup step in its own shell and return the stub log.
+
+        npmrc is the text of the user's npm config file. user_env holds extra
+        environment variables for the user.
+        """
         steps = get_preset("claude-code-codex").backend_setup_commands["docker"]
         with tempfile.TemporaryDirectory() as temp:
             system, nvm = Path(temp, "system"), Path(temp, "nvm")
             system.mkdir()
             nvm.mkdir()
+            home = Path(temp, "home")
+            if npmrc is not None:
+                home.mkdir()
+                (home / ".npmrc").write_text(npmrc)
             root = f"PATH={shlex.quote(str(system))} FAKE_UID=0"
             sudo_stubs = {
                 "nopasswd": textwrap.dedent(
@@ -284,10 +310,11 @@ class ContainerNpmInstallTests(unittest.TestCase):
             log = Path(temp, "log")
             env = {
                 "PATH": f"{nvm}:{system}",
-                "HOME": str(Path(temp, "home")),
+                "HOME": str(home),
                 "LOG": str(log),
                 "FAKE_UID": str(uid),
                 "npm_config_registry": self.REGISTRY,
+                **dict(user_env),
             }
             for step in steps:
                 subprocess.run([shell, "-c", step], env=env, check=True)
@@ -298,22 +325,24 @@ class ContainerNpmInstallTests(unittest.TestCase):
         found = {name: shutil.which(name) for name in ("sh", "bash", "dash")}
         return {name: path for name, path in found.items() if path}
 
-    def npm_log(self, uid, home, userconfig="default"):
+    def npm_log(self, uid, home, userconfig="default", prefix="/usr/local"):
         """Return the line the stub npm logs for the install."""
         return (
             f"{self.NPM_INSTALL} (uid {uid}, HOME={home}, "
-            f"userconfig={userconfig}, registry={self.REGISTRY})"
+            f"userconfig={userconfig}, prefix={prefix}, "
+            f"registry={self.REGISTRY})"
         )
 
-    def sudo_npm_log(self):
+    def sudo_npm_log(self, prefix="/usr/local"):
         """Return the log lines for npm with passwordless sudo."""
         return [
             "sudo -n -E -H true",
             "sudo -n -E -H env PATH=$TMP/nvm:$TMP/system "
-            f"npm_config_userconfig=$TMP/home/.npmrc {self.NPM_INSTALL}",
+            "npm_config_userconfig=$TMP/home/.npmrc "
+            f"npm_config_prefix={prefix} {self.NPM_INSTALL}",
             # npm runs as root with root's HOME, the user's registry setting,
-            # and the user's npm config file.
-            self.npm_log(0, "/root", "$TMP/home/.npmrc"),
+            # the user's npm config file, and the user's global npm folder.
+            self.npm_log(0, "/root", "$TMP/home/.npmrc", prefix),
         ]
 
     def test_root_runs_apt_get_and_npm_directly(self):
@@ -350,6 +379,24 @@ class ContainerNpmInstallTests(unittest.TestCase):
                     self.run_steps(shell, 1000, tools=("node", "git")),
                     self.sudo_npm_log(),
                 )
+
+    def test_sudo_npm_uses_the_users_global_folder(self):
+        # npm's docs suggest prefix=~/.npm-global. npm reads ~ relative to
+        # HOME, and sudo -H sets HOME to /root. Without the folder from the
+        # user's npm, root would install the CLI into /root/.npm-global.
+        cases = {
+            "npmrc": {"npmrc": "prefix=~/.npm-global\n"},
+            "env": {"user_env": {"npm_config_prefix": "~/.npm-global"}},
+        }
+        for name, shell in self.shells().items():
+            for where, user_setting in cases.items():
+                with self.subTest(shell=name, where=where):
+                    self.assertEqual(
+                        self.run_steps(
+                            shell, 1000, tools=("node", "git"), **user_setting
+                        ),
+                        self.sudo_npm_log("$TMP/home/.npm-global"),
+                    )
 
     def test_user_without_passwordless_sudo_runs_npm_directly(self):
         # npm works without sudo when the user owns its global prefix.

@@ -88,10 +88,18 @@ def _container_npm_install(packages: str) -> list[str]:
       variables. sudo-rs ignores -E, so these variables are lost there.
     - env passes PATH through, because sudo sets its own PATH, and that PATH
       does not include an npm installed with nvm.
-    - The -H flag sets HOME to root's home, so root does not write files into
-      the user's home, e.g., the npm cache.
+    - The -H flag sets HOME to root's home, so root keeps its npm cache in its
+      own home, not in the user's home.
     - HOME is different, so the command sets npm_config_userconfig to the
       user's npm config file. That file can hold registry settings and tokens.
+    - npm reads a path that starts with ~ relative to HOME, e.g.,
+      prefix=~/.npm-global, which npm's docs suggest for permission errors.
+      So the command also sets npm_config_prefix to the user's global npm
+      folder, and root installs the CLI there. If that folder is in the
+      user's home, the files that root installs there belong to root.
+
+    sudo runs env, and env sets PATH and both npm settings. So these values
+    reach npm with sudo-rs too.
     """
     install = f"npm install -g {packages}"
     sudo = "sudo -n -E -H"
@@ -105,6 +113,7 @@ def _container_npm_install(packages: str) -> list[str]:
         f'if [ "$(id -u)" -ne 0 ] && {sudo} true 2>/dev/null; then '
         f'{sudo} env PATH="$PATH" '
         'npm_config_userconfig="$(npm config get userconfig)" '
+        'npm_config_prefix="$(npm prefix -g)" '
         f"{install}; else {install}; fi",
     ]
 

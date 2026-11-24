@@ -448,9 +448,12 @@ missing prerequisites with `apt-get` on Debian/Ubuntu base images before
 running `npm install -g`. For a non-root user, such as Daytona's `daytona`
 user, setup runs `apt-get` and `npm install -g` with passwordless sudo. Under
 sudo, npm still uses the user's environment variables and `~/.npmrc` file, so
-settings such as a proxy or a private registry still apply. With sudo-rs, npm
-uses only the settings in `~/.npmrc`, because sudo-rs drops the environment
-variables. For a user without passwordless sudo, setup runs `npm install -g`
+settings such as a proxy or a private registry still apply. npm also installs
+into the folder that the user's npm uses for global packages, e.g.,
+`~/.npm-global`. If that folder is in the user's home, root owns the installed
+files. With sudo-rs, npm loses the user's environment variables, because
+sudo-rs drops them. npm still uses the user's `~/.npmrc` file and global
+folder. For a user without passwordless sudo, setup runs `npm install -g`
 directly. This works when that user owns the folders where npm installs global
 packages. Custom images need those tools already available, or a working
 `apt-get` with root or passwordless sudo. Choose a Node.js version supported by
