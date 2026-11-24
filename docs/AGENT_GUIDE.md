@@ -445,9 +445,16 @@ with Sandbox("docker", preset="codex") as sb:
 
 On Docker, Daytona, and Modal, setup checks for Node.js, npm, and Git, installing
 missing prerequisites with `apt-get` on Debian/Ubuntu base images before
-running `npm install -g`. Custom images need those tools already available or
-root access to a working `apt-get`. Choose a Node.js version supported by the
-CLI you install. Setup runs before repository cloning and file/workspace
+running `npm install -g`. For a non-root user, such as Daytona's `daytona`
+user, setup runs `apt-get` and `npm install -g` with passwordless sudo. Under
+sudo, npm still uses the user's environment variables and `~/.npmrc` file, so
+settings such as a proxy or a private registry still apply. With sudo-rs, npm
+uses only the settings in `~/.npmrc`, because sudo-rs drops the environment
+variables. For a user without passwordless sudo, setup runs `npm install -g`
+directly. This works when that user owns the folders where npm installs global
+packages. Custom images need those tools already available, or a working
+`apt-get` with root or passwordless sudo. Choose a Node.js version supported by
+the CLI you install. Setup runs before repository cloning and file/workspace
 materialization. A failed setup triggers sandbox cleanup. The `antigravity`
 preset does not use npm. It installs `curl` and Git when they are missing and
 then runs Google's install script, as described in
