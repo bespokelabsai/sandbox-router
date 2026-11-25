@@ -1,4 +1,8 @@
-"""Persistable agent usage and explicitly labeled Codex API-cost estimates."""
+"""Persistable agent usage and explicitly labeled Codex API-cost estimates.
+
+Antigravity CLI reports tokens but no dollar cost, so its runs record
+token usage with an unavailable cost.
+"""
 
 from __future__ import annotations
 
@@ -86,6 +90,14 @@ def _has_tokens(record: dict, harness: str) -> bool:
     events = record.get("events")
     if not isinstance(events, list):
         events = [record]
+    if harness == "antigravity":
+        # stream-json nests each payload under its event name.
+        events = [
+            e.get(e["event"])
+            if isinstance(e, dict) and isinstance(e.get("event"), str)
+            else e
+            for e in events
+        ]
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -130,6 +142,24 @@ def agent_usage_record(
             incomplete
             or result.exit_code != 0
             or any(e.get("type") == "error" for e in events)
+        )
+    elif harness == "antigravity" and events:
+        # Usage is complete only when the final envelope reports success
+        # and the turn was not cut short (print timeout, interrupt). This
+        # also covers a stream that stopped before any step reported tokens.
+        finals = [
+            e if e.get("event") is None else e["result"]
+            for e in events
+            if (e.get("event") is None and isinstance(e.get("status"), str))
+            or (
+                e.get("event") == "result" and isinstance(e.get("result"), dict)
+            )
+        ]
+        final = finals[-1] if finals else {}
+        incomplete = (
+            incomplete
+            or final.get("status") != "SUCCESS"
+            or bool(final.get("finished_reason"))
         )
     partial_cost = any(s.get("cost_is_partial") for s in sources)
     known = _has_tokens(raw, harness)
