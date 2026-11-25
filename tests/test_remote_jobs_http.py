@@ -146,7 +146,9 @@ def test_transport_timeout_does_not_resubmit_or_cancel(http_jobs):
             caught.value.outcome == "unknown"
             and caught.value.code == "connection"
         )
-        assert h.backend.submit_entered.is_set()
+        # The client gives up after 0.1s; on a slow runner the server may not
+        # have reached the backend yet, so wait for it rather than racing it.
+        assert h.backend.submit_entered.wait(5)
         assert h.backend.submits == 1 and h.backend.cancels == 0
     finally:
         h.backend.submit_release.set()
