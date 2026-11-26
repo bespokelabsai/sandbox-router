@@ -1120,3 +1120,13 @@ def test_older_durable_rows_reopen_without_losing_dispatch_fence(h):
         assert connection.execute(
             "SELECT version FROM hosted_jobs_schema_migrations ORDER BY version"
         ).fetchall() == [(1,), (2,)]
+
+
+def test_update_rejects_a_change_key_that_is_not_a_column_name():
+    import pytest
+
+    from bespokelabs.sandbox.control_plane.job_store import HostedJobRepository
+
+    repository = HostedJobRepository.__new__(HostedJobRepository)
+    with pytest.raises(ValueError, match="not a hosted_jobs column name"):
+        repository._update(None, {"phase=phase, organization_id": "x"})

@@ -23,6 +23,8 @@ from .job_models import (
     ObservationConfidence,
 )
 
+_COLUMN_NAME = re.compile(r"[a-z_]+")
+
 _SCHEMA = (
     """CREATE TABLE IF NOT EXISTS hosted_jobs_schema_migrations (
         version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
@@ -211,8 +213,12 @@ class HostedJobRepository:
         """Every mutable write fences version, lease, UID and full binding.
 
         Terminal snapshots are write-once. Only this repository constructs
-        column names; values never become SQL.
+        column names, and each must be a plain lower-case identifier;
+        values never become SQL.
         """
+        for key in changes:
+            if not _COLUMN_NAME.fullmatch(key):
+                raise ValueError(f"not a hosted_jobs column name: {key!r}")
         with self._transaction() as connection:
             assignments = ", ".join(f"{key}=?" for key in changes)
             return (
