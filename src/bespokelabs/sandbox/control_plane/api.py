@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from fastapi import (
     FastAPI,
@@ -23,6 +23,7 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -47,6 +48,9 @@ from bespokelabs.sandbox.exceptions import (
     SandboxError,
 )
 from bespokelabs.sandbox.types import NetworkPolicy
+
+if TYPE_CHECKING:
+    from .job_api import HostedJobConfiguration
 
 _CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 _CSV_NUMERIC_COLUMNS = frozenset(
@@ -222,6 +226,7 @@ def create_app(
     session_cookie_secure: bool = True,
     enable_local_dashboard_login: bool = False,
     session_ttl_seconds: int = 8 * 60 * 60,
+    hosted_job_configuration: HostedJobConfiguration | None = None,
 ) -> FastAPI:
     """Create an HTTP API around an initialized control-plane service."""
     dashboard_dir = Path(__file__).with_name("static")
@@ -265,13 +270,38 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         return response
 
+    def job_mutation_action(request: Request) -> str | None:
+        # CSRF is checked before routing, so route metadata is not available yet.
+        if hosted_job_configuration is None or request.method != "POST":
+            return None
+        if request.url.path == "/v1/jobs":
+            return "job.submit"
+        parts = request.url.path.split("/")
+        if (
+            len(parts) == 5
+            and parts[1:3] == ["v1", "jobs"]
+            and parts[3]
+            and parts[4] == "cancel"
+        ):
+            return "job.cancel"
+        return None
+
     def audit_action(request: Request) -> str:
+        mutation = job_mutation_action(request)
+        if mutation is not None:
+            return mutation
         route = request.scope.get("route")
         template = getattr(route, "path", request.url.path)
         names = {
+            ("POST", "/v1/jobs"): "job.submit",
+            ("GET", "/v1/jobs/{job_id}"): "job.read",
+            ("GET", "/v1/jobs/{job_id}/result"): "job.result",
+            ("GET", "/v1/jobs/{job_id}/logs"): "job.logs",
+            ("POST", "/v1/jobs/{job_id}/cancel"): "job.cancel",
             ("POST", "/v1/sandboxes"): "sandbox.create",
             ("DELETE", "/v1/sandboxes/{sandbox_id}"): "sandbox.terminate",
             ("POST", "/v1/sandboxes/{sandbox_id}/execute"): "sandbox.execute",
+            ("POST", "/v1/sandboxes/{sandbox_id}/attach"): "sandbox.attach",
             (
                 "PUT",
                 "/v1/sandboxes/{sandbox_id}/network",
@@ -288,6 +318,8 @@ def create_app(
             ("PUT", "/v1/retention/current"): "retention.configure",
             ("POST", "/v1/retention/apply"): "retention.apply",
         }
+        if request.url.path.startswith("/v1/jobs"):
+            return names.get((request.method, template), "job.request")
         return names.get(
             (request.method, template), f"{request.method.lower()} {template}"
         )
@@ -296,46 +328,71 @@ def create_app(
     async def security_middleware(request: Request, call_next):
         state: dict = {}
         context_token = request_auth.set(state)
-        cookie = request.cookies.get("bespoke_dashboard_session")
-        if cookie:
-            try:
-                principal, session_id = (
-                    control_plane.store.authenticate_web_session(
-                        cookie, timestamp=control_plane._now().isoformat()
+        try:
+            cookie = request.cookies.get("bespoke_dashboard_session")
+            if cookie:
+                try:
+                    principal, session_id = (
+                        control_plane.store.authenticate_web_session(
+                            cookie, timestamp=control_plane._now().isoformat()
+                        )
                     )
-                )
-            except AuthenticationError:
-                pass
-            else:
-                state["principal"] = principal
-                state["session_id"] = session_id
-        is_login = (
-            request.method == "POST"
-            and request.url.path == "/v1/dashboard/session"
-        )
-        if (
-            state.get("session_id")
-            and not request.headers.get("Authorization")
-            and not request.headers.get("X-Control-Plane-Admin")
-            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
-            and not is_login
-            and not control_plane.store.validate_session_csrf(
-                state["session_id"], request.headers.get("X-CSRF-Token")
+                except AuthenticationError:
+                    pass
+                else:
+                    state["principal"] = principal
+                    state["session_id"] = session_id
+            is_login = (
+                request.method == "POST"
+                and request.url.path == "/v1/dashboard/session"
             )
-        ):
-            request_auth.reset(context_token)
-            return add_security_headers(
-                JSONResponse(
+            supplied_admin = request.headers.get("X-Control-Plane-Admin")
+            # Only organization bootstrap authenticates with the legacy admin token.
+            admin_authenticated = (
+                request.method == "POST"
+                and request.url.path == "/v1/organizations"
+                and admin_token is not None
+                and supplied_admin is not None
+                and secrets.compare_digest(
+                    supplied_admin.encode(), admin_token.encode()
+                )
+            )
+            if (
+                state.get("session_id")
+                and not request.headers.get("Authorization")
+                and not admin_authenticated
+                and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+                and not is_login
+                and not control_plane.store.validate_session_csrf(
+                    state["session_id"], request.headers.get("X-CSRF-Token")
+                )
+            ):
+                action = job_mutation_action(request)
+                if action is not None:
+                    control_plane.record_audit(
+                        state["principal"],
+                        action=action,
+                        outcome="denied",
+                        session_id=state["session_id"],
+                        resource_type="http_route",
+                        resource_id=action,
+                        details={"status_code": 403},
+                    )
+                response = JSONResponse(
                     status_code=403,
                     content={"detail": "CSRF token is missing or invalid"},
                 )
-            )
-        try:
+                if request.url.path.startswith("/v1/jobs"):
+                    response.headers["Cache-Control"] = "no-store"
+                return add_security_headers(response)
             response = await call_next(request)
+            if request.url.path.startswith("/v1/jobs"):
+                response.headers["Cache-Control"] = "no-store"
             principal = state.get("principal")
             should_audit = request.url.path.startswith("/v1/") and (
                 request.method in {"POST", "PUT", "PATCH", "DELETE"}
                 or request.url.path.startswith("/v1/exports/")
+                or request.url.path.startswith("/v1/jobs")
             )
             if principal is not None and should_audit and not is_login:
                 control_plane.record_audit(
@@ -350,7 +407,11 @@ def create_app(
                     ),
                     session_id=state.get("session_id"),
                     resource_type="http_route",
-                    resource_id=request.url.path[:255],
+                    resource_id=(
+                        audit_action(request)
+                        if request.url.path.startswith("/v1/jobs")
+                        else request.url.path[:255]
+                    ),
                     details={"status_code": response.status_code},
                 )
             return add_security_headers(response)
@@ -425,6 +486,13 @@ def create_app(
         principal = current_principal(authorization)
         control_plane.require(principal, scope)
         return principal
+
+    if hosted_job_configuration is not None:
+        from .job_api import install_job_routes
+
+        install_job_routes(
+            app, control_plane.store, hosted_job_configuration, authenticate
+        )
 
     @app.get("/", include_in_schema=False)
     def root() -> RedirectResponse:
@@ -836,6 +904,25 @@ def create_app(
         return _sandbox_response(
             control_plane.set_network(principal, sandbox_id, body.to_policy())
         )
+
+    @app.post(
+        "/v1/sandboxes/{sandbox_id}/attach",
+        operation_id="attach_hosted_sandbox",
+    )
+    async def attach_sandbox(
+        sandbox_id: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict:
+        principal = authenticate(authorization, "sandboxes:execute")
+        if request.query_params or await request.body():
+            # Do not echo rejected provider documents or credential values in
+            # validation responses. The path is the entire attachment request.
+            raise ValueError("Attachment accepts only a hosted sandbox ID.")
+        record = await run_in_threadpool(
+            control_plane.attach_sandbox, principal, sandbox_id
+        )
+        return _sandbox_response(record)
 
     @app.post("/v1/sandboxes/{sandbox_id}/execute")
     def execute(

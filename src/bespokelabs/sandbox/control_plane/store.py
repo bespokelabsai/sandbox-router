@@ -8,7 +8,8 @@ import json
 import secrets
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +18,7 @@ from bespokelabs.sandbox.control_plane.agent_usage import (
     add_agent_usage,
     empty_agent_summary,
 )
+from bespokelabs.sandbox.control_plane.attachments import AttachmentRepository
 from bespokelabs.sandbox.control_plane.errors import (
     AuthenticationError,
     ConflictError,
@@ -31,6 +33,11 @@ from bespokelabs.sandbox.control_plane.models import (
     Principal,
     RetentionPolicy,
     SandboxRecord,
+)
+from bespokelabs.sandbox.control_plane.reconciliation import (
+    ProviderObservation,
+    normalize_observation,
+    provider_timestamp,
 )
 from bespokelabs.sandbox.control_plane.security import redact_payload
 
@@ -421,6 +428,23 @@ _MIGRATIONS = (
             "CREATE INDEX resource_samples_time_idx ON resource_samples(collected_at)",
         ),
     ),
+    (
+        11,
+        (
+            "ALTER TABLE sandboxes ADD COLUMN resource_hold INTEGER NOT NULL DEFAULT 0 CHECK(resource_hold IN (0, 1))",
+            # Observation rows include rejected diagnostics, NOT proof that a
+            # terminal transition applied. Only durable end timestamps exclude
+            # an ambiguous prior stop/allocation from this conservative backfill.
+            """UPDATE sandboxes SET resource_hold=1
+               WHERE status='failed' AND terminated_at IS NULL
+               AND destroyed_at IS NULL
+               AND (stopping_at IS NOT NULL OR cleanup_status='unknown'
+                    OR retry_status='blocked_cleanup_unknown'
+                    OR (provider_resource_id IS NOT NULL
+                        AND COALESCE(cleanup_status, 'unknown')
+                            NOT IN ('deleted', 'not_found')))""",
+        ),
+    ),
 )
 
 
@@ -472,6 +496,27 @@ class SQLiteStore:
         self._path = str(path)
         self._pepper = key_pepper.encode()
         self._initialize()
+        self.attachment_repository = AttachmentRepository(self.connect)
+        self.attachment_repository.initialize()
+
+    def connect(self) -> sqlite3.Connection:
+        """Open a caller-owned connection to this store's database.
+
+        Extensions must close it and own their transaction boundaries. This
+        preserves connection configuration without exposing storage internals.
+        """
+        return self._connect()
+
+    def _invalidate_attachment(
+        self, connection: sqlite3.Connection, sandbox_id: str
+    ) -> None:
+        row = connection.execute(
+            "SELECT organization_id FROM sandboxes WHERE id=?", (sandbox_id,)
+        ).fetchone()
+        if row is not None:
+            self.attachment_repository.invalidate(
+                row[0], sandbox_id, connection=connection
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self._path, timeout=30)
@@ -498,6 +543,9 @@ class SQLiteStore:
                     "SELECT version FROM schema_migrations"
                 )
             }
+            # Include DDL in the migration transaction: a crash between adding
+            # the hold column, backfill, and version stamp must roll back all.
+            connection.execute("BEGIN IMMEDIATE")
             for version, statements in _MIGRATIONS:
                 if version in applied:
                     continue
@@ -832,7 +880,7 @@ class SQLiteStore:
         with self._connect() as connection:
             active = connection.execute(
                 """SELECT COUNT(*) FROM sandboxes WHERE organization_id=?
-                   AND status IN ('creating', 'running', 'stopping')""",
+                   AND (status IN ('creating', 'running', 'stopping') OR resource_hold=1)""",
                 (organization_id,),
             ).fetchone()[0]
             hourly = self._spend_between(
@@ -1309,13 +1357,28 @@ class SQLiteStore:
         provider_resource_id: str | None = None,
         timestamp: str | None = None,
         hourly_rate_usd: Decimal | None = None,
+        publish_attachment: Callable[[sqlite3.Connection], None] | None = None,
     ) -> None:
-        """Finish the active creation attempt and update its summary."""
+        """Finish creation, publishing optional metadata in the same transaction.
+
+        A publication failure rolls back the lifecycle and attempt writes too.
+        """
         completed_at = timestamp or _now()
         error_json = json.dumps(error, sort_keys=True) if error else None
         attempt_status = "succeeded" if status == "running" else status
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT status FROM sandboxes WHERE id=?", (sandbox_id,)
+            ).fetchone()
+            if current is None or (
+                current[0] != "creating"
+                and not (
+                    status == "failed"
+                    and current[0] in {"stopping", "failed", "destroyed"}
+                )
+            ):
+                raise ConflictError("sandbox creation is no longer active")
             connection.execute(
                 """
                 UPDATE sandbox_creation_attempts
@@ -1334,6 +1397,25 @@ class SQLiteStore:
                     sandbox_id,
                 ),
             )
+            if current[0] != "creating":
+                # A late allocation/failure must not reverse a stop or terminal
+                # observation, but its known identity still needs durable cleanup
+                # metadata. Never overwrite an already authoritative identity.
+                connection.execute(
+                    """UPDATE sandboxes SET
+                       provider_resource_id=COALESCE(provider_resource_id, ?),
+                       latest_error_json=?, retry_status=?, cleanup_status=?,
+                       version=version+1 WHERE id=?""",
+                    (
+                        provider_resource_id,
+                        error_json,
+                        retry_status,
+                        cleanup_status,
+                        sandbox_id,
+                    ),
+                )
+                self._invalidate_attachment(connection, sandbox_id)
+                return
             connection.execute(
                 """
                 UPDATE sandboxes
@@ -1343,6 +1425,7 @@ class SQLiteStore:
                     hourly_rate_usd = COALESCE(?, hourly_rate_usd),
                     running_at = CASE WHEN ? = 'running' THEN ? ELSE running_at END,
                     failed_at = CASE WHEN ? = 'failed' THEN ? ELSE failed_at END,
+                    resource_hold = ?,
                     version = version + 1
                 WHERE id = ?
                 """,
@@ -1359,9 +1442,25 @@ class SQLiteStore:
                     completed_at,
                     status,
                     completed_at,
+                    int(
+                        status == "failed"
+                        and (
+                            cleanup_status == "unknown"
+                            or retry_status == "blocked_cleanup_unknown"
+                            or (
+                                provider_resource_id is not None
+                                and cleanup_status
+                                not in {"deleted", "not_found"}
+                            )
+                        )
+                    ),
                     sandbox_id,
                 ),
             )
+            if status != "running":
+                self._invalidate_attachment(connection, sandbox_id)
+            if publish_attachment is not None:
+                publish_attachment(connection)
 
     def mark_lifecycle(
         self,
@@ -1380,8 +1479,18 @@ class SQLiteStore:
         if column is None:
             raise ValueError("unsupported lifecycle status")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT status, resource_hold FROM sandboxes WHERE id=?",
+                (sandbox_id,),
+            ).fetchone()
+            if current is None or (
+                current[0] in {"destroyed", "failed"} and not current[1]
+            ):
+                return
             connection.execute(
                 f"""UPDATE sandboxes SET status = ?, {column} = ?,
+                   resource_hold=CASE WHEN ? IN ('destroyed', 'failed') THEN 0 ELSE resource_hold END,
                    terminated_by_api_key_id=CASE WHEN ? = 'destroyed'
                        THEN ? ELSE terminated_by_api_key_id END,
                    termination_reason=CASE WHEN ? = 'destroyed'
@@ -1392,12 +1501,14 @@ class SQLiteStore:
                     status,
                     timestamp,
                     status,
+                    status,
                     actor_api_key_id,
                     status,
                     reason,
                     sandbox_id,
                 ),
             )
+            self._invalidate_attachment(connection, sandbox_id)
 
     def begin_termination(
         self,
@@ -1411,13 +1522,15 @@ class SQLiteStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT status, version FROM sandboxes WHERE id=? AND organization_id=?",
+                "SELECT status, version, resource_hold FROM sandboxes WHERE id=? AND organization_id=?",
                 (sandbox_id, organization_id),
             ).fetchone()
             if row is None:
                 raise NotFoundError("sandbox not found")
-            if row["status"] == "destroyed":
-                return self.get_sandbox(organization_id, sandbox_id)
+            if row["status"] == "destroyed" or (
+                row["status"] == "failed" and not row["resource_hold"]
+            ):
+                raise ConflictError("sandbox is already terminal")
             if (
                 expected_version is not None
                 and row["version"] != expected_version
@@ -1434,6 +1547,7 @@ class SQLiteStore:
                    version=version+1 WHERE id=? AND organization_id=?""",
                 (timestamp, sandbox_id, organization_id),
             )
+            self._invalidate_attachment(connection, sandbox_id)
         return self.get_sandbox(organization_id, sandbox_id)
 
     def claim_expired_sandboxes(
@@ -1469,6 +1583,7 @@ class SQLiteStore:
                        version=version+1 WHERE id=?""",
                     (timestamp, owner, timestamp, sandbox_id),
                 )
+                self._invalidate_attachment(connection, sandbox_id)
         return [self.get_sandbox_internal(sandbox_id) for sandbox_id in ids]
 
     def list_organization_ids(self) -> list[str]:
@@ -1632,16 +1747,44 @@ class SQLiteStore:
             ).fetchall()
         return {row["backend"]: dict(row) for row in rows}
 
-    def fail_termination(
-        self, sandbox_id: str, *, timestamp: str, error: dict
-    ) -> None:
+    def resource_is_held(self, sandbox_id: str) -> bool:
+        """Accounting uncertainty, never attachment or cleanup authority."""
         with self._connect() as connection:
-            connection.execute(
+            row = connection.execute(
+                "SELECT resource_hold FROM sandboxes WHERE id=?", (sandbox_id,)
+            ).fetchone()
+        return bool(row and row[0])
+
+    def fail_termination(
+        self,
+        sandbox_id: str,
+        *,
+        timestamp: str,
+        error: dict,
+        expected_version: int | None = None,
+    ) -> None:
+        # An RPC error is not proof of termination, regardless of error code or
+        # message. Fence late callbacks against both closure and newer attempts.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
                 """UPDATE sandboxes SET status='failed', failed_at=?,
                    latest_error_json=?, retry_status='not_retryable',
-                   version=version+1 WHERE id=?""",
-                (timestamp, json.dumps(error, sort_keys=True), sandbox_id),
+                   resource_hold=1, version=version+1
+                   WHERE id=? AND (status IN ('creating', 'running', 'stopping')
+                                   OR resource_hold=1)
+                   AND terminated_at IS NULL AND destroyed_at IS NULL
+                   AND (? IS NULL OR version=?)""",
+                (
+                    timestamp,
+                    json.dumps(error, sort_keys=True),
+                    sandbox_id,
+                    expected_version,
+                    expected_version,
+                ),
             )
+            if cursor.rowcount:
+                self._invalidate_attachment(connection, sandbox_id)
 
     def record_lifecycle_cost(
         self,
@@ -1656,30 +1799,107 @@ class SQLiteStore:
         currency: str,
         pricing_source: str,
         timestamp: str,
+        _connection: sqlite3.Connection | None = None,
     ) -> bool:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+        with (
+            nullcontext(_connection)
+            if _connection is not None
+            else self._connect()
+        ) as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
+            owner = connection.execute(
+                "SELECT * FROM sandboxes WHERE id=? AND organization_id=?",
+                (sandbox_id, organization_id),
+            ).fetchone()
+            if owner is None:
+                raise NotFoundError("sandbox not found")
+            # The caller may have read an active row before another connection
+            # closed it. Fence elapsed time AND the estimated provider tail under
+            # the billing write lock; finalization must still fill the closed
+            # window, and a real provider adjustment may still increase cost.
+            if (
+                owner["status"] in {"destroyed", "failed"}
+                and not owner["resource_hold"]
+            ):
+                closed_at = (
+                    owner["failed_at"]
+                    if owner["status"] == "failed"
+                    else owner["terminated_at"] or owner["destroyed_at"]
+                )
+                if closed_at is not None:
+                    end = min(
+                        datetime.fromisoformat(timestamp),
+                        datetime.fromisoformat(closed_at),
+                    )
+                    timestamp = end.isoformat()
+                    started = owner["provisioning_at"] or owner["created_at"]
+                    billable_seconds = max(
+                        Decimal(0),
+                        Decimal(
+                            str(
+                                (
+                                    end - datetime.fromisoformat(started)
+                                ).total_seconds()
+                            )
+                        ),
+                    )
+                    estimated_cost_usd = (
+                        billable_seconds
+                        * Decimal(owner["hourly_rate_usd"])
+                        / Decimal(3600)
+                    )
             existing = connection.execute(
                 """
                 SELECT billable_seconds, estimated_cost_usd,
                        provider_reported_cost_usd, effective_cost_usd,
-                       customer_cost_usd, currency, pricing_source, cost_state
-                FROM lifecycle_costs WHERE sandbox_id = ?
+                       customer_cost_usd, currency, pricing_source, cost_state,
+                       updated_at
+                FROM lifecycle_costs WHERE sandbox_id = ? AND organization_id = ?
                 """,
-                (sandbox_id,),
+                (sandbox_id, organization_id),
             ).fetchone()
+            cost_updated_at = timestamp
+            if existing and datetime.fromisoformat(
+                timestamp
+            ) < datetime.fromisoformat(existing[8]):
+                if provider_reported_cost_usd is None:
+                    return False
+                # Local estimates may already extend beyond a delayed provider
+                # total. Replace its covered window, retaining the live tail.
+                cost_updated_at = existing[8]
+            reported_tail = (
+                max(Decimal(0), Decimal(existing[1]) - estimated_cost_usd)
+                if existing and provider_reported_cost_usd is not None
+                else Decimal(0)
+            )
             old_seconds = Decimal(existing[0]) if existing else Decimal(0)
             old_effective = Decimal(existing[3]) if existing else Decimal(0)
             old_customer = Decimal(existing[4]) if existing else Decimal(0)
-            billable_seconds = max(billable_seconds, old_seconds)
             if (
-                provider_reported_cost_usd is None
+                existing
+                and provider_reported_cost_usd is None
+                and billable_seconds <= old_seconds
+            ):
+                return False
+            billable_seconds = max(billable_seconds, old_seconds)
+            estimated_cost_usd = max(
+                estimated_cost_usd,
+                Decimal(existing[1]) if existing else Decimal(0),
+            )
+            estimated_tail = provider_reported_cost_usd is None
+            if (
+                estimated_tail
                 and existing
                 and existing[7] in {"provider_reported", "reconciled"}
             ):
                 provider_reported_cost_usd = Decimal(existing[2])
-                effective = old_effective
-                customer = old_customer
+                # A provider total covers only its observed billable window.
+                # Keep that baseline and estimate the subsequent live tail;
+                # the next cumulative provider total replaces both atomically.
+                tail = estimated_cost_usd - Decimal(existing[1])
+                effective = old_effective + tail
+                customer = old_customer + tail * customer_markup
                 currency = existing[5]
                 pricing_source = existing[6]
                 state = existing[7]
@@ -1689,12 +1909,18 @@ class SQLiteStore:
                     if provider_reported_cost_usd is not None
                     else "estimated"
                 )
-                effective = (
-                    provider_reported_cost_usd
+                # Cumulative billing is not a refund protocol. Compare the new
+                # total PLUS the already accrued uncovered tail with the entire
+                # old effective total, not old total plus tail (double billing).
+                # A lower/equal-time report must never reduce posted charges;
+                # legitimate refunds require a separate explicit adjustment.
+                effective = max(
+                    old_effective,
+                    provider_reported_cost_usd + reported_tail
                     if provider_reported_cost_usd is not None
-                    else estimated_cost_usd
+                    else estimated_cost_usd,
                 )
-                customer = effective * customer_markup
+                customer = max(old_customer, effective * customer_markup)
             try:
                 connection.execute(
                     "INSERT INTO lifecycle_observations VALUES (?, ?)",
@@ -1724,7 +1950,7 @@ class SQLiteStore:
                     segment_seconds = Decimal(
                         str((segment_end - cursor).total_seconds())
                     )
-                    if state == "estimated":
+                    if estimated_tail:
                         segment_provider = (
                             provider_delta * segment_seconds / seconds_delta
                         )
@@ -1806,7 +2032,7 @@ class SQLiteStore:
                     currency,
                     pricing_source,
                     state,
-                    timestamp,
+                    cost_updated_at,
                 ),
             )
             connection.execute(
@@ -1814,6 +2040,7 @@ class SQLiteStore:
                    pricing_source = ? WHERE id = ?""",
                 (state, currency, pricing_source, sandbox_id),
             )
+            return True
 
     def record_provider_observation(
         self,
@@ -1827,9 +2054,20 @@ class SQLiteStore:
         provider_cost_usd: Decimal | None = None,
         currency: str | None = None,
         missing: bool = False,
+        _connection: sqlite3.Connection | None = None,
     ) -> bool:
         try:
-            with self._connect() as connection:
+            with (
+                nullcontext(_connection)
+                if _connection is not None
+                else self._connect()
+            ) as connection:
+                owner = connection.execute(
+                    "SELECT provider_resource_id FROM sandboxes WHERE id=? AND organization_id=?",
+                    (sandbox_id, organization_id),
+                ).fetchone()
+                if owner is None or owner[0] != provider_resource_id:
+                    return False
                 connection.execute(
                     """INSERT INTO provider_observations(
                        id, organization_id, sandbox_id, observation_id,
@@ -1854,7 +2092,194 @@ class SQLiteStore:
             return True
         except sqlite3.IntegrityError:
             return False
-        return True
+
+    def reconcile_provider_observation(
+        self,
+        organization_id: str,
+        sandbox_id: str,
+        *,
+        backend: str,
+        observation: ProviderObservation,
+        customer_markup: Decimal,
+        now: datetime | None = None,
+        diagnostics: dict[str, bool] | None = None,
+    ) -> bool:
+        """Atomically fence identity/order, persist evidence, and meter its window.
+
+        False means no lifecycle/cost update: stale evidence, reused identity
+        (including exact replay), or a terminal record. Later terminal evidence
+        is retained for investigation but never revives capacity or billing.
+        When supplied, diagnostics reports equal-time lifecycle contradictions
+        as unknown even when immutable identity replay prevents another insert.
+        """
+        observation = normalize_observation(
+            observation, now=now or datetime.now(timezone.utc)
+        )
+        if observation is None:
+            return False
+        status = observation.status
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute(
+                "SELECT * FROM sandboxes WHERE id=? AND organization_id=?",
+                (sandbox_id, organization_id),
+            ).fetchone()
+            if (
+                current is None
+                or current["backend"] != backend
+                or current["provider_resource_id"]
+                != observation.provider_resource_id
+                or not observation.matches(organization_id, backend)
+            ):
+                return False
+            # Compare against committed evidence, not just this listing. A
+            # terminal snapshot cannot win a tie against a prior live snapshot
+            # from another run. In the opposite order retain the closed state,
+            # but surface the contradiction without posting any hidden charges.
+            live = {"running", "provisioning", "stopping"}
+            terminal = {"terminated", "failed", "missing"}
+            opposing = (
+                terminal
+                if status in live
+                else live
+                if status in terminal
+                else set()
+            )
+            conflict = any(
+                row[0] in opposing
+                and provider_timestamp(row[1])
+                == provider_timestamp(observation.observed_at)
+                for row in connection.execute(
+                    "SELECT status, observed_at FROM provider_observations WHERE sandbox_id=?",
+                    (sandbox_id,),
+                )
+            )
+            if conflict and diagnostics is not None:
+                diagnostics["unknown"] = True
+            # Reserve one immutable identity for the entire atomic observation.
+            # Check BEFORE touching lifecycle/watermarks. Exact replay is a
+            # no-op; different payload under the same identity is rejected too.
+            if (
+                connection.execute(
+                    "SELECT 1 FROM provider_observations WHERE sandbox_id=? AND observation_id=?",
+                    (sandbox_id, observation.observation_id),
+                ).fetchone()
+                or connection.execute(
+                    "SELECT 1 FROM lifecycle_observations WHERE sandbox_id=? AND observation_id=?",
+                    (sandbox_id, observation.observation_id),
+                ).fetchone()
+            ):
+                return False
+            if conflict:
+                if not self.record_provider_observation(
+                    organization_id,
+                    sandbox_id,
+                    observation_id=observation.observation_id,
+                    provider_resource_id=observation.provider_resource_id,
+                    status=status,
+                    observed_at=observation.observed_at,
+                    provider_cost_usd=observation.provider_cost_usd,
+                    currency=observation.currency,
+                    missing=status == "missing",
+                    _connection=connection,
+                ):
+                    raise ConflictError(
+                        "provider observation identity conflict"
+                    )
+                return False
+            if (
+                current["status"] not in {"creating", "running", "stopping"}
+                and not current["resource_hold"]
+            ):
+                watermark = provider_timestamp(
+                    current["last_provider_observed_at"]
+                    or current["provisioning_at"]
+                    or current["created_at"]
+                )
+                if (
+                    watermark is not None
+                    and datetime.fromisoformat(observation.observed_at)
+                    >= watermark
+                ):
+                    # Authoritative absence is irreversible here. Contradictory
+                    # later positives need operator investigation, not blind
+                    # resurrection or a second billable lifetime.
+                    self.record_provider_observation(
+                        organization_id,
+                        sandbox_id,
+                        observation_id=observation.observation_id,
+                        provider_resource_id=observation.provider_resource_id,
+                        status=status,
+                        observed_at=observation.observed_at,
+                        provider_cost_usd=observation.provider_cost_usd,
+                        currency=observation.currency,
+                        missing=status == "missing",
+                        _connection=connection,
+                    )
+                return False
+            if not self.apply_provider_observation(
+                organization_id,
+                sandbox_id,
+                status=status,
+                observed_at=observation.observed_at,
+                missing=status == "missing",
+                _connection=connection,
+            ):
+                return False
+            recorded = self.record_provider_observation(
+                organization_id,
+                sandbox_id,
+                observation_id=observation.observation_id,
+                provider_resource_id=observation.provider_resource_id,
+                status=status,
+                observed_at=observation.observed_at,
+                provider_cost_usd=(
+                    observation.provider_cost_usd
+                    if status != "unknown"
+                    else None
+                ),
+                currency=observation.currency,
+                missing=status == "missing",
+                _connection=connection,
+            )
+            if not recorded:
+                # Unexpected uniqueness/identity failures roll back lifecycle
+                # state too; never commit a watermark without its evidence.
+                raise ConflictError("provider observation identity conflict")
+            if status == "unknown":
+                return True
+            started = current["provisioning_at"] or current["created_at"]
+            seconds = max(
+                Decimal(0),
+                Decimal(
+                    str(
+                        (
+                            datetime.fromisoformat(observation.observed_at)
+                            - datetime.fromisoformat(started)
+                        ).total_seconds()
+                    )
+                ),
+            )
+            rate = Decimal(current["hourly_rate_usd"])
+            if rate != 0 or observation.provider_cost_usd is not None:
+                self.record_lifecycle_cost(
+                    organization_id=organization_id,
+                    sandbox_id=sandbox_id,
+                    observation_id=observation.observation_id,
+                    billable_seconds=seconds,
+                    estimated_cost_usd=seconds * rate / Decimal(3600),
+                    provider_reported_cost_usd=observation.provider_cost_usd,
+                    customer_markup=customer_markup,
+                    currency=observation.currency,
+                    pricing_source=(
+                        "provider"
+                        if observation.provider_cost_usd is not None
+                        else current["pricing_source"]
+                    ),
+                    timestamp=observation.observed_at,
+                    _connection=connection,
+                )
+            return True
 
     def apply_provider_observation(
         self,
@@ -1864,7 +2289,8 @@ class SQLiteStore:
         status: str,
         observed_at: str,
         missing: bool = False,
-    ) -> None:
+        _connection: sqlite3.Connection | None = None,
+    ) -> bool:
         lifecycle_status = status.lower().strip()
         normalized = {
             "running": "running",
@@ -1873,28 +2299,59 @@ class SQLiteStore:
             "terminated": "destroyed",
             "failed": "failed",
         }.get(lifecycle_status)
-        if normalized is None:
-            raise ValueError(f"unsupported provider lifecycle status: {status}")
         if missing:
             normalized = "failed"
-        with self._connect() as connection:
+        if normalized is None and lifecycle_status != "unknown":
+            raise ValueError(f"unsupported provider lifecycle status: {status}")
+        with (
+            nullcontext(_connection)
+            if _connection is not None
+            else self._connect()
+        ) as connection:
+            if _connection is None:
+                connection.execute("BEGIN IMMEDIATE")
             current = connection.execute(
-                "SELECT status FROM sandboxes WHERE id=? AND organization_id=?",
+                """SELECT status, last_provider_observed_at, provider_missing,
+                          provisioning_at, created_at, resource_hold
+                   FROM sandboxes WHERE id=? AND organization_id=?""",
                 (sandbox_id, organization_id),
             ).fetchone()
             if current is None:
                 raise NotFoundError("sandbox not found")
-            if current[0] in {"destroyed", "failed"}:
-                connection.execute(
-                    """UPDATE sandboxes SET last_provider_observed_at=?,
-                       provider_missing=0, version=version+1
-                       WHERE id=? AND organization_id=?""",
-                    (observed_at, sandbox_id, organization_id),
+            observed = provider_timestamp(observed_at)
+            watermark = provider_timestamp(
+                current[1] or current[3] or current[4]
+            )
+            if observed is None or watermark is None or observed < watermark:
+                return False
+            # A same-time positive is safer than any terminal evidence, not
+            # only direct absence. This guard also protects direct store callers.
+            if (
+                normalized in {"destroyed", "failed"}
+                and observed == watermark
+                and (
+                    current[0] in {"creating", "running", "stopping"}
+                    or current[5]
                 )
-                return
+                and not current[2]
+            ):
+                return False
+            if current[0] in {"destroyed", "failed"} and not current[5]:
+                return False
+            if lifecycle_status == "unknown":
+                # Local lookup attempts are not provider evidence. Persist the
+                # attempt separately, without poisoning the provider watermark.
+                return True
+            # Positive evidence may extend accounting, never restore an
+            # executable failed handle or clear its uncertainty hold.
+            if current[5] and normalized in {"running", "creating", "stopping"}:
+                normalized = current[0]
+                if normalized == "failed":
+                    normalized = None
             cursor = connection.execute(
                 """UPDATE sandboxes SET last_provider_observed_at=?,
-                   provider_missing=?, status=?,
+                   provider_missing=?, status=COALESCE(?, status),
+                   resource_hold=CASE WHEN ? IN ('destroyed', 'failed') THEN 0 ELSE resource_hold END,
                    provisioning_at=CASE WHEN ? = 'creating' THEN COALESCE(provisioning_at, ?) ELSE provisioning_at END,
                    running_at=CASE WHEN ? = 'running' THEN COALESCE(running_at, ?) ELSE running_at END,
                    stopping_at=CASE WHEN ? = 'stopping' THEN COALESCE(stopping_at, ?) ELSE stopping_at END,
@@ -1905,6 +2362,7 @@ class SQLiteStore:
                 (
                     observed_at,
                     int(missing),
+                    normalized,
                     normalized,
                     normalized,
                     observed_at,
@@ -1922,6 +2380,9 @@ class SQLiteStore:
             )
             if cursor.rowcount != 1:
                 raise NotFoundError("sandbox not found")
+            if normalized in {"stopping", "destroyed", "failed"}:
+                self._invalidate_attachment(connection, sandbox_id)
+            return True
 
     def update_sandbox_status(
         self, sandbox_id: str, status: str, *, error: str | None = None
@@ -1937,6 +2398,8 @@ class SQLiteStore:
                 """,
                 (status, error, destroyed_at, sandbox_id),
             )
+            if status != "running":
+                self._invalidate_attachment(connection, sandbox_id)
 
     def update_sandbox_network(
         self, organization_id: str, sandbox_id: str, network: dict
@@ -2786,7 +3249,7 @@ class SQLiteStore:
         if policy.max_concurrent_sandboxes is not None:
             active = connection.execute(
                 """SELECT COUNT(*) FROM sandboxes WHERE organization_id=?
-                   AND status IN ('creating', 'running', 'stopping')""",
+                   AND (status IN ('creating', 'running', 'stopping') OR resource_hold=1)""",
                 (organization_id,),
             ).fetchone()[0]
             if active >= policy.max_concurrent_sandboxes:

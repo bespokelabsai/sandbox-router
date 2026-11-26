@@ -4,13 +4,30 @@ import unittest
 from unittest import mock
 
 from bespokelabs.sandbox import Sandbox, SandboxClient
-from bespokelabs.sandbox.backends.modal import ModalClient
+from bespokelabs.sandbox.backends.modal import ModalClient, ModalSession
 from bespokelabs.sandbox.exceptions import (
     FeatureNotSupportedError,
     SandboxConfigurationError,
     SandboxExecutionError,
 )
 from bespokelabs.sandbox.types import SandboxConfig
+
+
+class ModalSessionLegacyCleanupTests(unittest.TestCase):
+
+    def test_default_unowned_session_keeps_legacy_destroy_behavior(self):
+        for failure in (None, RuntimeError("legacy termination failure")):
+            with self.subTest(failure=failure):
+                shared_client = mock.MagicMock()
+                remote = mock.Mock(client=shared_client)
+                remote.terminate.side_effect = failure
+                session = ModalSession(sandbox=remote)
+                session.destroy()
+                session.destroy()
+                remote.terminate.assert_called_once_with()
+                shared_client.__exit__.assert_not_called()
+                self.assertIsNone(session._sandbox)
+                self.assertIsNone(session._owned_client)
 
 
 class ModalClientGpuTests(unittest.TestCase):
