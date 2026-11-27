@@ -669,6 +669,7 @@ image or Cloud Storage. Credentials are Application Default Credentials.
 | `backend_options` key | Meaning |
 |---|---|
 | `project`, `region` | Where to submit (else `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_REGION` or `CLOUDSDK_COMPUTE_REGION`) |
+| `regions`, `region_quota` | Used when `region` is not given. `regions` lists candidate regions in preference order; `region_quota` maps Compute regional quota metrics to the amount the job needs free, e.g. `{"CPUS": 16, "SSD_TOTAL_GB": 600}`. The job goes to the first candidate with that much free, else to the first candidate so it queues. With `regions` alone, the first candidate is used. The check reads quota (`compute.regions.get`); it reserves nothing and does not see Spot capacity. A region-specific `subnetwork` must exist in whichever region is chosen |
 | `service_account` | Service account email the VMs run as (it needs Artifact Registry read and whatever the job touches, e.g. GCS) |
 | `service_account_scopes` | OAuth scopes for that service account (list) |
 | `network`, `subnetwork` | VPC network and subnetwork for the VMs (`projects/<p>/global/networks/<n>`, `projects/<p>/regions/<r>/subnetworks/<s>`) |

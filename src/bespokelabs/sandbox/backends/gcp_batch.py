@@ -10,6 +10,12 @@ Configuration (``JobSpec.backend_options`` wins over the environment):
                    Application Default Credentials project.
   region           Batch location; else ``GOOGLE_CLOUD_REGION``, else
                    ``CLOUDSDK_COMPUTE_REGION``.
+  regions          Candidate regions in preference order, used when
+                   ``region`` is not given: the job goes to the first one
+                   with ``region_quota`` free, else to the first candidate.
+  region_quota     Compute regional quota the job needs free, by metric,
+                   e.g. ``{"CPUS": 16, "SSD_TOTAL_GB": 600}``.  Requires
+                   ``regions``.
   service_account  Email of the service account the VMs run as;
                    ``service_account_scopes`` (list) sets its OAuth scopes.
   network /        Network and subnetwork URLs or paths for the VMs;
@@ -66,6 +72,8 @@ _OPTION_KEYS = frozenset(
     {
         "project",
         "region",
+        "regions",
+        "region_quota",
         "service_account",
         "service_account_scopes",
         "network",
@@ -571,7 +579,7 @@ class GcpBatchClient:
         options = spec.backend_options
         job = self.build_job(spec)
         project = self._project(options)
-        region = self._region(options)
+        region = self._region(options, project)
         job_id = options.get("job_id") or (
             f"{options.get('job_id_prefix', 'job')}-{uuid.uuid4().hex[:16]}"
         )
@@ -849,11 +857,53 @@ class GcpBatchClient:
         return str(project)
 
     @staticmethod
-    def _region(options: dict) -> str:
-        region = (
-            options.get("region")
-            or os.environ.get("GOOGLE_CLOUD_REGION")
-            or os.environ.get("CLOUDSDK_COMPUTE_REGION")
+    def _region(options: dict, project: str) -> str:
+        region = options.get("region")
+        if region:
+            return str(region)
+        candidates = options.get("regions")
+        requirements = options.get("region_quota")
+        if candidates is None:
+            if requirements is not None:
+                raise SandboxConfigurationError(
+                    "backend_options['region_quota'] needs "
+                    "backend_options['regions'] to choose from",
+                    backend="gcp_batch",
+                    op="submit_job",
+                )
+        else:
+            if (
+                isinstance(candidates, str)
+                or not candidates
+                or not all(isinstance(r, str) and r for r in candidates)
+            ):
+                raise SandboxConfigurationError(
+                    "backend_options['regions'] must be a non-empty list of "
+                    "region names",
+                    backend="gcp_batch",
+                    op="submit_job",
+                )
+            if not requirements:
+                return str(candidates[0])
+            if not isinstance(requirements, dict) or not all(
+                isinstance(metric, str)
+                and isinstance(amount, (int, float))
+                and not isinstance(amount, bool)
+                for metric, amount in requirements.items()
+            ):
+                raise SandboxConfigurationError(
+                    "backend_options['region_quota'] must map Compute quota "
+                    "metric names to numbers",
+                    backend="gcp_batch",
+                    op="submit_job",
+                )
+            from bespokelabs.sandbox.backends import gcp_batch_placement
+
+            return gcp_batch_placement.choose_region(
+                project, list(candidates), requirements
+            ).region
+        region = os.environ.get("GOOGLE_CLOUD_REGION") or os.environ.get(
+            "CLOUDSDK_COMPUTE_REGION"
         )
         if not region:
             raise SandboxConfigurationError(
