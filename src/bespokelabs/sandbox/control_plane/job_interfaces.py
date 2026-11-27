@@ -107,3 +107,15 @@ class AuthorityStore(Protocol):
         details: dict | None = None,
     ) -> str:
         ...
+
+
+@runtime_checkable
+class SeedableAuthorityStore(AuthorityStore, Protocol):
+    """An authority store an operator can seed without an HTTP admin route."""
+
+    def ensure_organization(self, name: str) -> dict[str, str]:
+        """Return the organization with this name, creating it if absent."""
+        ...
+
+    def list_api_keys(self, organization_id: str) -> list[dict]:
+        ...

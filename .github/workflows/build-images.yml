@@ -10,6 +10,9 @@ name: Build and push optional agent images
 #     Users can opt in through a custom SandboxPreset(image=...).
 #
 # :sha-<short> is always emitted for audit/rollback.
+#
+# images/service is not an agent image and is never built or pushed here: it
+# needs the repository root as its build context and is built by deployers.
 
 on:
   push:
@@ -47,11 +50,15 @@ jobs:
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             if [[ "$INPUT" == "all" || -z "$INPUT" ]]; then
               # Build all images
-              IMAGES=$(ls -d images/*/ | xargs -I{} basename {} | jq -R -s -c 'split("\n") | map(select(. != ""))')
+              IMAGES=$(ls -d images/*/ | xargs -I{} basename {} | jq -R -s -c 'split("\n") | map(select(. != "" and . != "service"))')
             else
               # Validate single image input: must be a simple basename
               if ! [[ "$INPUT" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
                 echo "::error::Invalid image name. Must match ^[a-z0-9][a-z0-9_-]*$" >&2
+                exit 1
+              fi
+              if [[ "$INPUT" == "service" ]]; then
+                echo "::error::images/service is not published by this workflow" >&2
                 exit 1
               fi
               # Verify the directory exists
@@ -64,7 +71,7 @@ jobs:
             fi
           else
             # On push, only build images whose Dockerfile changed
-            CHANGED=$(git diff --name-only HEAD~1 HEAD -- images/ | cut -d/ -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(. != ""))')
+            CHANGED=$(git diff --name-only HEAD~1 HEAD -- images/ | cut -d/ -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(. != "" and . != "service"))')
             if [[ "$CHANGED" == "[]" || "$CHANGED" == '[""]' ]]; then
               IMAGES="[]"
             else

@@ -76,8 +76,12 @@ jobs:
           python-version: '3.12'
       - name: Install development, server, and PostgreSQL dependencies
         run: python -m pip install -e '.[dev,server,postgres]'
-      - name: Run hosted-job suite against PostgreSQL
-        run: python -m pytest tests/test_hosted_jobs_postgres.py -ra
+      - name: Run hosted-job suites against PostgreSQL
+        run: >-
+          python -m pytest
+          tests/test_hosted_jobs_postgres.py
+          tests/test_job_app_postgres.py
+          -ra
 
   lint:
     name: Lint and formatting

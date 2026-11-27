@@ -248,6 +248,7 @@ before deploying.
 | [Running agents](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/AGENT_GUIDE.md) | Agent placement, CLI harnesses, presets, token usage, cost reporting, Envy |
 | [Control plane setup](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_GUIDE.md) | Server setup, product keys, remote execution, dashboard, policies |
 | [Control plane operations](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_OPERATIONS.md) | Deployment, supervision, recovery, and operating limits |
+| [Jobs-only service deployment](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/JOBS_SERVICE_DEPLOYMENT.md) | Running the hosted-jobs API as a stateless container service on PostgreSQL |
 | [HTTP API contract](https://github.com/bespokelabsai/sandbox-router/blob/main/docs/CONTROL_PLANE_API.md) | Endpoints, authentication, request semantics, and exports |
 
 ## Examples
@@ -263,6 +264,7 @@ lists its own provider and agent prerequisites.
 | [claude_code_outside.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/claude_code_outside.py) | Host-side agent driving sandbox commands through a local bridge |
 | [claude_code_persona.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/claude_code_persona.py) | Declarative workspace and agent persona files |
 | [github_stats.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/github_stats.py) | Parsing agent output into a Pydantic model |
+| [jobs_service_host.py](https://github.com/bespokelabsai/sandbox-router/blob/main/examples/jobs_service_host.py) | Host module for the jobs-only service: PostgreSQL stores, one batch binding, an admission policy |
 
 A local transfer demo needs no cloud credentials or agent CLI:
 
