@@ -445,6 +445,76 @@ class SubmitTests(GcpBatchTestCase):
             r"^projects/other/locations/europe-west4/jobs/myapp-[0-9a-f]+$",
         )
 
+    def test_region_is_chosen_from_candidates_by_free_quota(self) -> None:
+        from bespokelabs.sandbox.backends import gcp_batch_placement
+
+        self.service.create_job.return_value = batch_v1.Job()
+        choice = gcp_batch_placement.RegionChoice("us-east1", True)
+        with mock.patch.object(
+            gcp_batch_placement, "choose_region", return_value=choice
+        ) as choose:
+            job_id = self.client.submit_job(
+                JobSpec(
+                    command="true",
+                    image="img",
+                    backend_options={
+                        "regions": ["us-central1", "us-east1"],
+                        "region_quota": {"CPUS": 16},
+                    },
+                )
+            )
+        choose.assert_called_once_with(
+            "proj", ["us-central1", "us-east1"], {"CPUS": 16}
+        )
+        self.assertIn("/locations/us-east1/jobs/", job_id)
+
+    def test_region_candidates_without_quota_or_with_explicit_region(
+        self,
+    ) -> None:
+        from bespokelabs.sandbox.backends import gcp_batch_placement
+
+        self.service.create_job.return_value = batch_v1.Job()
+        with mock.patch.object(gcp_batch_placement, "choose_region") as choose:
+            first = self.client.submit_job(
+                JobSpec(
+                    command="true",
+                    image="img",
+                    backend_options={"regions": ["us-west1", "us-east1"]},
+                )
+            )
+            explicit = self.client.submit_job(
+                JobSpec(
+                    command="true",
+                    image="img",
+                    backend_options={
+                        "region": "europe-west4",
+                        "regions": ["us-west1"],
+                        "region_quota": {"CPUS": 16},
+                    },
+                )
+            )
+        choose.assert_not_called()
+        self.assertIn("/locations/us-west1/jobs/", first)
+        self.assertIn("/locations/europe-west4/jobs/", explicit)
+
+    def test_invalid_region_candidates_are_rejected(self) -> None:
+        for options in (
+            {"regions": []},
+            {"regions": "us-central1"},
+            {"regions": ["us-central1", ""]},
+            {"region_quota": {"CPUS": 16}},
+            {"regions": ["us-central1"], "region_quota": {"CPUS": "many"}},
+            {"regions": ["us-central1"], "region_quota": ["CPUS"]},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaises(SandboxConfigurationError):
+                    self.client.submit_job(
+                        JobSpec(
+                            command="true", image="img", backend_options=options
+                        )
+                    )
+        self.service.create_job.assert_not_called()
+
     def test_configuration_errors(self) -> None:
         with self.assertRaises(SandboxConfigurationError):
             self.client.submit_job(
