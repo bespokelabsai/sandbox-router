@@ -181,14 +181,19 @@ _RESERVED_EXIT_CODES = {
 }
 
 # Why a job failed before any task exited, when Batch names a capacity cause.
-# Matched on the error codes Batch and Compute Engine put in an event's text
+# Quota wording is the documented status-event text ("Quota <NAME> exceeded.
+# Limit: ..." and "... due to inadequate quotas"); the code tokens are the
+# ones Batch and Compute Engine put in an event's text
 # (``CODE_GCE_QUOTA_EXCEEDED``, ``CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED``,
-# ``ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS``, ...) and on Compute Engine's
-# fixed wording for the same two errors.  The text itself is never returned.
+# ``ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS``).  The text itself is never
+# returned.
 _CAPACITY_REASONS = (
     (
         "quota_exceeded",
-        re.compile(r"QUOTA_EXCEEDED|Quota '[^']{1,128}' exceeded"),
+        re.compile(
+            r"QUOTA_EXCEEDED|Quota '?[\w.-]{1,128}'? exceeded"
+            r"|inadequate quotas"
+        ),
     ),
     (
         "capacity_unavailable",
@@ -198,9 +203,8 @@ _CAPACITY_REASONS = (
         ),
     ),
 )
-# Only the newest events explain a failure: a job that waited on quota while
-# queued and failed later for another cause is not a quota failure.
-_CAPACITY_EVENT_WINDOW = 3
+# A job that reached RUNNING survived whatever capacity event came before it.
+_REACHED_RUNNING = re.compile(r"\bto RUNNING\b")
 
 # Friendly GPU names (Modal-style, as JobSpec.gpu uses elsewhere) -> Compute
 # Engine accelerator types.  A raw ``nvidia-*`` type is accepted as is.
@@ -468,19 +472,43 @@ def task_counts(spec: JobSpec) -> tuple[int, int | None]:
     return task_count, parallelism
 
 
+def _event_time(event: Any) -> float | None:
+    stamp = getattr(event, "event_time", None)
+    try:
+        return stamp.timestamp() if stamp is not None else None
+    except (AttributeError, OverflowError, ValueError):
+        return None
+
+
 def capacity_reason(events: Any) -> str | None:
     """Classify status events as a quota or a capacity failure, if either.
 
-    Returns ``"quota_exceeded"``, ``"capacity_unavailable"`` or ``None``; the
-    newest matching event among the last few wins.
+    Returns ``"quota_exceeded"``, ``"capacity_unavailable"`` or ``None``.
+    Events are read in time order when every one carries a time (the API does
+    not promise an order).  Anything up to the last move to RUNNING is
+    ignored: a job that waited on capacity, then ran and failed for another
+    cause, is not a capacity failure.  Of what remains the newest match wins.
     """
-    recent = list(events or [])[-_CAPACITY_EVENT_WINDOW:]
-    for event in reversed(recent):
-        text = getattr(event, "description", None)
-        if not isinstance(text, str):
-            continue
+    ordered = [
+        event
+        for event in (events or [])
+        if isinstance(getattr(event, "description", None), str)
+    ]
+    times = [_event_time(event) for event in ordered]
+    if ordered and all(stamp is not None for stamp in times):
+        ordered = [
+            event
+            for _, event in sorted(
+                zip(times, ordered, strict=True), key=lambda pair: pair[0]
+            )
+        ]
+    for index in range(len(ordered) - 1, -1, -1):
+        if _REACHED_RUNNING.search(ordered[index].description):
+            ordered = ordered[index + 1 :]
+            break
+    for event in reversed(ordered):
         for reason, pattern in _CAPACITY_REASONS:
-            if pattern.search(text):
+            if pattern.search(event.description):
                 return reason
     return None
 

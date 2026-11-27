@@ -484,8 +484,10 @@ message is never stored or returned:
 | `cancelled`, `cancelled_before_dispatch` | Cancelled at the provider, or locally before dispatch |
 
 `quota_exceeded` and `capacity_unavailable` are recognized from provider error
-codes in the job's newest status events; a failure Batch describes some other
-way stays `batch_failed`, so treat `batch_failed` as "cause not classified",
+codes and quota wording in the job's and tasks' status events, read in time
+order. Events from before the job last reached `RUNNING` are ignored, so a job
+that waited on capacity, then ran and failed, is not reported as a capacity
+failure. A failure Batch describes some other way stays `batch_failed`, so treat `batch_failed` as "cause not classified",
 not as "not a capacity problem". A binding has one region, so retrying
 elsewhere means submitting to another binding with a new operation key.
 

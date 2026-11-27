@@ -1159,6 +1159,56 @@ class StatusTests(GcpBatchTestCase):
             capacity_reason([batch_v1.StatusEvent(type_="STATUS_CHANGED")])
         )
 
+    def test_capacity_reason_matches_the_documented_quota_wording(
+        self,
+    ) -> None:
+        for text in (
+            "VM group0 creation failed: Quota CPUS exceeded. Limit: 24.0 in "
+            "region us-central1",
+            "Quota checking process decides to delay scheduling for the job "
+            "uid-1 due to inadequate quotas [Quota: CPUS, limit: 24, usage: "
+            "24, wanted: 8.]",
+        ):
+            with self.subTest(text[:30]):
+                event = batch_v1.StatusEvent(description=text)
+                self.assertEqual(capacity_reason([event]), "quota_exceeded")
+
+    def test_capacity_event_before_running_is_not_the_cause(self) -> None:
+        events = [
+            batch_v1.StatusEvent(description=_STOCKOUT_EVENT),
+            batch_v1.StatusEvent(
+                description="Job state is set from SCHEDULED to RUNNING"
+            ),
+            batch_v1.StatusEvent(
+                description="Job state is set from RUNNING to FAILED"
+            ),
+        ]
+        self.assertIsNone(capacity_reason(events))
+        # The same stock-out after the last run attempt is the cause.
+        self.assertEqual(
+            capacity_reason([events[1], events[0]]), "capacity_unavailable"
+        )
+
+    def test_capacity_reason_orders_events_by_time(self) -> None:
+        import datetime
+
+        def at(second: int, text: str) -> object:
+            return batch_v1.StatusEvent(
+                description=text,
+                event_time=datetime.datetime(
+                    2025, 1, 1, 0, 0, second, tzinfo=datetime.timezone.utc
+                ),
+            )
+
+        # Listed newest first: the quota event is older than the move to
+        # RUNNING, so it does not explain the failure.
+        events = [
+            at(30, "Job state is set from RUNNING to FAILED"),
+            at(20, "Job state is set from SCHEDULED to RUNNING"),
+            at(10, _QUOTA_EVENT),
+        ]
+        self.assertIsNone(capacity_reason(events))
+
     def test_single_task_status_has_no_task_summary(self) -> None:
         for task_count in (0, 1):
             with self.subTest(task_count=task_count):
