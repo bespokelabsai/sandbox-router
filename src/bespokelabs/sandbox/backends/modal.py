@@ -381,6 +381,9 @@ def _list_apps(modal: Any) -> list[AppListing]:
             lifecycle = app.info().lifecycle
             state = getattr(lifecycle, "state", None)
             state = getattr(state, "value", state)
+            # The SDK's listing normally leaves stopped apps out already.
+            if isinstance(state, str) and state.lower() == "stopped":
+                continue
             name = getattr(app, "name", None) or getattr(
                 app, "description", None
             )

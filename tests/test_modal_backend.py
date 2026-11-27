@@ -430,6 +430,15 @@ class ModalListAppsTests(unittest.TestCase):
         )
         self.assertEqual(second.state, "ephemeral")
 
+    def test_a_stopped_app_is_left_out(self) -> None:
+        sdk = _FakeModal()
+        sdk.add("gone", "ap-1", state="stopped")
+        sdk.add("live", "ap-2")
+
+        self.assertEqual(
+            [app.name for app in sdk.client().list_apps()], ["live"]
+        )
+
     def test_an_unset_or_naive_creation_time_is_unknown_not_old(self) -> None:
         sdk = _FakeModal()
         sdk.add("a", "ap-1", created_at=datetime.fromtimestamp(0, timezone.utc))
