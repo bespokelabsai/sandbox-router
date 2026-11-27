@@ -396,7 +396,7 @@ class JobSpec:
 
       - command: an argv list (run without a shell) or a shell string (run
         with ``sh -c``).
-      - image: the container image the job runs in.
+      - image: the container image the job runs in (none for a script job).
       - env_vars: literal values exported for the command only.  Names must
         be valid shell identifiers.
       - timeout_secs: the command's own run-time limit.

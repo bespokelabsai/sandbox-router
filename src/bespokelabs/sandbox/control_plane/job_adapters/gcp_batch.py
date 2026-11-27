@@ -14,7 +14,15 @@ import re
 from dataclasses import replace
 from typing import Callable
 
-from bespokelabs.sandbox.exceptions import SandboxNotFoundError
+from bespokelabs.sandbox.backends.gcp_batch import (
+    secret_env_vars,
+    secret_project,
+    validate_options,
+)
+from bespokelabs.sandbox.exceptions import (
+    SandboxConfigurationError,
+    SandboxNotFoundError,
+)
 from bespokelabs.sandbox.protocols import SandboxJobBackend
 from bespokelabs.sandbox.types import JobSpec, JobState, JobStatus
 
@@ -85,9 +93,23 @@ class GcpBatchHostedAdapter:
             raise OwnershipConflict()
         if _RESERVED_OPTIONS.intersection(spec.backend_options):
             raise ValueError("Hosted resource routing is server-controlled")
+        try:
+            # Pure checks of the option values; never echo them to a caller.
+            validate_options(spec)
+            secrets = secret_env_vars(spec)
+        except SandboxConfigurationError:
+            raise ValueError("Invalid Cloud Batch job options") from None
+        # A secret reference names a project; like routing, that is the
+        # binding's. Which of its secrets a tenant may read is admission's job.
+        if any(
+            secret_project(resource) != self.binding.project
+            for resource in secrets.values()
+        ):
+            raise ValueError("Hosted secret references are server-scoped")
         # Match the public backend's label normalization so a differently
         # spelled request label cannot collide with the reserved marker.
-        for key in spec.labels:
+        instance_labels = spec.backend_options.get("instance_labels") or {}
+        for key in (*spec.labels, *instance_labels):
             normalized = re.sub(r"[^a-z0-9_-]", "_", key.lower())[:63]
             if not normalized or not normalized[0].isalpha():
                 normalized = ("l_" + normalized)[:63]

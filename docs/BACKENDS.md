@@ -249,6 +249,29 @@ unverified and outside this acceptance scope. Other providers' cloud tests
 were not executed. Do not collect `tests/test_regression.py` for Novita-only
 validation: its collection can create unrelated provider resources.
 
+## Google Cloud Batch: detached jobs
+
+`gcp_batch` runs detached jobs only (`SandboxClient("gcp_batch").submit_job`);
+it has no interactive sandboxes. A job is one Batch job with one task, on VMs
+in your own project, authenticated with Application Default Credentials.
+
+Beyond the generic `JobSpec` fields, `backend_options` reaches these Batch
+features:
+
+| Feature | `backend_options` |
+|---|---|
+| Container (default) or a shell script on the VM | `runnable` (`container` / `script`); a script job takes `command` as the script text and no `image` |
+| Environment variables from Secret Manager | `secret_env_vars` (`{"NAME": "projects/<project>/secrets/<name>/versions/<version>"}`); the VMs' service account needs `roles/secretmanager.secretAccessor` |
+| Boot disk | `boot_disk_image`, `boot_disk_type` (size is `JobSpec.disk_mb`) |
+| GPU drivers | Installed when `JobSpec.gpu` is set; `install_gpu_drivers` requests them for an accelerator-optimized `machine_type`, or turns them off |
+| VM hardening | `block_project_ssh_keys`, `no_external_ip`, `network` / `subnetwork`, `service_account` |
+| Labels | `JobSpec.labels` on the job and its VMs; `instance_labels` on the VMs only |
+| Placement and cost | `region` / `regions` / `region_quota`, `allowed_locations`, `machine_type`, `provisioning_model` |
+
+See [Detached jobs](SDK_REFERENCE.md#detached-jobs-google-cloud-batch) for
+every key and its validation, and [Hosted jobs](HOSTED_JOBS.md) for which of
+them a remote caller of the hosted API may send.
+
 ## Feature Support Matrix
 
 This table describes the adapters in this repository, not every feature offered

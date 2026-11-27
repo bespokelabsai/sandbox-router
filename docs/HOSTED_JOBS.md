@@ -271,6 +271,51 @@ clamping helper, HTTP rejects larger values. Returned text remains capped at
 1 MiB; logs are intentionally authorized workload output, not automatically
 redacted secret storage.
 
+### Cloud Batch options a caller may send
+
+`spec.backend_options` is forwarded to the native Cloud Batch job spec, so the
+options below are **caller-settable request fields**. Each one is in the copy
+of the spec that `admit` receives, and none of them changes the project,
+region, job name, credential account, or ownership label, which stay
+server-controlled. Their values are validated before the operation key is
+reserved (422, with a fixed message that never repeats the input).
+
+| Option | What the caller controls | What the server keeps |
+| --- | --- | --- |
+| `secret_env_vars` | Which Secret Manager secret versions become environment variables: `{"NAME": "projects/<project>/secrets/<name>/versions/<version>"}` | `<project>` must be exactly the binding's `project` string; other projects (and the project number in place of its ID, or the reverse) are rejected |
+| `runnable: "script"` | Runs `spec.command` (a string) as a shell script on the VM instead of in a container; `spec.image` must then be absent | Nothing more: admission must decide whether tenants may run scripts |
+| `boot_disk_image`, `boot_disk_type` | The VM's boot image and disk type | Nothing more: restrict images in admission |
+| `install_gpu_drivers` | Driver install for `spec.gpu` or an accelerator-optimized `machine_type` | - |
+| `block_project_ssh_keys` | Keeps project-wide SSH keys off the VMs | - |
+| `instance_labels` | Extra labels on the VMs only | The `hosted-job-owner` label, in any spelling that normalizes to it, is rejected; the server's ownership label is still applied to the job and its VMs as before |
+
+**Secrets.** The request, the job row, the audit trail, and every response
+carry at most the secret *reference*, never a value; Batch resolves the value
+on the VM. This service **does not check that the calling tenant is entitled
+to a secret**. It only checks the reference's format and project. The value is
+read with the job's runtime service account (`service_account`, else the
+project's default Compute Engine service account), which needs
+`roles/secretmanager.secretAccessor` on the secret, so any tenant admitted
+with a reference can read whatever that account can read. Restrict references
+per tenant in `admit`, for example to an allowlist or a per-tenant name prefix,
+and grant the runtime account access to those secrets only. A job's own output
+can still print a value it was given; logs are not redacted.
+
+**Scripts.** A script runs on the VM host, outside any container, as the
+runtime service account, and `allow_internet=False` cannot be combined with it
+(that flag only blocks a container's network). Allowing `runnable: "script"`
+is therefore a broader grant than allowing an image; deny it in `admit` unless
+the tenant is meant to have it. The script is the `command` string and counts
+toward the 64 KiB request cap after JSON escaping (a newline is two bytes), so
+the largest script that fits is somewhat under 64 KiB. The cap is not raised
+for scripts and there is no separate script limit: a larger payload gets 413.
+Keep the script a small bootstrap that fetches the rest from the VM image or
+Cloud Storage.
+
+An admission policy should **allowlist** option keys rather than block known
+ones, so an option added in a later release is denied until the host has
+reviewed it.
+
 The job DTO exposes only `id`, `backend`, `phase`, `state`, `confidence`,
 `cancel_requested`, safe `error_code`, and terminal-only `result`. Results expose
 only terminal state, bounded integer exit code, allowlisted reason and parsed
@@ -343,14 +388,17 @@ payloads never enter durable storage; commands and environment values are kept
 only in request memory for the actual native submission in this control plane.
 The provider retains the submitted Batch job definition, including task
 environment values; absence from the local database is not provider-side secret
-redaction or a substitute for a provider secret-management policy.
+redaction or a substitute for a provider secret-management policy. To keep a
+value out of the Batch job definition as well, pass it by reference with the
+`secret_env_vars` option (see "Cloud Batch options a caller may send").
 
 Before dispatch, the row contains the full provider resource name, a random
 ownership marker, and the trusted binding identity. Batch receives that reserved
 name via `backend_options.job_id`. The routing fields (`project`, `region`,
 `job_id`, `job_id_prefix`) and `hosted-job-owner` ownership label are reserved
 for the server and cannot be overridden by hosted request payloads, including
-label spellings that normalize to the reserved label. Other resource defaults
+label spellings that normalize to the reserved label, in `labels` or in the
+VM-only `instance_labels` option. Other resource defaults
 are unchanged. Pure hosted routing/label validation runs before reservation:
 invalid reserved options consume no operation key and perform no provider RPC.
 The adapter validates again before submission. A changed policy or other

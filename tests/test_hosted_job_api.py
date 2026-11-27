@@ -263,6 +263,108 @@ def test_invalid_request_does_not_consume_key(h, change):
     assert h.backend.submits == 1
 
 
+_NEW_OPTIONS = {
+    "runnable": "script",
+    "secret_env_vars": {
+        "API_KEY": "projects/example-project/secrets/api-key/versions/latest"
+    },
+    "boot_disk_image": "projects/example-project/global/images/worker",
+    "boot_disk_type": "pd-balanced",
+    "machine_type": "g2-standard-8",
+    "install_gpu_drivers": True,
+    "block_project_ssh_keys": True,
+    "instance_labels": {"pool": "gpu"},
+}
+
+
+def _options_body(options, command="#!/bin/bash\necho hello\n"):
+    return {
+        "binding_id": "batch",
+        "spec": {"command": command, "backend_options": options},
+    }
+
+
+def test_admission_sees_the_new_batch_options_and_can_reject_them(h):
+    def policy(principal, binding, spec):
+        h.admissions.append(spec)
+        secrets = spec.backend_options.get("secret_env_vars", {})
+        return (
+            spec.backend_options.get("runnable") != "script"
+            or h.allowed is True
+        ) and all("/secrets/api-key/" in ref for ref in secrets.values())
+
+    client = h.restart(h.config(admit=policy))
+    accepted = h.post(body=_options_body(_NEW_OPTIONS), client=client)
+    assert accepted.status_code == 202, accepted.text
+    assert h.admissions[-1].backend_options == _NEW_OPTIONS
+    assert h.backend.runtime_spec.backend_options == {
+        **_NEW_OPTIONS,
+        "project": h.binding.project,
+        "region": h.binding.region,
+        "job_id": h.backend.runtime_spec.backend_options["job_id"],
+    }
+    # Neither the script nor the secret reference is stored or returned.
+    assert "api-key" not in accepted.text and "echo hello" not in accepted.text
+    assert "api-key" not in repr(h.row()) and "echo hello" not in repr(h.row())
+
+    other = {
+        **_NEW_OPTIONS,
+        "secret_env_vars": {
+            "DB": "projects/example-project/secrets/database/versions/1"
+        },
+    }
+    denied = h.post(
+        body=_options_body(other), key="other-secret", client=client
+    )
+    assert denied.status_code == 403
+    h.allowed = False
+    denied = h.post(
+        body=_options_body(_NEW_OPTIONS), key="script", client=client
+    )
+    assert denied.status_code == 403
+    assert h.backend.submits == 1
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {
+            "secret_env_vars": {
+                "API_KEY": "projects/other-project/secrets/api-key/versions/1"
+            }
+        },
+        {"secret_env_vars": {"API_KEY": "pasted-secret-value"}},
+        {"instance_labels": {"hosted-job-owner": "override"}},
+        {"runnable": "script", "project": "other-project"},
+        {"runnable": "script", "container_options": "--privileged"},
+        {"install_gpu_drivers": True},
+        {"block_project_ssh_keys": 1},
+    ],
+)
+def test_invalid_new_batch_options_are_422_and_keep_the_key(h, options):
+    response = h.post(body=_options_body(options), key="reusable")
+    assert response.status_code == 422, response.text
+    assert "pasted-secret-value" not in response.text
+    assert h.backend.submits == 0
+    with h.store.connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM hosted_jobs").fetchone()[0]
+            == 0
+        )
+    assert h.post(key="reusable").status_code == 202
+
+
+def test_a_script_counts_toward_the_request_size_cap(h):
+    fits = h.post(body=_options_body({"runnable": "script"}, "x" * 60_000))
+    assert fits.status_code == 202, fits.text
+    assert len(h.backend.runtime_spec.command) == 60_000
+    large = h.post(
+        body=_options_body({"runnable": "script"}, "x" * 70_000), key="large"
+    )
+    assert large.status_code == 413
+    assert h.backend.submits == 1
+
+
 @pytest.mark.parametrize("key", [None, "", " ", "x" * 513])
 def test_required_bounded_header_never_reflects_input(h, key):
     headers = h.headers

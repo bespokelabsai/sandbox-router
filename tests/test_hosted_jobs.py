@@ -642,6 +642,76 @@ def test_adapter_scope_and_public_direct_api_contract(h):
         adapter.observe(record)
 
 
+_SECRET = "projects/example-project/secrets/api-key/versions/latest"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"instance_labels": {OWNERSHIP_LABEL: "override"}},
+        {"instance_labels": {"Hosted-Job-Owner": "override"}},
+        {"instance_labels": {"pool": 1}},
+        {"secret_env_vars": {"API_KEY": "pasted-secret-value"}},
+        {"secret_env_vars": {"TOKEN": _SECRET}},
+        {
+            "secret_env_vars": {
+                "API_KEY": "projects/other-project/secrets/api-key/versions/1"
+            }
+        },
+        {"runnable": "vm"},
+        {"runnable": "script", "container_options": "--privileged"},
+        {"boot_disk_type": ""},
+        {"install_gpu_drivers": True},
+        {"block_project_ssh_keys": "yes"},
+    ],
+)
+def test_invalid_batch_options_fail_before_reservation(h, options):
+    spec = JobSpec("true", env_vars={"TOKEN": "x"}, backend_options=options)
+    with pytest.raises(ValueError) as error:
+        h.submit(spec)
+    # Fixed text only: a malformed reference may be a pasted secret value.
+    assert "pasted-secret-value" not in str(error.value)
+    assert error.value.__cause__ is None
+    with sqlite3.connect(h.path) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM hosted_jobs").fetchone()[0]
+            == 0
+        )
+    assert h.backend.submits == 0
+
+
+def test_batch_options_reach_native_submit_with_server_routing(h):
+    options = {
+        "runnable": "script",
+        "secret_env_vars": {"API_KEY": _SECRET},
+        "boot_disk_image": "projects/example-project/global/images/worker",
+        "boot_disk_type": "pd-balanced",
+        "machine_type": "g2-standard-8",
+        "install_gpu_drivers": True,
+        "block_project_ssh_keys": True,
+        "instance_labels": {"pool": "gpu"},
+    }
+    spec = JobSpec("#!/bin/bash\necho hello\n", backend_options=dict(options))
+    record = h.submit(spec)
+    assert record.phase is JobPhase.ACTIVE
+    actual = h.backend.runtime_spec
+    assert actual.command == spec.command and actual.image is None
+    assert actual.backend_options == {
+        **options,
+        "project": h.binding.project,
+        "region": h.binding.region,
+        "job_id": record.resource_name.rsplit("/", 1)[-1],
+    }
+    # The marker stays a job label (so also a VM label), never instance-only.
+    assert actual.labels == {OWNERSHIP_LABEL: record.ownership_marker}
+    # A changed secret reference is a different payload for the same key.
+    changed = copy.deepcopy(spec)
+    changed.backend_options["secret_env_vars"]["API_KEY"] = _SECRET[:-6] + "2"
+    with pytest.raises(ConflictError):
+        h.submit(changed)
+    assert h.backend.submits == 1
+
+
 @pytest.mark.parametrize(
     "spec",
     [

@@ -1,6 +1,7 @@
 """Google Cloud Batch backend: native detached jobs, no interactive sandboxes.
 
-A job is one Batch job with one task running one container runnable.  The
+A job is one Batch job with one task running one runnable: a container, or
+with ``runnable="script"`` a shell script on the VM itself.  The
 job id is the job's resource name (``projects/<p>/locations/<region>/jobs/
 <id>``), so status, logs and cancel need no configuration beyond credentials.
 
@@ -22,6 +23,22 @@ Configuration (``JobSpec.backend_options`` wins over the environment):
   subnetwork       ``no_external_ip`` (bool) drops their external IP.
   machine_type     Overrides the machine type chosen for ``cpu`` /
                    ``memory_mb`` / ``gpu``.
+  runnable         ``container`` (default) or ``script``.  A script job runs
+                   ``JobSpec.command`` (a shell string) as a script on the
+                   VM and takes no ``image``.
+  secret_env_vars  Environment variables read from Secret Manager, as
+                   ``{"NAME": "projects/<project>/secrets/<name>/versions/
+                   <version>"}``.  The job carries the reference, never the
+                   value; the VMs' service account needs access to it.
+  boot_disk_image /   Boot disk image (e.g. ``batch-debian`` or
+  boot_disk_type      ``projects/<p>/global/images/<image>``) and disk type
+                   (e.g. ``pd-balanced``); ``JobSpec.disk_mb`` is its size.
+  install_gpu_drivers  Whether Batch installs GPU drivers.  Defaults to
+                   whether ``JobSpec.gpu`` is set; ``True`` without it needs
+                   an accelerator-optimized ``machine_type``.
+  block_project_ssh_keys  ``True`` keeps project-wide SSH keys off the VMs.
+  instance_labels  Labels for the VMs only, on top of ``JobSpec.labels``
+                   (which go on the job and the VMs).
   provisioning_model  ``STANDARD`` (default), ``SPOT``, ``PREEMPTIBLE`` or
                    ``FLEX_START``.
   allowed_locations   List such as ``["zones/us-central1-a"]``.
@@ -85,6 +102,13 @@ _OPTION_KEYS = frozenset(
         "max_retry_count",
         "container_options",
         "gpu_driver_version",
+        "runnable",
+        "secret_env_vars",
+        "boot_disk_image",
+        "boot_disk_type",
+        "install_gpu_drivers",
+        "block_project_ssh_keys",
+        "instance_labels",
         "job_id",
         "job_id_prefix",
     }
@@ -96,6 +120,14 @@ _JOB_NAME_RE = re.compile(
 )
 _JOB_ID_RE = re.compile(r"[a-z]([a-z0-9-]{0,61}[a-z0-9])?")
 _LABEL_RE = re.compile(r"[^a-z0-9_-]")
+_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SECRET_VERSION_RE = re.compile(
+    r"projects/(?P<project>[A-Za-z0-9][A-Za-z0-9.:-]*)"
+    r"/secrets/[A-Za-z0-9_-]{1,255}/versions/[A-Za-z0-9_-]{1,255}"
+)
+# Accelerator-optimized machine families: every such VM carries GPUs.
+_GPU_MACHINE_TYPE_RE = re.compile(r"(a2|a3|a4|a4x|g2|g4)-[a-z0-9-]+")
+_RUNNABLES = ("container", "script")
 
 # Batch job states -> JobState.  STATE_UNSPECIFIED is a job Batch has not
 # classified yet, not an unknown outcome, so it reads as pending.  A job
@@ -295,6 +327,138 @@ def _labels(labels: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _invalid(message: str) -> SandboxConfigurationError:
+    return SandboxConfigurationError(
+        message, backend="gcp_batch", op="submit_job"
+    )
+
+
+def secret_env_vars(spec: JobSpec) -> dict[str, str]:
+    """Return the validated ``secret_env_vars`` option (name -> version)."""
+    secrets = spec.backend_options.get("secret_env_vars")
+    if secrets is None:
+        return {}
+    if not isinstance(secrets, dict):
+        raise _invalid(
+            "backend_options['secret_env_vars'] must map variable names to "
+            "Secret Manager secret versions"
+        )
+    for name, resource in secrets.items():
+        if not isinstance(name, str) or not _ENV_NAME_RE.fullmatch(name):
+            raise _invalid(
+                f"secret_env_vars name {name!r} is not a valid variable name"
+            )
+        if name in spec.env_vars:
+            raise _invalid(f"{name!r} is in both env_vars and secret_env_vars")
+        # The reference is not echoed: a malformed one may be a pasted value.
+        if not isinstance(resource, str) or not _SECRET_VERSION_RE.fullmatch(
+            resource
+        ):
+            raise _invalid(
+                f"secret_env_vars[{name!r}] must look like "
+                "'projects/<project>/secrets/<name>/versions/<version>'"
+            )
+    return dict(secrets)
+
+
+def secret_project(resource: str) -> str:
+    """Return the project of a validated secret version resource name."""
+    match = _SECRET_VERSION_RE.fullmatch(resource)
+    if match is None:
+        raise _invalid("Not a Secret Manager secret version resource name")
+    return match["project"]
+
+
+def instance_labels(spec: JobSpec) -> dict[str, str]:
+    """Return the coerced VM-only labels, which may not repeat a job label."""
+    extra = spec.backend_options.get("instance_labels")
+    if extra is None:
+        return {}
+    if not isinstance(extra, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in extra.items()
+    ):
+        raise _invalid(
+            "backend_options['instance_labels'] must map label names to "
+            "strings"
+        )
+    labels = _labels(extra)
+    repeated = sorted(set(labels) & set(_labels(spec.labels)))
+    if repeated:
+        raise _invalid(
+            f"instance_labels repeats the job label {repeated[0]!r}; "
+            "JobSpec.labels already go on the VMs"
+        )
+    return labels
+
+
+def _flag(options: dict, key: str) -> bool | None:
+    value = options.get(key)
+    if value is not None and not isinstance(value, bool):
+        raise _invalid(f"backend_options[{key!r}] must be a boolean")
+    return value
+
+
+def validate_options(spec: JobSpec) -> None:
+    """Check the options that can be judged without the SDK or the network.
+
+    Covers ``runnable``, ``secret_env_vars``, ``boot_disk_image``,
+    ``boot_disk_type``, ``install_gpu_drivers``, ``block_project_ssh_keys``
+    and ``instance_labels``; ``build_job`` checks the rest.
+    """
+    options = spec.backend_options
+    runnable = options.get("runnable", "container")
+    if runnable not in _RUNNABLES:
+        raise _invalid(
+            "backend_options['runnable'] must be 'container' or 'script'"
+        )
+    if runnable == "script":
+        if spec.image:
+            raise _invalid(
+                "A script job runs on the VM and takes no JobSpec.image; "
+                "give either an image or runnable='script'"
+            )
+        if not isinstance(spec.command, str):
+            raise _invalid(
+                "A script job needs JobSpec.command as the script text "
+                "(a string), not an argv list"
+            )
+        if spec.workdir or options.get("container_options"):
+            raise _invalid(
+                "workdir and container_options apply to a container, not "
+                "to a script job"
+            )
+        if not spec.allow_internet:
+            raise _invalid(
+                "allow_internet=False blocks a container's network; a "
+                "script job is restricted through the VM's network instead"
+            )
+    secret_env_vars(spec)
+    for key in ("boot_disk_image", "boot_disk_type"):
+        value = options.get(key)
+        if value is not None and (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 1024
+            or re.search(r"\s", value)
+        ):
+            raise _invalid(
+                f"backend_options[{key!r}] must be a non-empty string "
+                "without whitespace"
+            )
+    _flag(options, "block_project_ssh_keys")
+    if _flag(options, "install_gpu_drivers") and not spec.gpu:
+        machine_type = options.get("machine_type")
+        if not isinstance(
+            machine_type, str
+        ) or not _GPU_MACHINE_TYPE_RE.fullmatch(machine_type):
+            raise _invalid(
+                "install_gpu_drivers needs JobSpec.gpu or an "
+                "accelerator-optimized machine_type (A2, A3, A4, G2, G4)"
+            )
+    instance_labels(spec)
+
+
 def _classify(exc: Exception, op: str) -> SandboxError:
     """Translate google-api-core errors into the public error taxonomy."""
     if isinstance(exc, SandboxError):
@@ -440,40 +604,26 @@ class GcpBatchClient:
                 backend="gcp_batch",
                 op="submit_job",
             )
-        if not spec.image:
+        validate_options(spec)
+        script = options.get("runnable") == "script"
+        if not spec.image and not script:
             raise SandboxConfigurationError(
                 "gcp_batch jobs need JobSpec.image (a container image URI, "
-                "e.g. in Artifact Registry)",
+                "e.g. in Artifact Registry), or backend_options['runnable']"
+                "='script' to run the command as a script on the VM",
                 backend="gcp_batch",
                 op="submit_job",
             )
 
-        if isinstance(spec.command, list):
-            entrypoint, commands = spec.command[0], spec.command[1:]
+        if script:
+            runnable = batch.Runnable(
+                script=batch.Runnable.Script(text=spec.command)
+            )
         else:
-            entrypoint, commands = "/bin/sh", ["-c", spec.command]
-        container = batch.Runnable.Container(
-            image_uri=spec.image,
-            entrypoint=entrypoint,
-            commands=commands,
-            block_external_network=not spec.allow_internet,
-        )
-        container_options = []
-        if spec.workdir:
-            if re.search(r"\s", spec.workdir):
-                raise SandboxConfigurationError(
-                    "gcp_batch workdir cannot contain whitespace",
-                    backend="gcp_batch",
-                    op="submit_job",
-                )
-            container_options.append(f"--workdir={spec.workdir}")
-        if options.get("container_options"):
-            container_options.append(str(options["container_options"]))
-        if container_options:
-            container.options = " ".join(container_options)
+            runnable = batch.Runnable(container=self._container(spec))
 
         task = batch.TaskSpec(
-            runnables=[batch.Runnable(container=container)],
+            runnables=[runnable],
             compute_resource=batch.ComputeResource(
                 cpu_milli=int(math.ceil(spec.cpu * 1000)),
                 memory_mib=int(spec.memory_mb),
@@ -481,8 +631,11 @@ class GcpBatchClient:
             max_run_duration=datetime.timedelta(seconds=int(spec.timeout_secs)),
             max_retry_count=int(options.get("max_retry_count", 0)),
         )
-        if spec.env_vars:
+        secrets = secret_env_vars(spec)
+        if spec.env_vars or secrets:
             task.environment = batch.Environment(variables=dict(spec.env_vars))
+            if secrets:
+                task.environment.secret_variables = secrets
 
         policy = batch.AllocationPolicy.InstancePolicy()
         install_drivers = False
@@ -505,12 +658,19 @@ class GcpBatchClient:
             machine_type = machine_type or machine_type_for(
                 accelerator, count, spec.cpu, spec.memory_mb
             )
+        if options.get("install_gpu_drivers") is not None:
+            install_drivers = options["install_gpu_drivers"]
         if machine_type:
             policy.machine_type = str(machine_type)
+        disk: dict[str, Any] = {}
         if spec.disk_mb:
-            policy.boot_disk = batch.AllocationPolicy.Disk(
-                size_gb=int(math.ceil(spec.disk_mb / 1024))
-            )
+            disk["size_gb"] = int(math.ceil(spec.disk_mb / 1024))
+        if options.get("boot_disk_image"):
+            disk["image"] = options["boot_disk_image"]
+        if options.get("boot_disk_type"):
+            disk["type_"] = options["boot_disk_type"]
+        if disk:
+            policy.boot_disk = batch.AllocationPolicy.Disk(**disk)
         if options.get("provisioning_model"):
             model = str(options["provisioning_model"]).upper()
             try:
@@ -524,17 +684,21 @@ class GcpBatchClient:
                     op="submit_job",
                 ) from exc
 
-        allocation = batch.AllocationPolicy(
-            instances=[
-                batch.AllocationPolicy.InstancePolicyOrTemplate(
-                    policy=policy, install_gpu_drivers=install_drivers
-                )
-            ]
+        instances = batch.AllocationPolicy.InstancePolicyOrTemplate(
+            policy=policy, install_gpu_drivers=install_drivers
         )
+        if options.get("block_project_ssh_keys"):
+            if "block_project_ssh_keys" not in type(instances).meta.fields:
+                raise _invalid(
+                    "block_project_ssh_keys needs a newer google-cloud-batch"
+                )
+            instances.block_project_ssh_keys = True
+        allocation = batch.AllocationPolicy(instances=[instances])
         labels = _labels(spec.labels)
-        if labels:
+        vm_labels = {**labels, **instance_labels(spec)}
+        if vm_labels:
             # On the VMs too, so their cost is attributed like the job's.
-            allocation.labels = labels
+            allocation.labels = vm_labels
         if options.get("service_account"):
             allocation.service_account = batch.ServiceAccount(
                 email=str(options["service_account"]),
@@ -574,6 +738,34 @@ class GcpBatchClient:
                 destination=batch.LogsPolicy.Destination.CLOUD_LOGGING
             ),
         )
+
+    def _container(self, spec: JobSpec) -> Any:
+        batch = self._batch
+        options = spec.backend_options
+        if isinstance(spec.command, list):
+            entrypoint, commands = spec.command[0], spec.command[1:]
+        else:
+            entrypoint, commands = "/bin/sh", ["-c", spec.command]
+        container = batch.Runnable.Container(
+            image_uri=spec.image,
+            entrypoint=entrypoint,
+            commands=commands,
+            block_external_network=not spec.allow_internet,
+        )
+        container_options = []
+        if spec.workdir:
+            if re.search(r"\s", spec.workdir):
+                raise SandboxConfigurationError(
+                    "gcp_batch workdir cannot contain whitespace",
+                    backend="gcp_batch",
+                    op="submit_job",
+                )
+            container_options.append(f"--workdir={spec.workdir}")
+        if options.get("container_options"):
+            container_options.append(str(options["container_options"]))
+        if container_options:
+            container.options = " ".join(container_options)
+        return container
 
     def submit_job(self, spec: JobSpec) -> str:
         options = spec.backend_options
