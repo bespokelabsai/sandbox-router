@@ -9,6 +9,9 @@ Adapters must not translate permission failures or incomplete searches into
 absence. Adapters without explicit scope fields remain responsible for tenant
 filtering.
 
+Deciding which listed resources are safe to delete, and deleting them, is a
+separate library with its own guards: see the [reaper planner](RESOURCE_REAPER.md).
+
 ## Evidence and timestamps
 
 Provider timestamps must contain a timezone offset and convert safely to UTC.
