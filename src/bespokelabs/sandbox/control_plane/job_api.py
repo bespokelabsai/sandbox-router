@@ -22,7 +22,13 @@ from bespokelabs.sandbox.types import JobSpec, JobState
 
 from .errors import AuthorizationError, ConflictError, NotFoundError
 from .job_interfaces import JobRepository
-from .job_models import ConfiguredJobBinding, HostedJob, JobBinding, JobPhase
+from .job_models import (
+    ConfiguredJobBinding,
+    HostedJob,
+    JobBinding,
+    JobPhase,
+    bounded_task_summary,
+)
 from .job_service import HostedJobService
 from .job_store import HostedJobRepository, hosted_job_hmac
 from .models import Principal
@@ -37,6 +43,8 @@ _SAFE_REASONS = frozenset(
         "cancelled",
         "timeout",
         "batch_failed",
+        "quota_exceeded",
+        "capacity_unavailable",
         "exit_code",
         "vm_preempted",
         "vm_lost",
@@ -166,6 +174,10 @@ def _result_response(result: dict | None) -> dict | None:
                     response[key] = parsed.isoformat()
             except ValueError:
                 pass
+    # Multi-task jobs only: the key is absent from a single-task result.
+    tasks = bounded_task_summary(result.get("tasks"), _SAFE_REASONS)
+    if tasks is not None:
+        response["tasks"] = tasks
     return response
 
 

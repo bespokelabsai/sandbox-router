@@ -214,3 +214,39 @@ def test_server_rejects_reserved_options_without_provider_access(http_jobs):
     assert caught.value.status_code == 422
     assert h.backend.submits == 0
     assert submit(client, key="reusable-key").phase == "active"
+
+
+def test_multi_task_result_and_capacity_reason_over_http(http_jobs):
+    h, client, _ = http_jobs
+    job = client.submit(
+        JobSpec(
+            ["printf", "hello"],
+            backend_options={"task_count": 3, "parallelism": 2},
+        ),
+        binding_id="batch",
+        idempotency_key="multi-task-operation",
+    )
+    assert h.backend.runtime_spec.backend_options["task_count"] == 3
+    provider = h.backend.jobs[h.row()["resource_name"]]
+    provider.state = JobState.FAILED
+    provider.reason = "capacity_unavailable"
+    provider.details["message"] = "zone-secret has no capacity"
+    provider.details["tasks"] = {
+        "count": 3,
+        "succeeded": 1,
+        "failed": 2,
+        "other": 0,
+        "failures": [
+            {"index": 0, "exit_code": None, "reason": "capacity_unavailable"},
+            {"index": 2, "exit_code": 50001, "reason": "vm_preempted"},
+        ],
+        "truncated": False,
+    }
+    result = client.result(job.id)
+    assert result.state == "failed" and result.reason == "capacity_unavailable"
+    assert (result.tasks.count, result.tasks.failed) == (3, 2)
+    assert [(f.index, f.reason) for f in result.tasks.failures] == [
+        (0, "capacity_unavailable"),
+        (2, "vm_preempted"),
+    ]
+    assert "zone-secret" not in json.dumps(h.row())

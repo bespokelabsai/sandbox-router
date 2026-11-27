@@ -1,7 +1,8 @@
 """Google Cloud Batch backend: native detached jobs, no interactive sandboxes.
 
-A job is one Batch job with one task running one runnable: a container, or
-with ``runnable="script"`` a shell script on the VM itself.  The
+A job is one Batch job whose tasks each run one runnable: a container, or
+with ``runnable="script"`` a shell script on the VM itself.  It has one task
+unless ``task_count`` asks for more.  The
 job id is the job's resource name (``projects/<p>/locations/<region>/jobs/
 <id>``), so status, logs and cancel need no configuration beyond credentials.
 
@@ -43,6 +44,13 @@ Configuration (``JobSpec.backend_options`` wins over the environment):
                    ``FLEX_START``.
   allowed_locations   List such as ``["zones/us-central1-a"]``.
   max_retry_count  Task retries (default 0).
+  task_count       Number of tasks (default 1, at most ``MAX_TASK_COUNT``).
+                   Every task runs the same command; Batch gives each one
+                   its index in ``BATCH_TASK_INDEX`` (0-based) and the total
+                   in ``BATCH_TASK_COUNT``.
+  parallelism      How many tasks may run at once (1..``task_count``, at
+                   most ``MAX_PARALLELISM``); by default Batch runs as many
+                   as it can.
   container_options   Extra ``docker run`` options for the container.
   gpu_driver_version  Passed to Batch with ``install_gpu_drivers``.
   job_id           Explicit Batch job id; else ``<job_id_prefix>-<random>``
@@ -100,6 +108,8 @@ _OPTION_KEYS = frozenset(
         "provisioning_model",
         "allowed_locations",
         "max_retry_count",
+        "task_count",
+        "parallelism",
         "container_options",
         "gpu_driver_version",
         "runnable",
@@ -128,6 +138,16 @@ _SECRET_VERSION_RE = re.compile(
 # Accelerator-optimized machine families: every such VM carries GPUs.
 _GPU_MACHINE_TYPE_RE = re.compile(r"(a2|a3|a4|a4x|g2|g4)-[a-z0-9-]+")
 _RUNNABLES = ("container", "script")
+
+#: Most tasks one job may ask for.  Batch itself allows more; every status
+#: read lists the job's tasks, so the bound keeps that read small.
+MAX_TASK_COUNT = 10_000
+#: Most tasks one job may run at once (Batch's own per-job limit).
+MAX_PARALLELISM = 5_000
+#: Most failed tasks described in ``JobStatus.details["tasks"]["failures"]``.
+MAX_TASK_FAILURES = 20
+_TASK_PAGE_SIZE = 1000
+_TASK_INDEX_RE = re.compile(r".*/tasks/(?P<index>[0-9]{1,9})")
 
 # Batch job states -> JobState.  STATE_UNSPECIFIED is a job Batch has not
 # classified yet, not an unknown outcome, so it reads as pending.  A job
@@ -159,6 +179,32 @@ _RESERVED_EXIT_CODES = {
     50005: "timeout",
     50006: "vm_recreated",
 }
+
+# Why a job failed before any task exited, when Batch names a capacity cause.
+# Quota wording is the documented status-event text ("Quota <NAME> exceeded.
+# Limit: ..." and "... due to inadequate quotas"); the code tokens are the
+# ones Batch and Compute Engine put in an event's text
+# (``CODE_GCE_QUOTA_EXCEEDED``, ``CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED``,
+# ``ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS``).  The text itself is never
+# returned.
+_CAPACITY_REASONS = (
+    (
+        "quota_exceeded",
+        re.compile(
+            r"QUOTA_EXCEEDED|Quota '?[\w.-]{1,128}'? exceeded"
+            r"|inadequate quotas"
+        ),
+    ),
+    (
+        "capacity_unavailable",
+        re.compile(
+            r"RESOURCE_POOL_EXHAUSTED|STOCKOUT"
+            r"|does not have enough resources available"
+        ),
+    ),
+)
+# A job that reached RUNNING survived whatever capacity event came before it.
+_REACHED_RUNNING = re.compile(r"\bto RUNNING\b")
 
 # Friendly GPU names (Modal-style, as JobSpec.gpu uses elsewhere) -> Compute
 # Engine accelerator types.  A raw ``nvidia-*`` type is accepted as is.
@@ -399,14 +445,84 @@ def _flag(options: dict, key: str) -> bool | None:
     return value
 
 
+def _count(options: dict, key: str, maximum: int) -> int | None:
+    value = options.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise _invalid(f"backend_options[{key!r}] must be a positive integer")
+    if value > maximum:
+        raise _invalid(f"backend_options[{key!r}] can be at most {maximum}")
+    return value
+
+
+def task_counts(spec: JobSpec) -> tuple[int, int | None]:
+    """Return the validated ``(task_count, parallelism)`` options.
+
+    ``parallelism`` is ``None`` when it is left to Batch.
+    """
+    options = spec.backend_options
+    task_count = _count(options, "task_count", MAX_TASK_COUNT) or 1
+    parallelism = _count(options, "parallelism", MAX_PARALLELISM)
+    if parallelism is not None and parallelism > task_count:
+        raise _invalid(
+            "backend_options['parallelism'] cannot exceed task_count "
+            f"({task_count})"
+        )
+    return task_count, parallelism
+
+
+def _event_time(event: Any) -> float | None:
+    stamp = getattr(event, "event_time", None)
+    try:
+        return stamp.timestamp() if stamp is not None else None
+    except (AttributeError, OverflowError, ValueError):
+        return None
+
+
+def capacity_reason(events: Any) -> str | None:
+    """Classify status events as a quota or a capacity failure, if either.
+
+    Returns ``"quota_exceeded"``, ``"capacity_unavailable"`` or ``None``.
+    Events are read in time order when every one carries a time (the API does
+    not promise an order).  Anything up to the last move to RUNNING is
+    ignored: a job that waited on capacity, then ran and failed for another
+    cause, is not a capacity failure.  Of what remains the newest match wins.
+    """
+    ordered = [
+        event
+        for event in (events or [])
+        if isinstance(getattr(event, "description", None), str)
+    ]
+    times = [_event_time(event) for event in ordered]
+    if ordered and all(stamp is not None for stamp in times):
+        ordered = [
+            event
+            for _, event in sorted(
+                zip(times, ordered, strict=True), key=lambda pair: pair[0]
+            )
+        ]
+    for index in range(len(ordered) - 1, -1, -1):
+        if _REACHED_RUNNING.search(ordered[index].description):
+            ordered = ordered[index + 1 :]
+            break
+    for event in reversed(ordered):
+        for reason, pattern in _CAPACITY_REASONS:
+            if pattern.search(event.description):
+                return reason
+    return None
+
+
 def validate_options(spec: JobSpec) -> None:
     """Check the options that can be judged without the SDK or the network.
 
     Covers ``runnable``, ``secret_env_vars``, ``boot_disk_image``,
-    ``boot_disk_type``, ``install_gpu_drivers``, ``block_project_ssh_keys``
-    and ``instance_labels``; ``build_job`` checks the rest.
+    ``boot_disk_type``, ``install_gpu_drivers``, ``block_project_ssh_keys``,
+    ``instance_labels``, ``task_count`` and ``parallelism``; ``build_job``
+    checks the rest.
     """
     options = spec.backend_options
+    task_counts(spec)
     runnable = options.get("runnable", "container")
     if runnable not in _RUNNABLES:
         raise _invalid(
@@ -730,8 +846,12 @@ class GcpBatchClient:
                 network_interfaces=[interface]
             )
 
+        task_count, parallelism = task_counts(spec)
+        group = batch.TaskGroup(task_spec=task, task_count=task_count)
+        if parallelism is not None:
+            group.parallelism = parallelism
         return batch.Job(
-            task_groups=[batch.TaskGroup(task_spec=task, task_count=1)],
+            task_groups=[group],
             allocation_policy=allocation,
             labels=labels,
             logs_policy=batch.LogsPolicy(
@@ -818,11 +938,17 @@ class GcpBatchClient:
                 return None
             raise _classify(exc, op) from exc
 
+    @staticmethod
+    def _group(job: Any) -> tuple[str, int]:
+        """Return the job's task group name and how many tasks it has."""
+        groups = list(getattr(job, "task_groups", None) or [])
+        name = getattr(groups[0], "name", "") if groups else ""
+        count = getattr(groups[0], "task_count", 0) if groups else 0
+        return name or f"{job.name}/taskGroups/group0", max(int(count or 0), 1)
+
     def _task(self, job: Any) -> Any | None:
         """Return the job's single task, for its exit code and timings."""
-        groups = list(getattr(job, "task_groups", None) or [])
-        group = getattr(groups[0], "name", "") if groups else ""
-        parent = group or f"{job.name}/taskGroups/group0"
+        parent, _ = self._group(job)
         try:
             pager = self._service().list_tasks(
                 request=self._batch.ListTasksRequest(parent=parent, page_size=1)
@@ -834,6 +960,128 @@ class GcpBatchClient:
                 return None
             raise _classify(exc, "job_status") from exc
         return None
+
+    def _tasks(self, job: Any) -> tuple[list[Any], bool]:
+        """List a multi-task job's tasks, following every page.
+
+        Returns the tasks and whether the listing stopped at
+        ``MAX_TASK_COUNT`` with more to come.
+        """
+        parent, _ = self._group(job)
+        tasks: list[Any] = []
+        try:
+            # Iterating the pager requests each next page as it is needed.
+            pager = self._service().list_tasks(
+                request=self._batch.ListTasksRequest(
+                    parent=parent, page_size=_TASK_PAGE_SIZE
+                )
+            )
+            for task in pager:
+                if len(tasks) >= MAX_TASK_COUNT:
+                    return tasks, True
+                tasks.append(task)
+        except Exception as exc:
+            if _is_not_found(exc):
+                return [], False
+            raise _classify(exc, "job_status") from exc
+        return tasks, False
+
+    @staticmethod
+    def _task_events(task: Any) -> dict[str, Any]:
+        """Read a task's events: its last text, exit code and timings."""
+        message = None
+        exit_code = None
+        started_at = finished_at = None
+        last_state = ""
+        for event in list(
+            getattr(getattr(task, "status", None), "status_events", None) or []
+        ):
+            task_state = _enum_name(getattr(event, "task_state", ""))
+            when = _as_datetime(getattr(event, "event_time", None))
+            message = getattr(event, "description", None) or message
+            last_state = task_state or last_state
+            if task_state == "RUNNING" and started_at is None:
+                started_at = when
+            if task_state in {"SUCCEEDED", "FAILED"}:
+                finished_at = when
+            # Proto3 reads an unset message as zeros; only a present
+            # task_execution carries a real exit code.
+            if task_state in {"SUCCEEDED", "FAILED"} and (
+                "task_execution" in event
+            ):
+                exit_code = int(event.task_execution.exit_code)
+        return {
+            "message": message,
+            "exit_code": exit_code,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "last_state": last_state,
+        }
+
+    def _summarize(
+        self, job: Any, count: int, job_events: list[Any]
+    ) -> dict[str, Any]:
+        """Aggregate a multi-task job's tasks into counts and failures."""
+        tasks, cut = self._tasks(job)
+        succeeded = 0
+        failures: list[dict[str, Any]] = []
+        started: list[datetime.datetime] = []
+        finished: list[datetime.datetime] = []
+        for position, task in enumerate(tasks):
+            events = self._task_events(task)
+            if events["started_at"]:
+                started.append(events["started_at"])
+            if events["finished_at"]:
+                finished.append(events["finished_at"])
+            status = getattr(task, "status", None)
+            task_state = _enum_name(getattr(status, "state", ""))
+            if task_state in {"", "STATE_UNSPECIFIED"}:
+                task_state = events["last_state"]
+            if task_state == "SUCCEEDED":
+                succeeded += 1
+            if task_state != "FAILED":
+                continue
+            match = _TASK_INDEX_RE.fullmatch(str(getattr(task, "name", "")))
+            exit_code = events["exit_code"]
+            if exit_code is None:
+                reason = (
+                    capacity_reason(getattr(status, "status_events", None))
+                    or capacity_reason(job_events)
+                    or "batch_failed"
+                )
+            else:
+                reason = _RESERVED_EXIT_CODES.get(exit_code, "exit_code")
+            failures.append(
+                {
+                    "index": int(match["index"]) if match else position,
+                    "exit_code": exit_code,
+                    "reason": reason,
+                    "message": events["message"],
+                }
+            )
+        failures.sort(key=lambda failure: failure["index"])
+        total = max(count, len(tasks))
+        first = failures[0] if failures else None
+        return {
+            "first_failure": first,
+            "started_at": min(started) if started else None,
+            "finished_at": max(finished) if finished else None,
+            "tasks": {
+                "count": total,
+                "succeeded": succeeded,
+                "failed": len(failures),
+                # Pending, running, never run, or not listed.
+                "other": total - succeeded - len(failures),
+                "failures": [
+                    {
+                        key: failure[key]
+                        for key in ("index", "exit_code", "reason")
+                    }
+                    for failure in failures[:MAX_TASK_FAILURES]
+                ],
+                "truncated": cut or len(failures) > MAX_TASK_FAILURES,
+            },
+        }
 
     def _gone(self, job_id: str) -> JobStatus:
         return JobStatus(
@@ -860,27 +1108,40 @@ class GcpBatchClient:
         task_message = None
         exit_code = None
         started_at = finished_at = None
-        if state is not JobState.PENDING:
+        task_reason = None
+        _, task_count = self._group(job)
+        if state is JobState.PENDING:
+            pass
+        elif task_count > 1:
+            summary = self._summarize(job, task_count, events)
+            details["tasks"] = summary["tasks"]
+            started_at = summary["started_at"]
+            if state in {
+                JobState.SUCCEEDED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+            }:
+                finished_at = summary["finished_at"]
+            # The job's exit code and reason are its lowest-index failed
+            # task's; the other failures are in details["tasks"].
+            first = summary["first_failure"]
+            if state is JobState.FAILED and first is not None:
+                exit_code = first["exit_code"]
+                task_message = first["message"]
+                task_reason = first["reason"]
+        else:
             task = self._task(job)
-            for event in list(
-                getattr(getattr(task, "status", None), "status_events", None)
-                or []
-            ):
-                task_state = _enum_name(getattr(event, "task_state", ""))
-                when = _as_datetime(getattr(event, "event_time", None))
-                task_message = getattr(event, "description", None) or (
-                    task_message
+            task_events = self._task_events(task)
+            task_message = task_events["message"]
+            exit_code = task_events["exit_code"]
+            started_at = task_events["started_at"]
+            finished_at = task_events["finished_at"]
+            if exit_code is None:
+                task_reason = capacity_reason(
+                    getattr(
+                        getattr(task, "status", None), "status_events", None
+                    )
                 )
-                if task_state == "RUNNING" and started_at is None:
-                    started_at = when
-                if task_state in {"SUCCEEDED", "FAILED"}:
-                    finished_at = when
-                # Proto3 reads an unset message as zeros; only a present
-                # task_execution carries a real exit code.
-                if task_state in {"SUCCEEDED", "FAILED"} and (
-                    "task_execution" in event
-                ):
-                    exit_code = int(event.task_execution.exit_code)
         # The provider's own words for what happened last.  A task that ran
         # explains its own exit; a job that failed with no task exit (image
         # pull, quota, permissions) is explained by the job's last event.
@@ -892,11 +1153,14 @@ class GcpBatchClient:
             details["message"] = message
         reason = _IN_PROGRESS_REASONS.get(batch_state)
         if state is JobState.FAILED:
-            reason = (
-                "batch_failed"
-                if exit_code is None
-                else _RESERVED_EXIT_CODES.get(exit_code, "exit_code")
-            )
+            if exit_code is not None:
+                reason = _RESERVED_EXIT_CODES.get(exit_code, "exit_code")
+            else:
+                # No task exited: say so, or name the capacity cause when
+                # the job's or the task's newest events carry one.
+                reason = (
+                    capacity_reason(events) or task_reason or "batch_failed"
+                )
         elif state is JobState.CANCELLED:
             reason = "cancelled"
         if state is JobState.SUCCEEDED and exit_code is None:

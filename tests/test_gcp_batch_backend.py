@@ -30,8 +30,13 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     _HAS_BATCH = False
 
 if _HAS_BATCH:
+    from bespokelabs.sandbox.backends import gcp_batch
     from bespokelabs.sandbox.backends.gcp_batch import (
+        MAX_PARALLELISM,
+        MAX_TASK_COUNT,
+        MAX_TASK_FAILURES,
         GcpBatchClient,
+        capacity_reason,
         machine_type_for,
         parse_gpu,
     )
@@ -52,6 +57,7 @@ def _job(
     uid: str = "uid-1",
     events: tuple[str, ...] = (),
     labels: dict[str, str] | None = None,
+    task_count: int = 0,
 ) -> object:
     return batch_v1.Job(
         name=JOB,
@@ -63,8 +69,133 @@ def _job(
                 batch_v1.StatusEvent(description=text) for text in events
             ],
         ),
-        task_groups=[batch_v1.TaskGroup(name=f"{JOB}/taskGroups/group0")],
+        task_groups=[
+            batch_v1.TaskGroup(
+                name=f"{JOB}/taskGroups/group0", task_count=task_count
+            )
+        ],
     )
+
+
+def _indexed(index: int, state: str, *events: tuple) -> object:
+    """Build a task of a multi-task job, with its final state and index."""
+    task = _task(*events)
+    task.name = f"{JOB}/taskGroups/group0/tasks/{index}"
+    task.status.state = batch_v1.TaskStatus.State[state]
+    return task
+
+
+def _pager(pages: list[list], requests: list) -> object:
+    """Build a real ListTasksPager over fake pages, recording each fetch."""
+    from google.cloud.batch_v1.services.batch_service import pagers
+
+    def response(number: int) -> object:
+        more = number + 1 < len(pages)
+        return batch_v1.ListTasksResponse(
+            tasks=pages[number],
+            next_page_token=f"page-{number + 1}" if more else "",
+        )
+
+    def fetch(request, **_):
+        requests.append(request.page_token)
+        return response(int(request.page_token.rsplit("-", 1)[-1]))
+
+    return pagers.ListTasksPager(
+        method=fetch,
+        request=batch_v1.ListTasksRequest(parent=f"{JOB}/taskGroups/group0"),
+        response=response(0),
+    )
+
+
+_FAILED_TRANSITION = (
+    "Job state is set from SCHEDULED to FAILED for job "
+    "projects/123456789012/locations/us-central1/jobs/job-1. "
+)
+_QUOTA_EVENT = (
+    _FAILED_TRANSITION
+    + "Job failed due to: Batch Error: code - CODE_GCE_QUOTA_EXCEEDED, "
+    "description - error count is 4, latest message example: Instance "
+    "'job-1-0a1b2c3d-group0-0-x7k2' creation failed: Quota 'CPUS' exceeded.  "
+    "Limit: 24.0 in region us-central1."
+)
+_STOCKOUT_EVENT = (
+    _FAILED_TRANSITION + "Job failed due to: Batch Error: code - "
+    "CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED, description - error count is 2, "
+    "latest message example: Instance 'job-1-0a1b2c3d-group0-0-x7k2' creation "
+    "failed: The zone 'projects/example-project/zones/us-central1-a' does not "
+    "have enough resources available to fulfill the request.  Try a different "
+    "zone, or try again later."
+)
+# (name, job events oldest first, expected reason)
+_CAPACITY_CASES = [
+    ("quota, Batch error code", (_QUOTA_EVENT,), "quota_exceeded"),
+    (
+        "quota, Compute wording only",
+        (
+            "Instance 'job-1-0a1b2c3d-group0-0-x7k2' creation failed: Quota "
+            "'NVIDIA_L4_GPUS' exceeded.  Limit: 1.0 in region us-central1.",
+        ),
+        "quota_exceeded",
+    ),
+    (
+        "quota, Compute error code",
+        ("googleapi: Error 403: QUOTA_EXCEEDED - Quota exceeded",),
+        "quota_exceeded",
+    ),
+    ("stock-out, Batch error code", (_STOCKOUT_EVENT,), "capacity_unavailable"),
+    (
+        "stock-out, Compute error code with details",
+        (
+            "Instance creation failed: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_"
+            "DETAILS: (resource type:compute) (state: STOCKOUT)",
+        ),
+        "capacity_unavailable",
+    ),
+    (
+        "stock-out, Compute wording only",
+        (
+            "The zone 'projects/example-project/zones/us-central1-b' does "
+            "not have enough resources available to fulfill the request.",
+        ),
+        "capacity_unavailable",
+    ),
+    (
+        "the newest capacity event wins",
+        (_QUOTA_EVENT, _STOCKOUT_EVENT),
+        "capacity_unavailable",
+    ),
+    (
+        "image pull failure stays generic",
+        (
+            _FAILED_TRANSITION
+            + "Job failed due to task failure. Specifically, task with index "
+            '0 failed due to the following task event: "Task state is '
+            'updated from PENDING to FAILED"',
+        ),
+        "batch_failed",
+    ),
+    (
+        "a permission error stays generic",
+        ("Required 'compute.instances.create' permission is missing",),
+        "batch_failed",
+    ),
+    (
+        "lowercase prose about quotas stays generic",
+        ("Check your quota exceeded alerts and capacity dashboards",),
+        "batch_failed",
+    ),
+    (
+        "an old quota wait does not explain a later failure",
+        (
+            _QUOTA_EVENT,
+            "Job state is set from QUEUED to SCHEDULED",
+            "Job state is set from SCHEDULED to RUNNING",
+            "Job state is set from RUNNING to FAILED",
+        ),
+        "batch_failed",
+    ),
+    ("no events at all", (), "batch_failed"),
+]
 
 
 def _task(*events: tuple) -> object:
@@ -365,10 +496,66 @@ class BuildJobTests(GcpBatchTestCase):
                 with self.assertRaises(error):
                     self.backend.build_job(spec)
 
+    def test_task_count_and_parallelism(self) -> None:
+        group = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"task_count": 8, "parallelism": 3},
+            )
+        ).task_groups[0]
+        self.assertEqual((group.task_count, group.parallelism), (8, 3))
+        # Without parallelism the field stays unset: Batch picks its default.
+        group = self.backend.build_job(
+            JobSpec(command="x", image="i", backend_options={"task_count": 8})
+        ).task_groups[0]
+        self.assertEqual((group.task_count, group.parallelism), (8, 0))
+        group = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={
+                    "task_count": MAX_TASK_COUNT,
+                    "parallelism": MAX_PARALLELISM,
+                },
+            )
+        ).task_groups[0]
+        self.assertEqual(
+            (group.task_count, group.parallelism),
+            (MAX_TASK_COUNT, MAX_PARALLELISM),
+        )
+        # The task index is Batch's own BATCH_TASK_INDEX, not a new variable.
+        task = group.task_spec
+        self.assertNotIn("environment", task)
+        self.assertEqual(len(group.task_environments), 0)
+
+    def test_task_count_and_parallelism_rejections(self) -> None:
+        for options in (
+            {"task_count": 0},
+            {"task_count": -1},
+            {"task_count": True},
+            {"task_count": "3"},
+            {"task_count": 1.5},
+            {"task_count": MAX_TASK_COUNT + 1},
+            {"parallelism": 0},
+            {"parallelism": 2},
+            {"parallelism": False},
+            {"task_count": 4, "parallelism": 5},
+            {"task_count": 4, "parallelism": "2"},
+            {"task_count": MAX_TASK_COUNT, "parallelism": MAX_PARALLELISM + 1},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaises(SandboxConfigurationError):
+                    self.backend.build_job(
+                        JobSpec(command="x", image="i", backend_options=options)
+                    )
+
     def test_absent_new_options_leave_the_job_unchanged(self) -> None:
         job = self.backend.build_job(
             JobSpec(command="x", image="i", labels={"team": "a"})
         )
+        self.assertEqual(job.task_groups[0].task_count, 1)
+        self.assertEqual(job.task_groups[0].parallelism, 0)
         task = job.task_groups[0].task_spec
         self.assertEqual(task.runnables[0].container.image_uri, "i")
         self.assertFalse(task.runnables[0].script.text)
@@ -925,6 +1112,117 @@ class StatusTests(GcpBatchTestCase):
         self.assertEqual((status.exit_code, status.reason), (2, "exit_code"))
         self.assertEqual(status.details["message"], text)
 
+    def test_capacity_failures_have_their_own_reasons(self) -> None:
+        for name, events, reason in _CAPACITY_CASES:
+            with self.subTest(name):
+                self.service.get_job.return_value = _job(
+                    "FAILED", events=events
+                )
+                self.service.list_tasks.return_value = iter(())
+                status = self.client.job_status(JOB)
+                self.assertEqual(
+                    (status.state, status.exit_code, status.reason),
+                    (JobState.FAILED, None, reason),
+                )
+                # The provider's text stays in details, never in the reason.
+                self.assertEqual(
+                    status.details.get("message"), (events or [None])[-1]
+                )
+
+    def test_capacity_reason_reads_the_tasks_events_too(self) -> None:
+        self.service.get_job.return_value = _job(
+            "FAILED", events=("Job state is set from SCHEDULED to FAILED",)
+        )
+        self.service.list_tasks.return_value = iter(
+            [_task(("FAILED", 9, None, _STOCKOUT_EVENT))]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual(status.reason, "capacity_unavailable")
+
+    def test_an_exit_code_outranks_a_capacity_event(self) -> None:
+        self.service.get_job.return_value = _job(
+            "FAILED", events=(_QUOTA_EVENT,)
+        )
+        self.service.list_tasks.return_value = iter(
+            [_task(("RUNNING", 5, None), ("FAILED", 9, 3))]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual((status.exit_code, status.reason), (3, "exit_code"))
+
+    def test_capacity_reasons_are_only_for_failed_jobs(self) -> None:
+        self.service.get_job.return_value = _job(
+            "QUEUED", events=(_QUOTA_EVENT,)
+        )
+        self.assertIsNone(self.client.job_status(JOB).reason)
+        self.assertIsNone(capacity_reason(None))
+        self.assertIsNone(
+            capacity_reason([batch_v1.StatusEvent(type_="STATUS_CHANGED")])
+        )
+
+    def test_capacity_reason_matches_the_documented_quota_wording(
+        self,
+    ) -> None:
+        for text in (
+            "VM group0 creation failed: Quota CPUS exceeded. Limit: 24.0 in "
+            "region us-central1",
+            "Quota checking process decides to delay scheduling for the job "
+            "uid-1 due to inadequate quotas [Quota: CPUS, limit: 24, usage: "
+            "24, wanted: 8.]",
+        ):
+            with self.subTest(text[:30]):
+                event = batch_v1.StatusEvent(description=text)
+                self.assertEqual(capacity_reason([event]), "quota_exceeded")
+
+    def test_capacity_event_before_running_is_not_the_cause(self) -> None:
+        events = [
+            batch_v1.StatusEvent(description=_STOCKOUT_EVENT),
+            batch_v1.StatusEvent(
+                description="Job state is set from SCHEDULED to RUNNING"
+            ),
+            batch_v1.StatusEvent(
+                description="Job state is set from RUNNING to FAILED"
+            ),
+        ]
+        self.assertIsNone(capacity_reason(events))
+        # The same stock-out after the last run attempt is the cause.
+        self.assertEqual(
+            capacity_reason([events[1], events[0]]), "capacity_unavailable"
+        )
+
+    def test_capacity_reason_orders_events_by_time(self) -> None:
+        import datetime
+
+        def at(second: int, text: str) -> object:
+            return batch_v1.StatusEvent(
+                description=text,
+                event_time=datetime.datetime(
+                    2025, 1, 1, 0, 0, second, tzinfo=datetime.timezone.utc
+                ),
+            )
+
+        # Listed newest first: the quota event is older than the move to
+        # RUNNING, so it does not explain the failure.
+        events = [
+            at(30, "Job state is set from RUNNING to FAILED"),
+            at(20, "Job state is set from SCHEDULED to RUNNING"),
+            at(10, _QUOTA_EVENT),
+        ]
+        self.assertIsNone(capacity_reason(events))
+
+    def test_single_task_status_has_no_task_summary(self) -> None:
+        for task_count in (0, 1):
+            with self.subTest(task_count=task_count):
+                self.service.get_job.return_value = _job(
+                    "SUCCEEDED", task_count=task_count
+                )
+                self.service.list_tasks.return_value = iter(
+                    [_task(("RUNNING", 5, None), ("SUCCEEDED", 9, 0))]
+                )
+                status = self.client.job_status(JOB)
+                self.assertNotIn("tasks", status.details)
+                request = self.service.list_tasks.call_args.kwargs["request"]
+                self.assertEqual(request.page_size, 1)
+
     def test_reattach_from_a_new_process(self) -> None:
         """A restarted worker holds only the job id: no env, no old client."""
         service = mock.MagicMock()
@@ -967,6 +1265,242 @@ class StatusTests(GcpBatchTestCase):
     def test_rejects_non_batch_ids(self) -> None:
         with self.assertRaises(SandboxConfigurationError):
             self.client.job_status("local:abc")
+
+
+class MultiTaskStatusTests(GcpBatchTestCase):
+
+    def test_pending_does_not_list_tasks(self) -> None:
+        self.service.get_job.return_value = _job("QUEUED", task_count=4)
+        status = self.client.job_status(JOB)
+        self.assertNotIn("tasks", status.details)
+        self.service.list_tasks.assert_not_called()
+
+    def test_all_tasks_succeeded(self) -> None:
+        self.service.get_job.return_value = _job("SUCCEEDED", task_count=3)
+        self.service.list_tasks.return_value = iter(
+            [
+                _indexed(
+                    i,
+                    "SUCCEEDED",
+                    ("RUNNING", 5 + i, None),
+                    ("SUCCEEDED", 20 + i, None),
+                )
+                for i in range(3)
+            ]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual(
+            (status.state, status.exit_code, status.reason),
+            (JobState.SUCCEEDED, 0, None),
+        )
+        self.assertEqual(
+            status.details["tasks"],
+            {
+                "count": 3,
+                "succeeded": 3,
+                "failed": 0,
+                "other": 0,
+                "failures": [],
+                "truncated": False,
+            },
+        )
+        # First task to start, last task to finish.
+        self.assertEqual(status.started_at, _when(5))
+        self.assertEqual(status.finished_at, _when(22))
+
+    def test_mixed_outcomes(self) -> None:
+        self.service.get_job.return_value = _job(
+            "FAILED",
+            task_count=6,
+            events=("Job failed due to task failure.",),
+        )
+        text = "Task state is updated from RUNNING to FAILED with exit code 7."
+        self.service.list_tasks.return_value = iter(
+            [
+                # Listed out of order: failures are reported by index.
+                _indexed(
+                    4, "FAILED", ("RUNNING", 4, None), ("FAILED", 30, 50001)
+                ),
+                _indexed(
+                    0, "SUCCEEDED", ("RUNNING", 2, None), ("SUCCEEDED", 9, 0)
+                ),
+                _indexed(
+                    1, "FAILED", ("RUNNING", 3, None), ("FAILED", 12, 7, text)
+                ),
+                _indexed(2, "FAILED", ("FAILED", 13, None, _STOCKOUT_EVENT)),
+                _indexed(3, "UNEXECUTED"),
+                _indexed(5, "FAILED", ("FAILED", 14, None, "Task failed")),
+            ]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual(status.state, JobState.FAILED)
+        # The job's own exit code and reason are its first failed task's.
+        self.assertEqual((status.exit_code, status.reason), (7, "exit_code"))
+        self.assertEqual(status.details["message"], text)
+        self.assertEqual(
+            status.details["tasks"],
+            {
+                "count": 6,
+                "succeeded": 1,
+                "failed": 4,
+                "other": 1,
+                "failures": [
+                    {"index": 1, "exit_code": 7, "reason": "exit_code"},
+                    {
+                        "index": 2,
+                        "exit_code": None,
+                        "reason": "capacity_unavailable",
+                    },
+                    {"index": 4, "exit_code": 50001, "reason": "vm_preempted"},
+                    {"index": 5, "exit_code": None, "reason": "batch_failed"},
+                ],
+                "truncated": False,
+            },
+        )
+        # No provider text in the summary.
+        self.assertNotIn("zone", repr(status.details["tasks"]))
+        self.assertEqual(status.started_at, _when(2))
+        self.assertEqual(status.finished_at, _when(30))
+        request = self.service.list_tasks.call_args.kwargs["request"]
+        self.assertEqual(request.parent, f"{JOB}/taskGroups/group0")
+        self.assertGreater(request.page_size, 1)
+
+    def test_running_counts_unfinished_tasks_as_other(self) -> None:
+        self.service.get_job.return_value = _job("RUNNING", task_count=5)
+        self.service.list_tasks.return_value = iter(
+            [
+                _indexed(
+                    0, "SUCCEEDED", ("RUNNING", 2, None), ("SUCCEEDED", 9, 0)
+                ),
+                _indexed(1, "FAILED", ("RUNNING", 3, None), ("FAILED", 8, 1)),
+                _indexed(2, "RUNNING", ("RUNNING", 4, None)),
+                _indexed(3, "PENDING"),
+            ]
+        )
+        status = self.client.job_status(JOB)
+        # A task failure is not the job's outcome while the job still runs.
+        self.assertEqual(
+            (status.state, status.exit_code, status.reason),
+            (JobState.RUNNING, None, None),
+        )
+        tasks = status.details["tasks"]
+        # The fifth task is not listed yet; it still counts.
+        self.assertEqual(
+            (
+                tasks["count"],
+                tasks["succeeded"],
+                tasks["failed"],
+                tasks["other"],
+            ),
+            (5, 1, 1, 3),
+        )
+        self.assertEqual(
+            tasks["failures"],
+            [{"index": 1, "exit_code": 1, "reason": "exit_code"}],
+        )
+        self.assertEqual(status.started_at, _when(2))
+        self.assertIsNone(status.finished_at)
+
+    def test_job_failure_without_task_failures(self) -> None:
+        self.service.get_job.return_value = _job(
+            "FAILED", task_count=3, events=(_QUOTA_EVENT,)
+        )
+        self.service.list_tasks.return_value = iter(
+            [_indexed(i, "PENDING") for i in range(3)]
+        )
+        status = self.client.job_status(JOB)
+        self.assertEqual(
+            (status.exit_code, status.reason), (None, "quota_exceeded")
+        )
+        self.assertEqual(
+            status.details["tasks"],
+            {
+                "count": 3,
+                "succeeded": 0,
+                "failed": 0,
+                "other": 3,
+                "failures": [],
+                "truncated": False,
+            },
+        )
+
+    def test_listing_follows_every_page(self) -> None:
+        pages = [
+            [_indexed(0, "SUCCEEDED"), _indexed(1, "FAILED", ("FAILED", 5, 2))],
+            [],
+            [_indexed(2, "SUCCEEDED"), _indexed(3, "SUCCEEDED")],
+            [_indexed(4, "FAILED", ("FAILED", 9, 3))],
+        ]
+        requests: list[str] = []
+        self.service.get_job.return_value = _job("FAILED", task_count=5)
+        self.service.list_tasks.return_value = _pager(pages, requests)
+        tasks = self.client.job_status(JOB).details["tasks"]
+        self.assertEqual(requests, ["page-1", "page-2", "page-3"])
+        self.assertEqual(
+            (
+                tasks["count"],
+                tasks["succeeded"],
+                tasks["failed"],
+                tasks["other"],
+            ),
+            (5, 3, 2, 0),
+        )
+        self.assertEqual([f["index"] for f in tasks["failures"]], [1, 4])
+
+    def test_failures_are_bounded_and_flagged(self) -> None:
+        failed = MAX_TASK_FAILURES + 5
+        self.service.get_job.return_value = _job(
+            "FAILED", task_count=failed + 1
+        )
+        self.service.list_tasks.return_value = iter(
+            [_indexed(0, "SUCCEEDED")]
+            + [
+                _indexed(i, "FAILED", ("FAILED", 9, 1))
+                for i in range(failed, 0, -1)
+            ]
+        )
+        tasks = self.client.job_status(JOB).details["tasks"]
+        self.assertEqual((tasks["failed"], tasks["succeeded"]), (failed, 1))
+        self.assertTrue(tasks["truncated"])
+        # The lowest indexes are the ones kept.
+        self.assertEqual(
+            [f["index"] for f in tasks["failures"]],
+            list(range(1, MAX_TASK_FAILURES + 1)),
+        )
+        # Exactly the bound is complete, not truncated.
+        self.service.get_job.return_value = _job(
+            "FAILED", task_count=MAX_TASK_FAILURES
+        )
+        self.service.list_tasks.return_value = iter(
+            [
+                _indexed(i, "FAILED", ("FAILED", 9, 1))
+                for i in range(MAX_TASK_FAILURES)
+            ]
+        )
+        tasks = self.client.job_status(JOB).details["tasks"]
+        self.assertEqual(len(tasks["failures"]), MAX_TASK_FAILURES)
+        self.assertFalse(tasks["truncated"])
+
+    def test_listing_stops_at_the_task_bound(self) -> None:
+        """A job made elsewhere with more tasks than this client allows."""
+        requests: list[str] = []
+        pages = [[_indexed(i, "SUCCEEDED")] for i in range(6)]
+        self.service.get_job.return_value = _job("RUNNING", task_count=6)
+        self.service.list_tasks.return_value = _pager(pages, requests)
+        with mock.patch.object(gcp_batch, "MAX_TASK_COUNT", 3):
+            tasks = self.client.job_status(JOB).details["tasks"]
+        self.assertEqual((tasks["succeeded"], tasks["other"]), (3, 3))
+        self.assertTrue(tasks["truncated"])
+        self.assertLess(len(requests), 5)
+
+    def test_task_listing_errors(self) -> None:
+        self.service.get_job.return_value = _job("RUNNING", task_count=2)
+        self.service.list_tasks.side_effect = gexc.NotFound("gone")
+        tasks = self.client.job_status(JOB).details["tasks"]
+        self.assertEqual((tasks["count"], tasks["other"]), (2, 2))
+        self.service.list_tasks.side_effect = gexc.ServiceUnavailable("down")
+        with self.assertRaises(SandboxConnectionError):
+            self.client.job_status(JOB)
 
 
 class CancelTests(GcpBatchTestCase):

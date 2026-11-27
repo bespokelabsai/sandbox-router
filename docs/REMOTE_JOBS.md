@@ -86,6 +86,39 @@ must not be treated as verified completion or successful cloud cleanup.
 `RemoteJobResult` preserves nullable state, exit code, reason, and timezone-aware
 ISO timestamp strings. Missing exit codes are never replaced with zero.
 
+`RemoteJobResult.reason` is `None` or one of the service's fixed values
+([the full table](HOSTED_JOBS.md#result-reasons-and-multi-task-results)). Three
+of them describe a job that failed before any task exited, and they call for
+different handling:
+
+| `reason` | Retry? |
+| --- | --- |
+| `quota_exceeded` | Not as is: the project's quota in that region does not cover the job. Use another binding, a smaller request, or more quota |
+| `capacity_unavailable` | Yes, later or through a binding for another region: the zone had no such VMs to give (a stock-out) |
+| `batch_failed` | Unclassified: any other cause, including capacity problems the provider did not label |
+
+```python
+result = client.result(job.id)
+if result is not None and result.state == "failed":
+    if result.reason == "capacity_unavailable":
+        ...  # submit to another binding with a NEW idempotency key
+    elif result.reason == "quota_exceeded":
+        ...  # do not retry the same request against the same binding
+```
+
+A retry is a new operation: use a new idempotency key, never the failed job's.
+
+For a job submitted with `backend_options={"task_count": N}` (N > 1,
+optionally with `"parallelism"`), `RemoteJobResult.tasks` is a
+`RemoteJobTasks`: `count`, `succeeded`, `failed`, `other`, a `failures` tuple
+of at most 20 `RemoteJobTaskFailure` (`index`, `exit_code`, `reason`) ordered
+by task index, and `truncated`, which is `True` when more tasks failed than are
+listed. For a single-task job `tasks` is `None`, because the service sends no
+such key. Each task learns its index from the provider's `BATCH_TASK_INDEX`
+environment variable. A client older than these fields rejects a multi-task
+result as an invalid response (it forbids unknown keys); single-task results
+parse as before.
+
 ## HTTP and security behavior
 
 - `base_url` must be an HTTP(S) origin with an optional plain path prefix, such
