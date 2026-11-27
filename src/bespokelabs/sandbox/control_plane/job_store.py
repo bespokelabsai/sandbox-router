@@ -7,13 +7,16 @@ retained here. Dispatch authorization is an irreversible compare-and-swap.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
 import sqlite3
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 from .errors import ConflictError, NotFoundError
 from .job_models import (
@@ -65,55 +68,32 @@ def canonical(value: object) -> str:
     )
 
 
-class HostedJobRepository:
+def hosted_job_hmac(secret: bytes) -> Callable[[bytes], str]:
+    """Return the keyed SHA-256 function every repository on a database shares."""
+    return lambda payload: hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
-    def __init__(
-        self,
-        connection_factory: Callable[[], sqlite3.Connection],
-        hmac_function: Callable[[bytes], str],
-    ) -> None:
-        self._connection_factory = connection_factory
-        self._hmac = hmac_function
-        with self._transaction() as connection:
-            if not connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='organizations'"
-            ).fetchone():
-                raise ValueError(
-                    "Hosted jobs require the organization authority database"
-                )
-            for statement in _SCHEMA:
-                connection.execute(statement)
-            connection.execute(
-                "INSERT OR IGNORE INTO hosted_jobs_schema_migrations VALUES (1, CURRENT_TIMESTAMP)"
-            )
-            columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(hosted_jobs)")
-            }
-            if "submit_deadline" not in columns:
-                connection.execute(
-                    "ALTER TABLE hosted_jobs ADD COLUMN submit_deadline REAL"
-                )
-            connection.execute(
-                "INSERT OR IGNORE INTO hosted_jobs_schema_migrations VALUES (2, CURRENT_TIMESTAMP)"
-            )
 
-    @contextmanager
-    def _transaction(
-        self, *, write: bool = True
-    ) -> Iterator[sqlite3.Connection]:
-        connection = self._connection_factory()
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+def check_column_names(changes: dict) -> None:
+    """Reject any update key that is not a plain lower-case identifier."""
+    for key in changes:
+        if not _COLUMN_NAME.fullmatch(key):
+            raise ValueError(f"not a hosted_jobs column name: {key!r}")
+
+
+class HostedJobRepositoryBase:
+    """Storage-independent job transitions over a fenced row update.
+
+    A subclass supplies ``get`` and ``_update``; ``_update`` must apply the
+    changes atomically only while the stored row still matches the snapshot.
+    """
+
+    _hmac: Callable[[bytes], str]
+
+    def get(self, organization_id: str, job_id: str) -> HostedJob:
+        raise NotImplementedError
+
+    def _update(self, record: HostedJob, changes: dict) -> bool:
+        raise NotImplementedError
 
     def digest(self, domain: str, value: object) -> str:
         digest = self._hmac(
@@ -126,7 +106,7 @@ class HostedJobRepository:
         return digest
 
     @staticmethod
-    def _decode(row: sqlite3.Row) -> HostedJob:
+    def _decode(row: Mapping[str, Any]) -> HostedJob:
         return HostedJob(
             id=row["id"],
             organization_id=row["organization_id"],
@@ -148,99 +128,6 @@ class HostedJobRepository:
             lease_until=row["lease_until"],
             submit_deadline=row["submit_deadline"],
         )
-
-    def get(self, organization_id: str, job_id: str) -> HostedJob:
-        with self._transaction(write=False) as connection:
-            row = connection.execute(
-                "SELECT * FROM hosted_jobs WHERE organization_id=? AND id=?",
-                (organization_id, job_id),
-            ).fetchone()
-            if row is None:
-                raise NotFoundError("Hosted job not found")
-            return self._decode(row)
-
-    def reserve(
-        self,
-        organization_id: str,
-        key: str,
-        fingerprint: str,
-        binding: JobBinding,
-        resource_name: str,
-        marker: str,
-    ) -> HostedJob:
-        key_digest = self.digest("submit-key", key)
-        with self._transaction() as connection:
-            if not connection.execute(
-                "SELECT 1 FROM organizations WHERE id=?", (organization_id,)
-            ).fetchone():
-                raise NotFoundError("Organization not found")
-            row = connection.execute(
-                "SELECT * FROM hosted_jobs WHERE organization_id=? AND operation='submit' AND key_digest=?",
-                (organization_id, key_digest),
-            ).fetchone()
-            if row is not None:
-                if row["fingerprint"] != fingerprint or row[
-                    "binding_json"
-                ] != canonical(asdict(binding)):
-                    raise ConflictError(
-                        "Idempotency key has a different request"
-                    )
-                return self._decode(row)
-            job_id = "hjob_" + uuid.uuid4().hex
-            connection.execute(
-                """INSERT INTO hosted_jobs
-                (id, organization_id, operation, key_digest, fingerprint,
-                 binding_json, backend, account, resource_name, ownership_marker, phase)
-                VALUES (?, ?, 'submit', ?, ?, ?, ?, ?, ?, ?, 'reserved')""",
-                (
-                    job_id,
-                    organization_id,
-                    key_digest,
-                    fingerprint,
-                    canonical(asdict(binding)),
-                    binding.backend,
-                    binding.account,
-                    resource_name,
-                    marker,
-                ),
-            )
-            row = connection.execute(
-                "SELECT * FROM hosted_jobs WHERE id=?", (job_id,)
-            ).fetchone()
-            return self._decode(row)
-
-    def _update(self, record: HostedJob, changes: dict) -> bool:
-        """Every mutable write fences version, lease, UID and full binding.
-
-        Terminal snapshots are write-once. Only this repository constructs
-        column names, and each must be a plain lower-case identifier;
-        values never become SQL.
-        """
-        for key in changes:
-            if not _COLUMN_NAME.fullmatch(key):
-                raise ValueError(f"not a hosted_jobs column name: {key!r}")
-        with self._transaction() as connection:
-            assignments = ", ".join(f"{key}=?" for key in changes)
-            return (
-                connection.execute(
-                    f"UPDATE hosted_jobs SET {assignments}, version=version+1 "
-                    "WHERE id=? AND organization_id=? AND version=? AND uid IS ? "
-                    "AND lease_token IS ? AND binding_json=? AND resource_name=? "
-                    "AND phase=? AND phase != 'terminal'",
-                    (
-                        *changes.values(),
-                        record.id,
-                        record.organization_id,
-                        record.version,
-                        record.uid,
-                        record.lease_token,
-                        canonical(asdict(record.binding)),
-                        record.resource_name,
-                        record.phase.value,
-                    ),
-                ).rowcount
-                == 1
-            )
 
     def start_dispatch(
         self, record: HostedJob, now: float, duration: float
@@ -365,3 +252,145 @@ class HostedJobRepository:
 
     def release_observation(self, record: HostedJob) -> bool:
         return self._update(record, {"lease_token": None, "lease_until": None})
+
+
+class HostedJobRepository(HostedJobRepositoryBase):
+
+    def __init__(
+        self,
+        connection_factory: Callable[[], sqlite3.Connection],
+        hmac_function: Callable[[bytes], str],
+    ) -> None:
+        self._connection_factory = connection_factory
+        self._hmac = hmac_function
+        with self._transaction() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='organizations'"
+            ).fetchone():
+                raise ValueError(
+                    "Hosted jobs require the organization authority database"
+                )
+            for statement in _SCHEMA:
+                connection.execute(statement)
+            connection.execute(
+                "INSERT OR IGNORE INTO hosted_jobs_schema_migrations VALUES (1, CURRENT_TIMESTAMP)"
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(hosted_jobs)")
+            }
+            if "submit_deadline" not in columns:
+                connection.execute(
+                    "ALTER TABLE hosted_jobs ADD COLUMN submit_deadline REAL"
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO hosted_jobs_schema_migrations VALUES (2, CURRENT_TIMESTAMP)"
+            )
+
+    @contextmanager
+    def _transaction(
+        self, *, write: bool = True
+    ) -> Iterator[sqlite3.Connection]:
+        connection = self._connection_factory()
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get(self, organization_id: str, job_id: str) -> HostedJob:
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM hosted_jobs WHERE organization_id=? AND id=?",
+                (organization_id, job_id),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("Hosted job not found")
+            return self._decode(row)
+
+    def reserve(
+        self,
+        organization_id: str,
+        key: str,
+        fingerprint: str,
+        binding: JobBinding,
+        resource_name: str,
+        marker: str,
+    ) -> HostedJob:
+        key_digest = self.digest("submit-key", key)
+        with self._transaction() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM organizations WHERE id=?", (organization_id,)
+            ).fetchone():
+                raise NotFoundError("Organization not found")
+            row = connection.execute(
+                "SELECT * FROM hosted_jobs WHERE organization_id=? AND operation='submit' AND key_digest=?",
+                (organization_id, key_digest),
+            ).fetchone()
+            if row is not None:
+                if row["fingerprint"] != fingerprint or row[
+                    "binding_json"
+                ] != canonical(asdict(binding)):
+                    raise ConflictError(
+                        "Idempotency key has a different request"
+                    )
+                return self._decode(row)
+            job_id = "hjob_" + uuid.uuid4().hex
+            connection.execute(
+                """INSERT INTO hosted_jobs
+                (id, organization_id, operation, key_digest, fingerprint,
+                 binding_json, backend, account, resource_name, ownership_marker, phase)
+                VALUES (?, ?, 'submit', ?, ?, ?, ?, ?, ?, ?, 'reserved')""",
+                (
+                    job_id,
+                    organization_id,
+                    key_digest,
+                    fingerprint,
+                    canonical(asdict(binding)),
+                    binding.backend,
+                    binding.account,
+                    resource_name,
+                    marker,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM hosted_jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            return self._decode(row)
+
+    def _update(self, record: HostedJob, changes: dict) -> bool:
+        """Every mutable write fences version, lease, UID and full binding.
+
+        Terminal snapshots are write-once. Only this repository constructs
+        column names, and each must be a plain lower-case identifier;
+        values never become SQL.
+        """
+        check_column_names(changes)
+        with self._transaction() as connection:
+            assignments = ", ".join(f"{key}=?" for key in changes)
+            return (
+                connection.execute(
+                    f"UPDATE hosted_jobs SET {assignments}, version=version+1 "
+                    "WHERE id=? AND organization_id=? AND version=? AND uid IS ? "
+                    "AND lease_token IS ? AND binding_json=? AND resource_name=? "
+                    "AND phase=? AND phase != 'terminal'",
+                    (
+                        *changes.values(),
+                        record.id,
+                        record.organization_id,
+                        record.version,
+                        record.uid,
+                        record.lease_token,
+                        canonical(asdict(record.binding)),
+                        record.resource_name,
+                        record.phase.value,
+                    ),
+                ).rowcount
+                == 1
+            )

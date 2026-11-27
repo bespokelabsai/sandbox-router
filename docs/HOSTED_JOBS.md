@@ -106,6 +106,77 @@ allowlisted DTO, never a dataclass dump, and creates its own repository using
 against the existing organization authority. It takes no alternate database
 path and never accesses the store's private connector.
 
+## PostgreSQL store
+
+SQLite remains the default and is unchanged. To run the hosted-job path on
+PostgreSQL, install the `postgres` extra (`psycopg` 3 with its binary and pool
+packages) and construct both stores on the same database. The driver is
+imported only when a store is constructed.
+
+```python
+from psycopg_pool import ConnectionPool
+
+from bespokelabs.sandbox.control_plane.job_store import hosted_job_hmac
+from bespokelabs.sandbox.control_plane.job_store_postgres import (
+    PostgresHostedJobRepository,
+)
+from bespokelabs.sandbox.control_plane.store_postgres import (
+    PostgresAuthorityStore,
+)
+
+
+def make_postgres_stores(dsn, key_pepper, stable_server_hmac_secret):
+    pool = ConnectionPool(dsn, open=True)
+    authority = PostgresAuthorityStore(pool, key_pepper=key_pepper)
+    repository = PostgresHostedJobRepository(
+        pool, hosted_job_hmac(stable_server_hmac_secret)
+    )
+    return pool, authority, repository
+```
+
+Both classes take either a pool exposing `connection()` (such as
+`psycopg_pool.ConnectionPool`) or a zero-argument factory returning a new
+`psycopg` connection, which is closed after each operation. The caller owns
+the DSN, credentials, TLS settings, `search_path`, and the pool's lifetime;
+nothing is read from the environment and no module-level state is kept. Use the
+default READ COMMITTED isolation level. Construct the authority store first:
+the job repository refuses a database without an `organizations` table.
+
+`PostgresAuthorityStore` covers organizations, API keys, `authenticate`, and
+`record_audit` only (the `AuthorityStore` protocol in `job_interfaces.py`). API
+keys are stored under the same keyed digest as the SQLite store. It has no
+sandbox, dashboard-session, attachment, or billing tables, so it cannot back
+the full sandbox control plane or `create_app`. The audit `session_id` column
+is a plain nullable value, not a reference.
+
+`HostedJobService` accepts any `JobRepository`. For HTTP, pass the repository
+to `install_job_routes(app, None, configuration, authenticate,
+repository=repository)` with an `authenticate` callable built on the authority
+store. The repository's HMAC function must be
+`hosted_job_hmac(configuration.hmac_secret)`.
+
+Migrations run when each store is constructed. Each store records applied
+versions in its own journal (`authority_schema_migrations` and
+`hosted_jobs_schema_migrations`); every version is applied with its journal row
+in one transaction under a transaction-scoped advisory lock, so re-running is a
+no-op and instances that start together apply each version once. The database
+role needs permission to create tables in the target schema on first start.
+
+With several service instances on one PostgreSQL database:
+
+- **Safe:** the hosted-job path. Reservation of an idempotency key is a single
+  `INSERT ... ON CONFLICT DO NOTHING` followed by a re-read, so concurrent
+  submissions of one key get one job and the same replay-or-conflict answer.
+  Dispatch authorization, observation leases, cancellation intent, and terminal
+  snapshots are single-statement compare-and-swap updates fenced on version,
+  lease, UID, binding, and phase. API-key authentication and audit appends are
+  ordinary shared rows. All instances must use the same HMAC secret, key pepper,
+  and binding registry, and reasonably synchronized clocks for lease expiry.
+- **Not made safe by this:** the sandbox control plane. Its in-memory runtime
+  registry and supervisor remain single-process, and its sandbox, session,
+  attachment, and billing state still lives only in the SQLite store. Run one
+  such process per SQLite database as before.
+
 ## Opt-in HTTP host configuration
 
 Install the existing `server` extra for FastAPI. Importing the SDK or hosted-job
@@ -416,6 +487,13 @@ instances, a shared durable authority database, barriers, reopen/restart cases,
 lost responses, lease expiry, cancellation races, payload conflicts, scope and
 tenant denials, actual ownership/UID changes, credential sentinels, and immutable
 terminal result replay. It runs without any Google SDK installed.
+
+`tests/test_hosted_jobs_postgres.py` reruns the storage-independent cases of that
+suite against PostgreSQL with both a connection factory and a pool, and adds
+concurrent reservation, lease-claim, cancel-versus-update, and simultaneous
+migration cases over separate connections. Its database cases are skipped unless
+`SANDBOX_TEST_POSTGRES_DSN` names a disposable database; each test uses and
+drops its own schema. CI runs them against a PostgreSQL service container.
 
 `tests/test_hosted_jobs_gcp_batch.py` additionally exercises real public client
 translation and actual Batch status detail extraction with class-spec autospec
