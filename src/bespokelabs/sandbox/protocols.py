@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 from bespokelabs.sandbox.types import (
+    AppListing,
+    AppStopResult,
     FileInfo,
     JobSpec,
     JobStatus,
@@ -126,4 +128,28 @@ class SandboxListingBackend(Protocol):
     """
 
     def list_sandboxes(self, labels: dict[str, str]) -> list[SandboxListing]:
+        ...
+
+
+@runtime_checkable
+class SandboxAppBackend(Protocol):
+    """A backend client whose sandboxes are grouped into named apps (Modal).
+
+    ``stop_app`` stops the one app with exactly that name, never creating
+    it, and reports a missing app as ``reason="not_found"``.  ``list_apps``
+    returns every app that is not stopped, or raises.  ``SandboxClient``
+    raises ``FeatureNotSupportedError`` for either on a backend client
+    without it.
+    """
+
+    def stop_app(
+        self,
+        app_name: str,
+        *,
+        timeout_secs: float = ...,
+        allow_default_app: bool = ...,
+    ) -> AppStopResult:
+        ...
+
+    def list_apps(self, *, timeout_secs: float = ...) -> list[AppListing]:
         ...

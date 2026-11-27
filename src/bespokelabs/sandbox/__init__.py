@@ -58,6 +58,8 @@ from bespokelabs.sandbox.remote_jobs import (
 from bespokelabs.sandbox.sandbox import Sandbox, SandboxClient, json_schema
 from bespokelabs.sandbox.types import (
     AgentRunResult,
+    AppListing,
+    AppStopResult,
     ExposedPort,
     FileInfo,
     JobSpec,
@@ -108,6 +110,8 @@ __all__ = [
     "NetworkPolicy",
     "SandboxResult",
     "SandboxListing",
+    "AppListing",
+    "AppStopResult",
     "SandboxSessionState",
     "FileInfo",
     "SnapshotInfo",

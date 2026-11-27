@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import os
 import socket
 from dataclasses import replace
@@ -568,6 +569,31 @@ def test_modal_real_failed_reconnect_transport_lifetime(
             assert client._connection_manager is None
             assert client._cancellation_context is None
             assert client._shutdown_unregister is None
+
+
+def test_modal_app_calls_match_the_installed_sdk():
+    """stop_app/list_apps degrade on the floor SDK and resolve on the current."""
+    if _PROVIDER and _PROVIDER != "modal":
+        pytest.skip("Modal-only app contract")
+    sdk = _sdk("modal")
+    from bespokelabs.sandbox.backends import modal as backend
+    from bespokelabs.sandbox.exceptions import FeatureNotSupportedError
+
+    client = backend.ModalClient()
+    if version("modal") == "0.60.15":
+        # Refused before any SDK call: the offline fixture forbids the network.
+        with pytest.raises(FeatureNotSupportedError):
+            client.stop_app("contract-app")
+        with pytest.raises(FeatureNotSupportedError):
+            client.list_apps()
+        return
+    if version("modal") != "1.6.4":
+        pytest.skip("only the pinned floor and current SDKs are reviewed")
+    assert "create_if_missing" in inspect.signature(sdk.App.lookup).parameters
+    assert callable(sdk.App.stop) and callable(sdk.App.info)
+    assert callable(sdk.Environment.from_context)
+    assert hasattr(sdk.Environment, "apps")
+    assert backend._not_found_errors(sdk) == (sdk.exception.NotFoundError,)
 
 
 @pytest.mark.parametrize("backend", _PROVIDERS)
