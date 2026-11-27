@@ -7,13 +7,11 @@ imported or selected here. Admission is mandatory, server-owned, and fail-closed
 from __future__ import annotations
 
 import copy
-import hashlib
-import hmac
 import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
@@ -23,11 +21,14 @@ from bespokelabs.sandbox.exceptions import SandboxConfigurationError
 from bespokelabs.sandbox.types import JobSpec, JobState
 
 from .errors import AuthorizationError, ConflictError, NotFoundError
+from .job_interfaces import JobRepository
 from .job_models import ConfiguredJobBinding, HostedJob, JobBinding, JobPhase
 from .job_service import HostedJobService
-from .job_store import HostedJobRepository
+from .job_store import HostedJobRepository, hosted_job_hmac
 from .models import Principal
-from .store import SQLiteStore
+
+if TYPE_CHECKING:
+    from .store import SQLiteStore
 
 _MAX_REQUEST_BYTES = 64 * 1024
 _SAFE_REASONS = frozenset(
@@ -191,23 +192,33 @@ def _job_response(record: HostedJob) -> dict:
 
 def install_job_routes(
     app: FastAPI,
-    store: SQLiteStore,
+    store: SQLiteStore | None,
     configuration: HostedJobConfiguration,
     authenticate: Callable[[str | None, str], Principal],
+    *,
+    repository: JobRepository | None = None,
 ) -> None:
-    """Install routes sharing the host's existing auth, CSRF, audit, and DB."""
+    """Install routes sharing the host's existing auth, CSRF, audit, and DB.
+
+    By default the repository is built on ``store``'s SQLite database. Pass a
+    ready ``repository`` (and ``store=None``) to use another implementation; it
+    must have been built with ``hosted_job_hmac(configuration.hmac_secret)`` on
+    the database that owns the organizations ``authenticate`` resolves.
+    """
     if not isinstance(configuration, HostedJobConfiguration):
         raise ValueError("Explicit hosted-job server configuration is required")
+    if (store is None) == (repository is None):
+        raise ValueError(
+            "Exactly one of an authority store or a job repository is required"
+        )
     # Snapshot mutable server containers; there is no second path/DB authority.
     bindings = tuple(configuration.bindings)
     versions = dict(configuration.submit_bindings)
     configured = {(b.binding.id, b.binding.version): b for b in bindings}
     secret = configuration.hmac_secret
     admit = configuration.admit
-    repository = HostedJobRepository(
-        store.connect,
-        lambda payload: hmac.new(secret, payload, hashlib.sha256).hexdigest(),
-    )
+    if repository is None:
+        repository = HostedJobRepository(store.connect, hosted_job_hmac(secret))
     service = HostedJobService(repository, bindings)
 
     def invoke(operation: Callable):

@@ -116,12 +116,16 @@ ISO timestamp strings. Missing exit codes are never replaced with zero.
 
 ## Service limitations remain unchanged
 
-This client supports distributed **callers**, not horizontally scaled service
-replicas. The [existing SQLite operations constraints](CONTROL_PLANE_OPERATIONS.md)
-still apply: one active API process per SQLite database, a single writer, and one
-active supervisor. A client does not replace durable host storage, shared runtime
+This client supports distributed **callers**; it does not itself make a service
+horizontally scalable. With the default SQLite store, the
+[existing SQLite operations constraints](CONTROL_PLANE_OPERATIONS.md) still
+apply: one active API process per SQLite database, a single writer, and one
+active supervisor. The hosted-job routes alone can run as several instances on
+the optional [PostgreSQL store](HOSTED_JOBS.md#postgresql-store); the sandbox
+control plane's runtime registry and supervisor remain single-process either
+way. A client does not replace durable host storage, shared runtime
 custody, restart recovery, or operator admission/security/live-provider gates.
-No database rewrite, workers, hosting configuration, or deployment is included.
+No workers, hosting configuration, or deployment is included.
 This SDK addition is not evidence that a service is production-ready or deployed.
 
 The API currently lacks listing/discovery, version-pinned submission replay,

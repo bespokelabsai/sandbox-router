@@ -36,6 +36,7 @@ ray = ["ray>=2.0.0"]
 boxd = ["boxd>=0.2.20"]
 gcp-batch = ["google-cloud-batch>=0.17.0", "google-cloud-logging>=3.0.0", "google-cloud-compute>=1.14.0"]
 server = ["fastapi>=0.115.0", "uvicorn>=0.30.0"]
+postgres = ["psycopg[binary,pool]>=3.2,<4"]
 all = [
     "daytona>=0.207.0,<1",
     "tensorlake>=0.1.0",
@@ -49,6 +50,7 @@ all = [
     "google-cloud-batch>=0.17.0",
     "google-cloud-logging>=3.0.0",
     "google-cloud-compute>=1.14.0",
+    "psycopg[binary,pool]>=3.2,<4",
 ]
 dev = [
     "httpx>=0.27.0,<1",

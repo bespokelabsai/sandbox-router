@@ -11,6 +11,7 @@ from typing import Callable, Iterable
 from bespokelabs.sandbox.types import JobSpec, JobState
 
 from .errors import AuthorizationError, ConflictError, ControlPlaneError
+from .job_interfaces import JobRepository
 from .job_models import (
     CancellationUnavailable,
     ConfiguredJobBinding,
@@ -24,7 +25,6 @@ from .job_models import (
     bounded_log_text,
     bounded_tail,
 )
-from .job_store import HostedJobRepository
 from .models import Principal
 
 _TERMINAL = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}
@@ -45,7 +45,7 @@ class HostedJobService:
 
     def __init__(
         self,
-        repository: HostedJobRepository,
+        repository: JobRepository,
         bindings: Iterable[ConfiguredJobBinding],
         *,
         clock: Callable[[], float] = time.time,

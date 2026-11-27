@@ -468,6 +468,11 @@ def _normalize_expiration(value: str | None) -> str | None:
     return parsed.astimezone(timezone.utc).isoformat()
 
 
+def api_key_digest(pepper: bytes, secret: str) -> str:
+    """Keyed digest under which an API key is stored, for every store."""
+    return hmac.new(pepper, secret.encode(), hashlib.sha256).hexdigest()
+
+
 def _parse_time_bound(value: str | None, name: str) -> datetime | None:
     if value is None:
         return None
@@ -3111,9 +3116,7 @@ class SQLiteStore:
         )
 
     def _digest(self, secret: str) -> str:
-        return hmac.new(
-            self._pepper, secret.encode(), hashlib.sha256
-        ).hexdigest()
+        return api_key_digest(self._pepper, secret)
 
     def _session_csrf_value(self, session_id: str) -> str:
         digest = hmac.new(
