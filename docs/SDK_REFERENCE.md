@@ -585,6 +585,60 @@ The project listing is filtered client-side; pending, running, and suspended
 sandboxes are returned with their `state`, and ended ones are left out. A
 sandbox created without a name cannot be found this way.
 
+### Stopping a Modal app
+
+Modal creates every sandbox under an app: the one named by `app_name=`, or the
+shared default `sandbox-sdk`. Stopping an app ends every sandbox in it at once,
+so a caller that gives each workload its own app can clean up after a workload
+that crashed without destroying its sandboxes:
+
+```python
+client = SandboxClient("modal")
+sandbox = client.create(app_name="run-42")
+...
+result = client.stop_app("run-42", timeout_secs=30)
+if result.stopped:
+    print("stopped", result.app_id)
+elif result.not_found:
+    print("nothing to stop")
+```
+
+`stop_app` looks the app up by its exact name and never creates it. There is no
+prefix or pattern match, and an app id is refused. It returns an
+`AppStopResult`:
+
+| Outcome | Result |
+|---|---|
+| The app was stopped | `stopped=True`, `app_id` set |
+| No running app has that name (never created, or already stopped) | `stopped=False`, `reason="not_found"` (`result.not_found`) |
+| The name is the shared default `sandbox-sdk` | `SandboxConfigurationError`, unless `allow_default_app=True` |
+| Modal did not answer within `timeout_secs` (default 30) | `SandboxTimeoutError` with `outcome=unknown`: the stop may still land |
+| The lookup failed | `SandboxExecutionError` with `outcome=failed` |
+| The stop request failed | `SandboxExecutionError` with `outcome=unknown` |
+| The installed SDK cannot stop apps | `FeatureNotSupportedError` |
+
+Stopping is repeatable, so a timeout or failure can be retried; a retry after a
+stop that did land returns `not_found`. A stopped app's name can be used again:
+the next `create(app_name=...)` makes a new app.
+
+`client.list_apps(timeout_secs=30)` returns an `AppListing` (`name`, `app_id`,
+`state`, `created_at`) for every app in the configured Modal environment that
+is not stopped. It lists every app the credentials can see, including ones this
+SDK did not create, so select by your own naming scheme. `state` is Modal's own
+string, such as `deployed` or `ephemeral`. `created_at` is timezone-aware, or
+`None` when Modal reports no creation time. A failure raises; a partial list is
+never returned. To stop stale apps safely, see
+[Stopping stale Modal apps](RESOURCE_REAPER.md#stopping-stale-modal-apps).
+
+| Call | Modal SDK call | Needs |
+|---|---|---|
+| `stop_app` | `App.lookup(name)` then `App.stop()` | `modal>=1.6.3` |
+| `stop_app` on an older SDK | `App.lookup(name)` then `modal.experimental.stop_app(name)` | `modal>=1.2.5` |
+| `list_apps` | `Environment.from_context().apps.list()` and `App.info()` | `modal>=1.6.0` |
+
+An older SDK raises `FeatureNotSupportedError`, as does every other backend.
+Both calls use the SDK's ambient credentials and environment, like `create`.
+
 ### Tensorlake retries and failed creates
 
 The Tensorlake backend retries calls that are safe to repeat (listing,

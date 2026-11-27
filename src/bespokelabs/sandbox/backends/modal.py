@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
+import math
 import pathlib
+import re
 import threading
-from typing import Any
+import types
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any, TypeVar
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
@@ -15,8 +21,11 @@ from bespokelabs.sandbox.exceptions import (
     SandboxCreationError,
     SandboxError,
     SandboxExecutionError,
+    SandboxTimeoutError,
 )
 from bespokelabs.sandbox.types import (
+    AppListing,
+    AppStopResult,
     ExposedPort,
     FileInfo,
     NetworkPolicy,
@@ -26,6 +35,15 @@ from bespokelabs.sandbox.types import (
     SandboxSessionState,
     SnapshotInfo,
 )
+
+T = TypeVar("T")
+
+# Sandboxes created without ``app_name`` all share this app.
+DEFAULT_APP_NAME = "sandbox-sdk"
+DEFAULT_APP_TIMEOUT_SECS = 30.0
+
+# ``App.lookup`` also resolves an app *id* on newer SDKs; stop_app takes names only.
+_APP_ID_RE = re.compile(r"ap-[a-zA-Z0-9]{22}")
 
 
 class ModalClient:
@@ -55,7 +73,7 @@ class ModalClient:
     def create(self, config: SandboxConfig) -> ModalSession:
         modal = self._modal
         try:
-            app_name = config.app_name or "sandbox-sdk"
+            app_name = config.app_name or DEFAULT_APP_NAME
             app = modal.App.lookup(app_name, create_if_missing=True)
 
             create_kwargs: dict = {
@@ -153,6 +171,80 @@ class ModalClient:
             ) from exc
         return listings
 
+    def stop_app(
+        self,
+        app_name: str,
+        *,
+        timeout_secs: float = DEFAULT_APP_TIMEOUT_SECS,
+        allow_default_app: bool = False,
+    ) -> AppStopResult:
+        """Stop the app named exactly *app_name*, ending all its sandboxes.
+
+        The app is looked up by name without creating it, so an app that
+        does not exist (or is already stopped) is reported as
+        ``reason="not_found"``.  There is no prefix match and no listing: one
+        call stops at most one app.  The shared default app is refused unless
+        *allow_default_app* is set, and an app id is refused because only a
+        name can be checked against it.
+
+        Uses ``App.stop()`` (modal>=1.6.3), else
+        ``modal.experimental.stop_app`` (modal>=1.2.5); an older SDK raises
+        ``FeatureNotSupportedError``.  The whole call is abandoned after
+        *timeout_secs* with ``SandboxTimeoutError``; the stop may still land.
+        """
+        name = _checked_app_name(app_name, allow_default_app)
+        timeout = _checked_timeout(timeout_secs, "stop_app")
+        modal = self._modal
+        lookup = getattr(getattr(modal, "App", None), "lookup", None)
+        legacy_stop = _experimental_stop_app(modal)
+        if not callable(lookup) or not (
+            callable(getattr(modal.App, "stop", None)) or callable(legacy_stop)
+        ):
+            raise FeatureNotSupportedError(
+                "Stopping a Modal app needs modal>=1.2.5 "
+                "(App.stop or modal.experimental.stop_app); upgrade modal",
+                backend="modal",
+                op="stop_app",
+            )
+        return _call_bounded(
+            lambda: _stop_app_by_name(modal, name, legacy_stop),
+            timeout_secs=timeout,
+            op="stop_app",
+            outcome=ErrorOutcome.UNKNOWN,
+        )
+
+    def list_apps(
+        self, *, timeout_secs: float = DEFAULT_APP_TIMEOUT_SECS
+    ) -> list[AppListing]:
+        """Every app in the configured Modal environment that is not stopped.
+
+        Uses ``Environment.from_context().apps.list()`` and ``App.info()``
+        (modal>=1.6.0; one extra call per app before 1.6.3); an older SDK
+        raises ``FeatureNotSupportedError``.  The list covers every app the
+        credentials can see.  Any failure raises instead of returning part
+        of the list.
+        """
+        timeout = _checked_timeout(timeout_secs, "list_apps")
+        modal = self._modal
+        environment = getattr(modal, "Environment", None)
+        if not (
+            callable(getattr(environment, "from_context", None))
+            and hasattr(environment, "apps")
+            and callable(getattr(getattr(modal, "App", None), "info", None))
+        ):
+            raise FeatureNotSupportedError(
+                "Listing Modal apps needs modal>=1.6.0 "
+                "(Environment.apps.list and App.info); upgrade modal",
+                backend="modal",
+                op="list_apps",
+            )
+        return _call_bounded(
+            lambda: _list_apps(modal),
+            timeout_secs=timeout,
+            op="list_apps",
+            outcome=ErrorOutcome.FAILED,
+        )
+
     def resume(self, data: dict) -> ModalSession:
         try:
             sandbox = self._modal.Sandbox.from_id(data["sandbox_id"])
@@ -161,6 +253,211 @@ class ModalClient:
                 f"Cannot resume Modal sandbox '{data.get('sandbox_id')}': {exc}"
             ) from exc
         return ModalSession(sandbox=sandbox)
+
+
+def _checked_app_name(app_name: object, allow_default_app: bool) -> str:
+    """Return *app_name* if it names exactly one app this call may stop."""
+    if (
+        not isinstance(app_name, str)
+        or not app_name
+        or app_name.strip() != app_name
+    ):
+        raise SandboxConfigurationError(
+            "stop_app needs the app's exact, non-empty name",
+            backend="modal",
+            op="stop_app",
+        )
+    if _APP_ID_RE.fullmatch(app_name):
+        raise SandboxConfigurationError(
+            "stop_app takes an app name, not an app id",
+            backend="modal",
+            op="stop_app",
+        )
+    if app_name == DEFAULT_APP_NAME and not allow_default_app:
+        raise SandboxConfigurationError(
+            f"'{DEFAULT_APP_NAME}' is the default app shared by every sandbox "
+            "created without app_name; pass allow_default_app=True to stop "
+            "them all",
+            backend="modal",
+            op="stop_app",
+        )
+    return app_name
+
+
+def _checked_timeout(timeout_secs: object, op: str) -> float:
+    if (
+        isinstance(timeout_secs, bool)
+        or not isinstance(timeout_secs, (int, float))
+        or not math.isfinite(timeout_secs)
+        or timeout_secs <= 0
+    ):
+        raise SandboxConfigurationError(
+            "timeout_secs must be a finite number greater than 0",
+            backend="modal",
+            op=op,
+        )
+    return float(timeout_secs)
+
+
+def _experimental_stop_app(modal: object) -> Callable[[str], object] | None:
+    """``modal.experimental.stop_app``, the stop call before ``App.stop``."""
+    experimental = getattr(modal, "experimental", None)
+    if experimental is None and isinstance(modal, types.ModuleType):
+        # Older SDKs do not import the submodule with the package.
+        try:
+            experimental = importlib.import_module(
+                f"{modal.__name__}.experimental"
+            )
+        except Exception:
+            return None
+    return getattr(experimental, "stop_app", None)
+
+
+def _not_found_errors(modal: object) -> tuple[type[BaseException], ...]:
+    error = getattr(getattr(modal, "exception", None), "NotFoundError", None)
+    if isinstance(error, type) and issubclass(error, BaseException):
+        return (error,)
+    return ()
+
+
+def _stop_app_by_name(
+    modal: Any, app_name: str, legacy_stop: Callable[[str], object] | None
+) -> AppStopResult:
+    """Look *app_name* up without creating it, then stop that one app."""
+    not_found = _not_found_errors(modal)
+    absent = AppStopResult(app_name=app_name, stopped=False, reason="not_found")
+    try:
+        app = modal.App.lookup(app_name, create_if_missing=False)
+    except not_found:
+        return absent
+    except Exception as exc:
+        raise SandboxExecutionError(
+            f"Modal app lookup failed: {exc}", backend="modal", op="stop_app"
+        ) from exc
+    stop = getattr(app, "stop", None)
+    try:
+        if callable(stop):
+            stop()
+        elif legacy_stop is not None:
+            legacy_stop(app_name)
+        else:
+            raise FeatureNotSupportedError(
+                "This Modal SDK cannot stop an app; upgrade modal",
+                backend="modal",
+                op="stop_app",
+            )
+    except FeatureNotSupportedError:
+        raise
+    except not_found:
+        # Stopped by someone else between the lookup and the stop.
+        return absent
+    except Exception as exc:
+        # The request may have reached Modal before it failed.
+        raise SandboxExecutionError(
+            f"Modal app stop failed: {exc}",
+            backend="modal",
+            op="stop_app",
+            outcome=ErrorOutcome.UNKNOWN,
+        ) from exc
+    app_id = getattr(app, "app_id", None)
+    return AppStopResult(
+        app_name=app_name,
+        stopped=True,
+        app_id=str(app_id) if app_id else None,
+    )
+
+
+def _list_apps(modal: Any) -> list[AppListing]:
+    try:
+        listings: list[AppListing] = []
+        for app in modal.Environment.from_context().apps.list():
+            app_id = getattr(app, "app_id", None)
+            if not app_id:
+                raise SandboxExecutionError(
+                    "Modal listed an app without an id.",
+                    backend="modal",
+                    op="list_apps",
+                )
+            lifecycle = app.info().lifecycle
+            state = getattr(lifecycle, "state", None)
+            state = getattr(state, "value", state)
+            # The SDK's listing normally leaves stopped apps out already.
+            if isinstance(state, str) and state.lower() == "stopped":
+                continue
+            name = getattr(app, "name", None) or getattr(
+                app, "description", None
+            )
+            listings.append(
+                AppListing(
+                    name=str(name) if name else None,
+                    app_id=str(app_id),
+                    state=str(state) if state else None,
+                    created_at=_known_time(
+                        getattr(lifecycle, "created_at", None)
+                    ),
+                )
+            )
+    except SandboxExecutionError:
+        raise
+    except Exception as exc:
+        raise SandboxExecutionError(
+            f"Modal app list failed: {exc}", backend="modal", op="list_apps"
+        ) from exc
+    return listings
+
+
+def _known_time(value: object) -> datetime | None:
+    """Return a timezone-aware time after the epoch, else ``None``.
+
+    A creation time the server left unset arrives as the epoch itself; that
+    is an unknown age, not a very old app.
+    """
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return None
+    return value if value.timestamp() > 0 else None
+
+
+def _call_bounded(
+    call: Callable[[], T],
+    *,
+    timeout_secs: float,
+    op: str,
+    outcome: ErrorOutcome,
+) -> T:
+    """Run *call* in a daemon thread and give up after *timeout_secs*.
+
+    The SDK's own calls take no deadline, so the bound is enforced here.  A
+    thread still running past it is abandoned; it can only finish *call*.
+    """
+    result: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            result["value"] = call()
+        except BaseException as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=target, name=f"modal-{op}", daemon=True)
+    worker.start()
+    worker.join(timeout_secs)
+    if worker.is_alive():
+        raise SandboxTimeoutError(
+            f"Modal {op} did not finish within {timeout_secs:g}s",
+            backend="modal",
+            op=op,
+            outcome=outcome,
+        )
+    error = result.get("error")
+    if isinstance(error, Exception):
+        raise error
+    if error is not None:
+        raise SandboxExecutionError(
+            f"Modal {op} was interrupted: {type(error).__name__}",
+            backend="modal",
+            op=op,
+            outcome=outcome,
+        )
+    return result["value"]
 
 
 def _image_from_dockerfile(modal: object, config: SandboxConfig) -> object:

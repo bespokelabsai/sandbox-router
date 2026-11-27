@@ -8,7 +8,7 @@ can list). It splits the work into three steps with separate owners:
 
 | Step | Owner | Does |
 |---|---|---|
-| Observe | [Reconciliation](PROVIDER_RECONCILIATION.md), `Sandbox.list_sandboxes` | Lists what the provider has. Never deletes. |
+| Observe | [Reconciliation](PROVIDER_RECONCILIATION.md), `Sandbox.list_sandboxes`, `SandboxClient.list_apps` | Lists what the provider has. Never deletes. |
 | Decide | `plan_reap` | Pure function: one keep/delete decision per resource. No I/O. |
 | Delete | `execute_reap_plan` | Applies a plan through a delete callable you supply. |
 
@@ -137,6 +137,65 @@ min_references=..., max_unreferenced_fraction=...)`.
   message, and the run continues. The executor returns a `ReapResult` with one
   outcome per planned deletion plus every kept decision. Only process-level
   interruptions such as `KeyboardInterrupt` propagate.
+
+## Stopping stale Modal apps
+
+The planner takes any `ReapCandidate`, so the same guards can decide which
+[Modal apps](SDK_REFERENCE.md#stopping-a-modal-app) to stop. Apps have no
+labels: prove ownership with `is_owned` on the app name, and protect the shared
+default app. `list_apps` returns every app the credentials can see.
+
+```python
+from datetime import datetime, timedelta, timezone
+
+from bespokelabs.sandbox import SandboxClient, SandboxNotFoundError
+from bespokelabs.sandbox.control_plane.reaper import (
+    LivenessReport,
+    ReapCandidate,
+    ReapLimits,
+    execute_reap_plan,
+    plan_reap,
+)
+
+client = SandboxClient("modal")
+candidates = [
+    ReapCandidate(resource_id=app.name, created_at=app.created_at, state=app.state)
+    for app in client.list_apps()  # raises rather than return a partial list
+    if app.name
+]
+
+try:
+    liveness = LivenessReport.from_facts(
+        in_use=app_names_still_running(), not_in_use=app_names_known_finished()
+    )
+except Exception as error:
+    liveness = LivenessReport.failed(type(error).__name__)
+
+plan = plan_reap(
+    candidates,
+    liveness,
+    now=datetime.now(timezone.utc),
+    is_owned=lambda candidate: candidate.resource_id.startswith("my-service-run-"),
+    protected_ids={"sandbox-sdk"},
+    deletable_states={"deployed"},
+    limits=ReapLimits(min_age=timedelta(days=2)),
+)
+
+
+def stop_one(candidate):
+    if client.stop_app(candidate.resource_id).not_found:
+        raise SandboxNotFoundError(candidate.resource_id)  # reported as already_gone
+
+
+result = execute_reap_plan(plan, stop_one)  # dry run
+result = execute_reap_plan(plan, stop_one, apply=True)
+```
+
+The app name is the candidate id because `stop_app` takes an exact name. Set
+`min_age` longer than your longest workload: an app is created before its first
+sandbox, and Modal's listing has no last-activity time, so age since creation
+is the only stand-in for "idle". An app whose creation time Modal did not
+report is kept (`age_unknown`).
 
 ## What the library does not do
 

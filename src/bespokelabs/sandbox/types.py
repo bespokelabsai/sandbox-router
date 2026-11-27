@@ -303,6 +303,46 @@ class SandboxListing:
     __hash__ = None  # type: ignore[assignment]
 
 
+@dataclass(frozen=True)
+class AppListing:
+    """One provider app (a named group of sandboxes) that a backend listed.
+
+    Returned by ``SandboxClient.list_apps``, which only Modal supports.
+    ``name`` is the name ``SandboxClient.stop_app`` takes, or ``None`` for an
+    app the provider reports without one.  ``state`` is the provider's raw
+    state string (Modal: ``"deployed"``, ``"ephemeral"``, ...).  ``created_at``
+    is a timezone-aware time, or ``None`` when the provider did not report
+    one: an unknown age is never shown as an old one.
+    """
+
+    name: str | None
+    app_id: str
+    state: str | None
+    created_at: datetime | None
+
+
+@dataclass(frozen=True)
+class AppStopResult:
+    """What ``SandboxClient.stop_app`` did to one provider app.
+
+    ``stopped`` is ``True`` when the provider accepted the stop, which ends
+    every sandbox in the app.  Otherwise ``reason`` says why nothing was
+    stopped; the only such outcome that is not an exception is
+    ``"not_found"``: no running app has that exact name (it was never
+    created, or is already stopped).  ``app_id`` is the stopped app's id.
+    """
+
+    app_name: str
+    stopped: bool
+    app_id: str | None = None
+    reason: str | None = None
+
+    @property
+    def not_found(self) -> bool:
+        """Whether the provider has no running app by this name."""
+        return self.reason == "not_found"
+
+
 # -- Jobs ----------------------------------------------------------------------
 
 _ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")

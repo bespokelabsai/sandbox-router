@@ -50,6 +50,8 @@ from bespokelabs.sandbox.protocols import (
 )
 from bespokelabs.sandbox.types import (
     AgentRunResult,
+    AppListing,
+    AppStopResult,
     ExposedPort,
     FileInfo,
     JobSpec,
@@ -1083,6 +1085,62 @@ class SandboxClient:
                 op="list",
             )
         return self._backend_client.list_sandboxes(wanted)
+
+    def stop_app(
+        self,
+        app_name: str,
+        *,
+        timeout_secs: float = 30.0,
+        allow_default_app: bool = False,
+    ) -> AppStopResult:
+        """Stop one provider app, ending every sandbox created under it.
+
+        Only ``modal`` groups sandboxes into apps (``app_name=`` at
+        creation); every other backend raises
+        :class:`FeatureNotSupportedError`.  The app is resolved by its exact
+        name and is never created: one that does not exist, or is already
+        stopped, returns ``stopped=False`` with ``reason="not_found"``.  The
+        backend's shared default app is refused with
+        :class:`SandboxConfigurationError` unless ``allow_default_app=True``,
+        because sandboxes created without an ``app_name`` all live in it.
+
+        The call returns within about ``timeout_secs``:
+        :class:`SandboxTimeoutError` (``outcome=unknown``, since the stop may
+        still land) when the provider has not answered by then, and
+        :class:`SandboxExecutionError` on a provider failure.  Stopping is
+        repeatable, so either can be retried.
+        """
+        stopper = getattr(type(self._backend_client), "stop_app", None)
+        if not callable(stopper):
+            raise FeatureNotSupportedError(
+                f"The '{self._backend_name}' backend has no apps to stop",
+                backend=self._backend_name,
+                op="stop_app",
+            )
+        return self._backend_client.stop_app(
+            app_name,
+            timeout_secs=timeout_secs,
+            allow_default_app=allow_default_app,
+        )
+
+    def list_apps(self, *, timeout_secs: float = 30.0) -> list[AppListing]:
+        """List the provider apps that are not stopped.
+
+        Only ``modal`` supports this (apps in the configured Modal
+        environment); every other backend raises
+        :class:`FeatureNotSupportedError`.  The listing covers every app the
+        credentials can see, not only ones this SDK created, so filter by
+        your own naming scheme before passing a name to :meth:`stop_app`.
+        Provider failures raise; a partial list is never returned.
+        """
+        lister = getattr(type(self._backend_client), "list_apps", None)
+        if not callable(lister):
+            raise FeatureNotSupportedError(
+                f"The '{self._backend_name}' backend has no apps to list",
+                backend=self._backend_name,
+                op="list_apps",
+            )
+        return self._backend_client.list_apps(timeout_secs=timeout_secs)
 
     # -- Jobs --------------------------------------------------------------
 
