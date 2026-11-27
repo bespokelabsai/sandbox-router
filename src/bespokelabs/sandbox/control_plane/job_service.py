@@ -24,6 +24,7 @@ from .job_models import (
     ProviderMissing,
     bounded_log_text,
     bounded_tail,
+    bounded_task_summary,
 )
 from .models import Principal
 
@@ -32,6 +33,8 @@ _SAFE_REASONS = {
     "cancelled",
     "timeout",
     "batch_failed",
+    "quota_exceeded",
+    "capacity_unavailable",
     "exit_code",
     "vm_preempted",
     "vm_lost",
@@ -362,6 +365,13 @@ class HostedJobService:
                 if status.finished_at
                 else None,
             }
+            # Present only for a multi-task job; a single-task result keeps
+            # exactly the five keys above.
+            tasks = bounded_task_summary(
+                status.details.get("tasks"), _SAFE_REASONS
+            )
+            if tasks is not None:
+                result["tasks"] = tasks
         return self.repository.complete_observation(
             record,
             now=self._clock(),

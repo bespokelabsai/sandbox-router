@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Protocol
+from typing import Callable, Collection, Protocol
 
 from bespokelabs.sandbox.types import JobSpec, JobStatus
 
 DEFAULT_LOG_TAIL = 1000
 MAX_LOG_TAIL = 1000
 MAX_LOG_BYTES = 1024 * 1024
+#: Most failed tasks a multi-task result describes; more set ``truncated``.
+MAX_TASK_FAILURES = 20
+_MAX_TASKS = 2**31
 
 
 def bounded_tail(tail: int | None) -> int:
@@ -28,6 +31,51 @@ def bounded_log_text(value: str) -> str:
         .encode("utf-8")[:MAX_LOG_BYTES]
         .decode("utf-8", errors="ignore")
     )
+
+
+def bounded_task_summary(
+    value: object, reasons: Collection[str]
+) -> dict | None:
+    """Rebuild a multi-task summary from allowlisted fields only.
+
+    Returns ``None`` for a single-task job (no summary) or a malformed one,
+    so nothing but counts, task indexes, integer exit codes and reasons in
+    ``reasons`` can pass, and at most ``MAX_TASK_FAILURES`` failures.
+    """
+    if not isinstance(value, dict):
+        return None
+    summary: dict = {}
+    for key in ("count", "succeeded", "failed", "other"):
+        number = value.get(key)
+        if type(number) is not int or not 0 <= number < _MAX_TASKS:
+            return None
+        summary[key] = number
+    listed = value.get("failures")
+    if not isinstance(listed, (list, tuple)):
+        listed = []
+    failures = []
+    for entry in listed[:MAX_TASK_FAILURES]:
+        index = entry.get("index") if isinstance(entry, dict) else None
+        if type(index) is not int or not 0 <= index < _MAX_TASKS:
+            return None
+        exit_code = entry.get("exit_code")
+        reason = entry.get("reason")
+        failures.append(
+            {
+                "index": index,
+                "exit_code": exit_code
+                if type(exit_code) is int and -(2**31) <= exit_code < 2**31
+                else None,
+                "reason": reason
+                if isinstance(reason, str) and reason in reasons
+                else None,
+            }
+        )
+    summary["failures"] = failures
+    summary["truncated"] = (
+        value.get("truncated") is True or len(listed) > MAX_TASK_FAILURES
+    )
+    return summary
 
 
 class JobPhase(str, Enum):

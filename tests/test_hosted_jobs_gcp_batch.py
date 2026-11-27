@@ -511,3 +511,111 @@ def test_logging_factory_missing_fails_closed_without_native_fallback(
         ):
             adapter.logs(record, 1)
         native.assert_not_called()
+
+
+def test_real_batch_request_carries_task_count_and_parallelism(sdk_harness):
+    h, rpc, _ = sdk_harness
+    h.spec = replace(
+        h.spec, backend_options={"task_count": 6, "parallelism": 2}
+    )
+    assert h.submit().phase is JobPhase.ACTIVE
+    group = rpc.create_job.call_args.kwargs["request"].job.task_groups[0]
+    assert (group.task_count, group.parallelism) == (6, 2)
+
+
+def _real_task(name, index, state, exit_code=None, text=""):
+    event = batch.StatusEvent(
+        task_state=batch.TaskStatus.State[state], description=text
+    )
+    if exit_code is not None:
+        event.task_execution = batch.TaskExecution(exit_code=exit_code)
+    return batch.Task(
+        name=f"{name}/taskGroups/group0/tasks/{index}",
+        status=batch.TaskStatus(
+            state=batch.TaskStatus.State[state], status_events=[event]
+        ),
+    )
+
+
+def test_real_multi_task_status_becomes_a_sanitized_result(sdk_harness):
+    h, rpc, jobs = sdk_harness
+    h.spec = replace(h.spec, backend_options={"task_count": 4})
+    record = h.submit()
+    job = jobs[record.resource_name]
+    job.task_groups = [batch.TaskGroup(task_count=4)]
+    job.status.state = batch.JobStatus.State.FAILED
+    stockout = (
+        "Batch Error: code - CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED, "
+        "description - The zone does not have enough resources available"
+    )
+    rpc.list_tasks.return_value = iter(
+        [
+            _real_task(job.name, 0, "SUCCEEDED"),
+            _real_task(job.name, 1, "FAILED", 9, "exit text"),
+            _real_task(job.name, 2, "FAILED", None, stockout),
+            _real_task(job.name, 3, "UNEXECUTED"),
+        ]
+    )
+    result = h.service.result(h.principal, record.id)
+    assert result == {
+        "state": "failed",
+        "exit_code": 9,
+        "reason": "exit_code",
+        "started_at": None,
+        "finished_at": None,
+        "tasks": {
+            "count": 4,
+            "succeeded": 1,
+            "failed": 2,
+            "other": 1,
+            "failures": [
+                {"index": 1, "exit_code": 9, "reason": "exit_code"},
+                {
+                    "index": 2,
+                    "exit_code": None,
+                    "reason": "capacity_unavailable",
+                },
+            ],
+            "truncated": False,
+        },
+    }
+    parent = rpc.list_tasks.call_args.kwargs["request"].parent
+    assert parent == f"{record.resource_name}/taskGroups/group0"
+
+
+@pytest.mark.parametrize(
+    "text,reason",
+    [
+        (
+            "Job failed due to: Batch Error: code - CODE_GCE_QUOTA_EXCEEDED, "
+            "description - Quota 'CPUS' exceeded.  Limit: 24.0 in region "
+            "us-central1.",
+            "quota_exceeded",
+        ),
+        (
+            "Job failed due to: Batch Error: code - "
+            "CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED, description - The zone "
+            "does not have enough resources available to fulfill the request.",
+            "capacity_unavailable",
+        ),
+        ("Job failed: the image could not be pulled", "batch_failed"),
+    ],
+)
+def test_real_capacity_failures_have_distinct_hosted_reasons(
+    sdk_harness, text, reason
+):
+    h, _, jobs = sdk_harness
+    record = h.submit()
+    job = jobs[record.resource_name]
+    job.status.state = batch.JobStatus.State.FAILED
+    job.status.status_events = [batch.StatusEvent(description=text)]
+    result = h.service.result(h.principal, record.id)
+    assert result == {
+        "state": "failed",
+        "exit_code": None,
+        "reason": reason,
+        "started_at": None,
+        "finished_at": None,
+    }
+    # The provider's message is neither stored nor returned.
+    assert "Limit: 24.0" not in repr(h.service.get(h.principal, record.id))

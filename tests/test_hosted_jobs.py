@@ -663,6 +663,13 @@ _SECRET = "projects/example-project/secrets/api-key/versions/latest"
         {"boot_disk_type": ""},
         {"install_gpu_drivers": True},
         {"block_project_ssh_keys": "yes"},
+        {"task_count": 0},
+        {"task_count": True},
+        {"task_count": "4"},
+        {"task_count": 10_001},
+        {"parallelism": 2},
+        {"task_count": 4, "parallelism": 5},
+        {"task_count": 4, "parallelism": 0},
     ],
 )
 def test_invalid_batch_options_fail_before_reservation(h, options):
@@ -1200,3 +1207,126 @@ def test_update_rejects_a_change_key_that_is_not_a_column_name():
     repository = HostedJobRepository.__new__(HostedJobRepository)
     with pytest.raises(ValueError, match="not a hosted_jobs column name"):
         repository._update(None, {"phase=phase, organization_id": "x"})
+
+
+def test_task_options_reach_native_submit_and_the_fingerprint(h):
+    options = {"task_count": 4, "parallelism": 2}
+    spec = JobSpec("printf hello", backend_options=dict(options))
+    record = h.submit(spec)
+    assert record.phase is JobPhase.ACTIVE
+    assert h.backend.runtime_spec.backend_options == {
+        **options,
+        "project": h.binding.project,
+        "region": h.binding.region,
+        "job_id": record.resource_name.rsplit("/", 1)[-1],
+    }
+    # Replaying the same payload adopts the job; a changed count conflicts.
+    assert h.submit(spec).id == record.id
+    for changed in ({"task_count": 5, "parallelism": 2}, {"task_count": 4}):
+        with pytest.raises(ConflictError):
+            h.submit(JobSpec("printf hello", backend_options=changed))
+    assert h.backend.submits == 1
+
+
+_FIVE_KEYS = {"state", "exit_code", "reason", "started_at", "finished_at"}
+
+
+def test_single_task_result_shape_is_unchanged(h):
+    record = h.submit()
+    h.finish(record, JobState.FAILED)
+    result = h.service.result(h.principal, record.id)
+    assert set(result) == _FIVE_KEYS
+
+
+@pytest.mark.parametrize("reason", ["quota_exceeded", "capacity_unavailable"])
+def test_capacity_reasons_reach_the_terminal_result(h, reason):
+    record = h.submit()
+    status = h.backend.jobs[record.resource_name]
+    status.state = JobState.FAILED
+    status.reason = reason
+    status.details["message"] = "Quota 'CPUS' exceeded.  Limit: 24.0"
+    result = h.service.result(h.principal, record.id)
+    assert result == {
+        "state": "failed",
+        "exit_code": None,
+        "reason": reason,
+        "started_at": None,
+        "finished_at": None,
+    }
+    with sqlite3.connect(h.path) as connection:
+        assert "Limit: 24.0" not in "\n".join(connection.iterdump())
+
+
+def test_multi_task_result_is_bounded_and_sanitized(h):
+    sentinel = secrets.token_hex(16)
+    record = h.submit(
+        JobSpec("printf hello", backend_options={"task_count": 40})
+    )
+    h.finish(record, JobState.FAILED)
+    status = h.backend.jobs[record.resource_name]
+    status.reason = "exit_code"
+    failures = [
+        {
+            "index": index,
+            "exit_code": 1,
+            "reason": "exit_code",
+            "message": sentinel,
+        }
+        for index in range(1, 26)
+    ]
+    failures[1].update(exit_code=None, reason="capacity_unavailable")
+    failures[2].update(exit_code=2**40, reason=sentinel)
+    status.details["tasks"] = {
+        "count": 40,
+        "succeeded": 10,
+        "failed": 25,
+        "other": 5,
+        "failures": failures,
+        "truncated": False,
+        "private": sentinel,
+    }
+    result = h.service.result(h.principal, record.id)
+    assert set(result) == _FIVE_KEYS | {"tasks"}
+    tasks = result["tasks"]
+    assert set(tasks) == {
+        "count",
+        "succeeded",
+        "failed",
+        "other",
+        "failures",
+        "truncated",
+    }
+    assert (tasks["count"], tasks["succeeded"]) == (40, 10)
+    assert (tasks["failed"], tasks["other"]) == (25, 5)
+    # More failures than the bound: cut, and said so.
+    assert len(tasks["failures"]) == 20 and tasks["truncated"] is True
+    assert tasks["failures"][:3] == [
+        {"index": 1, "exit_code": 1, "reason": "exit_code"},
+        {"index": 2, "exit_code": None, "reason": "capacity_unavailable"},
+        {"index": 3, "exit_code": None, "reason": None},
+    ]
+    with sqlite3.connect(h.path) as connection:
+        assert sentinel not in "\n".join(connection.iterdump())
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        "raw text",
+        {"count": "4", "succeeded": 0, "failed": 0, "other": 4},
+        {"count": 4, "succeeded": True, "failed": 0, "other": 4},
+        {"count": 4, "succeeded": 0, "failed": -1, "other": 4},
+        {
+            "count": 4,
+            "succeeded": 0,
+            "failed": 1,
+            "other": 3,
+            "failures": [{"index": "0"}],
+        },
+    ],
+)
+def test_malformed_task_summary_is_dropped_whole(h, summary):
+    record = h.submit()
+    h.finish(record, JobState.FAILED)
+    h.backend.jobs[record.resource_name].details["tasks"] = summary
+    assert set(h.service.result(h.principal, record.id)) == _FIVE_KEYS

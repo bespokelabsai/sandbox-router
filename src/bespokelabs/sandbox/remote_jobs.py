@@ -41,32 +41,61 @@ class _Response(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
 
+_Reason = Literal[
+    "cancelled_before_dispatch",
+    "cancelled",
+    "timeout",
+    "batch_failed",
+    "quota_exceeded",
+    "capacity_unavailable",
+    "exit_code",
+    "vm_preempted",
+    "vm_lost",
+    "vm_rebooted",
+    "vm_unresponsive",
+    "vm_recreated",
+]
+
+
+class RemoteJobTaskFailure(_Response):
+    """One failed task of a multi-task job: its index and why it failed."""
+
+    index: int = Field(ge=0, lt=2**31)
+    exit_code: int | None = Field(ge=-(2**31), lt=2**31)
+    reason: _Reason | None
+
+
+class RemoteJobTasks(_Response):
+    """Task counts of a multi-task job by outcome, and its first failures.
+
+    ``other`` counts tasks that neither succeeded nor failed. ``failures`` is
+    bounded; ``truncated`` says the job had more than are listed.
+    """
+
+    count: int = Field(ge=0, lt=2**31)
+    succeeded: int = Field(ge=0, lt=2**31)
+    failed: int = Field(ge=0, lt=2**31)
+    other: int = Field(ge=0, lt=2**31)
+    failures: tuple[RemoteJobTaskFailure, ...] = Field(max_length=20)
+    truncated: bool
+
+
 class RemoteJobResult(_Response):
     """Allowlisted terminal snapshot, not stdout or a native JobStatus.
 
     Nullable fields are preserved exactly; absent exit codes are not zero.
     Timestamps remain timezone-aware ISO strings as returned by the service.
+    ``reason`` tells ``quota_exceeded`` and ``capacity_unavailable`` apart
+    from the generic ``batch_failed``. ``tasks`` is ``None`` for a single-task
+    job, whose response carries no such key.
     """
 
     state: Literal["succeeded", "failed", "cancelled"] | None
     exit_code: int | None = Field(ge=-(2**31), lt=2**31)
-    reason: (
-        Literal[
-            "cancelled_before_dispatch",
-            "cancelled",
-            "timeout",
-            "batch_failed",
-            "exit_code",
-            "vm_preempted",
-            "vm_lost",
-            "vm_rebooted",
-            "vm_unresponsive",
-            "vm_recreated",
-        ]
-        | None
-    )
+    reason: _Reason | None
     started_at: str | None = Field(max_length=64)
     finished_at: str | None = Field(max_length=64)
+    tasks: RemoteJobTasks | None = None
 
     @field_validator("started_at", "finished_at")
     @classmethod

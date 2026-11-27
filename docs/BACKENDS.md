@@ -252,7 +252,8 @@ validation: its collection can create unrelated provider resources.
 ## Google Cloud Batch: detached jobs
 
 `gcp_batch` runs detached jobs only (`SandboxClient("gcp_batch").submit_job`);
-it has no interactive sandboxes. A job is one Batch job with one task, on VMs
+it has no interactive sandboxes. A job is one Batch job with one task, or
+with `task_count` tasks of the same command, on VMs
 in your own project, authenticated with Application Default Credentials.
 
 Beyond the generic `JobSpec` fields, `backend_options` reaches these Batch
@@ -267,6 +268,12 @@ features:
 | VM hardening | `block_project_ssh_keys`, `no_external_ip`, `network` / `subnetwork`, `service_account` |
 | Labels | `JobSpec.labels` on the job and its VMs; `instance_labels` on the VMs only |
 | Placement and cost | `region` / `regions` / `region_quota`, `allowed_locations`, `machine_type`, `provisioning_model` |
+| Several tasks in one job | `task_count` (1 to 10,000) and `parallelism` (1 to `task_count`); each task reads its index from Batch's `BATCH_TASK_INDEX`, and the status counts tasks by outcome in `details["tasks"]` |
+
+A job that fails before any task exits reports why in `JobStatus.reason`:
+`quota_exceeded` when the project's quota does not cover the VMs,
+`capacity_unavailable` when the zone has none to give (a stock-out, worth
+retrying in another zone or region), and `batch_failed` for anything else.
 
 See [Detached jobs](SDK_REFERENCE.md#detached-jobs-google-cloud-batch) for
 every key and its validation, and [Hosted jobs](HOSTED_JOBS.md) for which of

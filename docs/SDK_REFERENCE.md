@@ -710,7 +710,10 @@ on the event loop and accepts a coroutine `on_poll`.
 `failed`, `cancelled` or `unknown`. `succeeded` and `failed` normally come from the
 command's own exit code (`reason="timeout"` when `timeout_secs` stopped it);
 Cloud Batch can also fail a job whose command never ran, with
-`exit_code=None` and `reason="batch_failed"`.
+`exit_code=None` and `reason="batch_failed"`, or one of two more specific
+reasons when Batch names the cause: `"quota_exceeded"` (the project's quota
+does not cover the VMs) and `"capacity_unavailable"` (the zone has no such
+VMs to give right now, a stock-out). See "Capacity failures" below.
 `unknown` is terminal and means the outcome can no longer be established: the
 Batch job is gone (`reason="job_not_found"`). It is never reported as success.
 `JobStatus.done` is true for every terminal state; `started_at` /
@@ -725,7 +728,7 @@ seen, failed reads are retried with backoff (capped at 60s) until the deadline. 
 authentication and not-installed errors raise at once.
 
 **How a Batch job runs.** `SandboxClient("gcp_batch")` runs each job as a Batch
-job with one task, a container by default; interactive `Sandbox("gcp_batch")` raises
+job with one task (or `task_count` tasks), a container by default; interactive `Sandbox("gcp_batch")` raises
 `FeatureNotSupportedError`. The job id is the job's resource name,
 `projects/<project>/locations/<region>/jobs/<id>`. `image` is any container
 URI the VMs can pull (e.g. Artifact Registry); `cpu` / `memory_mb` become the
@@ -760,6 +763,85 @@ carries the latest one in `details["message"]` (for a failure, why it failed:
 the task's exit, or the job-level cause when no task exited); the key is
 absent when Batch has given none, so read it with `details.get("message")`. Files reach the job through the
 image or Cloud Storage. Credentials are Application Default Credentials.
+
+**Multi-task jobs.** `task_count` runs the same command as that many tasks
+of one Batch job, and `parallelism` caps how many run at once:
+
+```python
+job_id = client.submit_job(JobSpec(
+    command='python -m worker --shard "$BATCH_TASK_INDEX" --of "$BATCH_TASK_COUNT"',
+    image="us-docker.pkg.dev/example-project/repo/worker:1",
+    backend_options={"task_count": 20, "parallelism": 5},
+))
+status = client.wait_job(job_id)
+tasks = status.details["tasks"]
+print(tasks["succeeded"], tasks["failed"], tasks["other"])
+for failure in tasks["failures"]:
+    print(failure["index"], failure["exit_code"], failure["reason"])
+```
+
+- `task_count` is an integer from 1 (the default) to 10,000
+  (`gcp_batch.MAX_TASK_COUNT`). `parallelism` is an integer from 1 to
+  `task_count`, at most 5,000 (`gcp_batch.MAX_PARALLELISM`); left out, Batch
+  runs as many tasks at once as it can. Both are rejected with
+  `SandboxConfigurationError` otherwise.
+- Batch itself tells each task which one it is: the environment variable
+  `BATCH_TASK_INDEX` is the task's 0-based index and `BATCH_TASK_COUNT` the
+  number of tasks. This SDK adds no variable of its own. `cpu`, `memory_mb`,
+  `timeout_secs` and `max_retry_count` apply to each task.
+- `JobStatus.state` stays the Batch job's state. For a job with more than one
+  task, a status read after the job left `pending` also carries
+  `details["tasks"]`:
+
+  ```python
+  {
+      "count": 20,       # tasks in the job
+      "succeeded": 17,
+      "failed": 2,
+      "other": 1,        # pending, running, never run, or not listed yet
+      "failures": [      # by task index, at most 20 (MAX_TASK_FAILURES)
+          {"index": 3, "exit_code": 2, "reason": "exit_code"},
+          {"index": 11, "exit_code": None, "reason": "capacity_unavailable"},
+      ],
+      "truncated": False,  # True when more failed than are listed
+  }
+  ```
+
+  Each failure's `reason` is one of the job-level failure reasons
+  (`exit_code`, `timeout`, `vm_preempted`, ..., `batch_failed`,
+  `quota_exceeded`, `capacity_unavailable`); the provider's message is not
+  repeated per task. For a failed job, `exit_code`, `reason` and
+  `details["message"]` describe the failed task with the lowest index;
+  `started_at` is when the first task started and `finished_at`, once the job
+  is terminal, when the last one finished. A succeeded job has `exit_code=0`.
+- A status read lists every task of the job, page by page (it asks Batch
+  for 1,000 tasks per page), so it costs more API calls the more tasks the
+  job has. A job that was not created by this SDK and
+  has more than 10,000 tasks is counted up to that many, with
+  `truncated=True`.
+- A job with `task_count` absent or 1 has no `details["tasks"]`; its status is
+  exactly what it was before these options existed. `job_logs` returns the
+  job's log lines whichever task wrote them.
+
+**Capacity failures.** A job that fails before any task exits has
+`exit_code=None`. Its `reason` is:
+
+| `reason` | Meaning | What usually helps |
+|---|---|---|
+| `quota_exceeded` | The project's quota (CPUs, GPUs, disk, ...) in the region does not cover the job's VMs | Another region or project, a smaller request, or a quota increase; retrying the same request fails the same way |
+| `capacity_unavailable` | The zone could not provide the VMs right now (a stock-out), although quota allows them | Another zone or region (`allowed_locations`, `region`), another machine type or provisioning model, or a later retry |
+| `batch_failed` | Any other cause (image pull, permissions, an invalid VM setting, ...), and every case Batch did not label | Read `details["message"]` |
+
+The two capacity reasons are derived from the error codes Batch and Compute
+Engine put in the job's and the task's newest status events
+(`CODE_GCE_QUOTA_EXCEEDED`, `QUOTA_EXCEEDED`;
+`CODE_GCE_ZONE_RESOURCE_POOL_EXHAUSTED`, `ZONE_RESOURCE_POOL_EXHAUSTED`,
+`STOCKOUT`) and from Compute Engine's fixed wording for them. The reason is
+one of these fixed values and never the provider's text, which stays in
+`details["message"]`. Batch does not always fail such a job: it can keep it
+`pending` while it waits for quota or capacity, and a pending job has no
+reason. A task that did exit keeps its exit-code reason whatever the events
+say.
 
 **Secrets, scripts and VM settings.** These are `backend_options` too:
 
@@ -829,6 +911,8 @@ client.submit_job(JobSpec(
 | `provisioning_model` | `STANDARD`, `SPOT`, `PREEMPTIBLE` or `FLEX_START` |
 | `allowed_locations` | e.g. `["zones/us-central1-a"]` |
 | `max_retry_count` | Task retries (default 0) |
+| `task_count` | Number of tasks, 1 (default) to 10,000; each gets its index in Batch's `BATCH_TASK_INDEX` |
+| `parallelism` | Most tasks running at once, 1 to `task_count` (at most 5,000); default: Batch's own |
 | `container_options` | Extra `docker run` options |
 | `gpu_driver_version` | GPU driver version for Batch to install |
 | `job_id`, `job_id_prefix` | Explicit Batch job id, or its prefix (default `job`) |

@@ -288,6 +288,7 @@ reserved (422, with a fixed message that never repeats the input).
 | `install_gpu_drivers` | Driver install for `spec.gpu` or an accelerator-optimized `machine_type` | - |
 | `block_project_ssh_keys` | Keeps project-wide SSH keys off the VMs | - |
 | `instance_labels` | Extra labels on the VMs only | The `hosted-job-owner` label, in any spelling that normalizes to it, is rejected; the server's ownership label is still applied to the job and its VMs as before |
+| `task_count`, `parallelism` | How many tasks the job runs (1 to 10,000, default 1) and how many at once (1 to `task_count`, at most 5,000) | The bounds only: admission must decide how many tasks, and so how many VMs, a tenant may start |
 
 **Secrets.** The request, the job row, the audit trail, and every response
 carry at most the secret *reference*, never a value; Batch resolves the value
@@ -312,6 +313,15 @@ for scripts and there is no separate script limit: a larger payload gets 413.
 Keep the script a small bootstrap that fetches the rest from the VM image or
 Cloud Storage.
 
+**Tasks.** `task_count` multiplies the job: every task runs the same command
+with the same `cpu`, `memory_mb` and `timeout_secs`, on as many VMs as Batch
+needs for `parallelism` tasks at a time. Both values are part of the spec that
+`admit` receives and of the payload fingerprint, so a replay of the same
+operation key with another count is a 409. A spend or quota policy must
+multiply by `task_count`; nothing here does it for the host. Each task reads
+its 0-based index from Batch's own `BATCH_TASK_INDEX` variable (and the total
+from `BATCH_TASK_COUNT`); the service adds no variable.
+
 An admission policy should **allowlist** option keys rather than block known
 ones, so an option added in a later release is denied until the host has
 reviewed it.
@@ -319,7 +329,9 @@ reviewed it.
 The job DTO exposes only `id`, `backend`, `phase`, `state`, `confidence`,
 `cancel_requested`, safe `error_code`, and terminal-only `result`. Results expose
 only terminal state, bounded integer exit code, allowlisted reason and parsed
-ISO timestamps. Provider names, UIDs, ownership markers, binding account/project,
+ISO timestamps, plus, for a multi-task job only, the bounded task summary
+described under "Result reasons and multi-task results". Provider names,
+UIDs, ownership markers, binding account/project,
 credentials, fingerprints, raw messages, labels, metadata and leases are never
 included, even from an overpopulated stored snapshot. Unexpected adapter/policy
 errors use fixed messages. Host bindings must use non-secret backend identifiers.
@@ -455,6 +467,59 @@ when available. A locally cancelled reservation has a
 `cancelled_before_dispatch` reason. It is a native job outcome snapshot, not an
 artifact download or cached stdout/stderr. Logs remain a separately authorized,
 provider-backed operation and are not retained in the job database.
+
+### Result reasons and multi-task results
+
+`result.reason` is `null` or one of these fixed values; the provider's own
+message is never stored or returned:
+
+| `reason` | Meaning |
+| --- | --- |
+| `exit_code` | The command exited nonzero; see `exit_code` |
+| `timeout` | `timeout_secs` stopped the command |
+| `vm_preempted`, `vm_lost`, `vm_rebooted`, `vm_unresponsive`, `vm_recreated` | Batch lost the VM under the task |
+| `quota_exceeded` | The job failed before any task exited because the project's quota in the region does not cover its VMs. The same request fails the same way until quota is raised or the request shrinks |
+| `capacity_unavailable` | The job failed before any task exited because the zone could not provide the VMs (a stock-out), although quota allows them. The same request may succeed later or in another zone or region |
+| `batch_failed` | The job failed before any task exited for any other cause, or one Batch did not label. This is the fallback and its meaning is unchanged |
+| `cancelled`, `cancelled_before_dispatch` | Cancelled at the provider, or locally before dispatch |
+
+`quota_exceeded` and `capacity_unavailable` are recognized from provider error
+codes in the job's newest status events; a failure Batch describes some other
+way stays `batch_failed`, so treat `batch_failed` as "cause not classified",
+not as "not a capacity problem". A binding has one region, so retrying
+elsewhere means submitting to another binding with a new operation key.
+
+A job submitted with `task_count` greater than 1 has one more key in its
+result, `tasks`; the other five keys keep their meaning, with `exit_code` and
+`reason` describing the failed task with the lowest index:
+
+```json
+{
+  "state": "failed",
+  "exit_code": 2,
+  "reason": "exit_code",
+  "started_at": "2026-01-01T00:00:05+00:00",
+  "finished_at": "2026-01-01T00:04:10+00:00",
+  "tasks": {
+    "count": 20,
+    "succeeded": 17,
+    "failed": 2,
+    "other": 1,
+    "failures": [
+      {"index": 3, "exit_code": 2, "reason": "exit_code"},
+      {"index": 11, "exit_code": null, "reason": "capacity_unavailable"}
+    ],
+    "truncated": false
+  }
+}
+```
+
+`other` counts tasks that neither succeeded nor failed (never run, or still
+unsettled when the job ended). `failures` lists failed tasks by index and holds
+at most 20 entries; `truncated` is `true` when more tasks failed than are
+listed (`failed` is still the full count). Each entry has exactly `index`,
+`exit_code` and an allowlisted `reason`. A job with `task_count` absent or 1
+has **no** `tasks` key: its result is exactly the five keys it always had.
 
 Public `JobState.UNKNOWN` semantics are unchanged. Hosted orchestration does not
 use a missing-resource UNKNOWN response as proof of failed dispatch, successful

@@ -339,6 +339,10 @@ def test_admission_sees_the_new_batch_options_and_can_reject_them(h):
         {"runnable": "script", "container_options": "--privileged"},
         {"install_gpu_drivers": True},
         {"block_project_ssh_keys": 1},
+        {"task_count": 0},
+        {"task_count": 2.5},
+        {"task_count": 10_001},
+        {"task_count": 2, "parallelism": 3},
     ],
 )
 def test_invalid_new_batch_options_are_422_and_keep_the_key(h, options):
@@ -965,3 +969,109 @@ def test_job_csrf_denial_resets_request_context_when_auditing_raises(
     assert "audit-storage-secret" not in response.text
     assert h.admissions == []
     assert (h.backend.submits, h.backend.reads, h.backend.cancels) == (0, 0, 0)
+
+
+def test_admission_sees_task_count_and_parallelism(h):
+    options = {"task_count": 8, "parallelism": 2}
+    body = {
+        "binding_id": "batch",
+        "spec": {"command": "printf hello", "backend_options": options},
+    }
+
+    def policy(principal, binding, spec):
+        h.admissions.append(spec)
+        return spec.backend_options.get("task_count", 1) <= 8
+
+    client = h.restart(h.config(admit=policy))
+    accepted = h.post(body=body, client=client)
+    assert accepted.status_code == 202, accepted.text
+    assert h.admissions[-1].backend_options == options
+    assert h.backend.runtime_spec.backend_options["task_count"] == 8
+    assert h.backend.runtime_spec.backend_options["parallelism"] == 2
+    # The same key with another task count is a different payload.
+    body["spec"]["backend_options"] = {"task_count": 4, "parallelism": 2}
+    assert h.post(body=body, client=client).status_code == 409
+    body["spec"]["backend_options"] = {"task_count": 9}
+    assert h.post(body=body, key="too-many", client=client).status_code == 403
+    assert h.backend.submits == 1
+
+
+@pytest.mark.parametrize("reason", ["quota_exceeded", "capacity_unavailable"])
+def test_capacity_reasons_are_returned(h, reason):
+    job_id = h.post().json()["id"]
+    status = h.backend.jobs[h.row()["resource_name"]]
+    status.state = JobState.FAILED
+    status.reason = reason
+    status.details["message"] = "provider-message-secret"
+    response = h.client.get(f"/v1/jobs/{job_id}/result", headers=h.headers)
+    assert response.status_code == 200
+    assert response.json()["result"] == {
+        "state": "failed",
+        "exit_code": None,
+        "reason": reason,
+        "started_at": None,
+        "finished_at": None,
+    }
+    assert "provider-message-secret" not in response.text
+
+
+def test_multi_task_result_dto_is_bounded_and_allowlisted(h):
+    job_id = h.post().json()["id"]
+    status = h.backend.jobs[h.row()["resource_name"]]
+    status.state = JobState.FAILED
+    status.exit_code = 3
+    status.reason = "exit_code"
+    status.details["tasks"] = {
+        "count": 6,
+        "succeeded": 3,
+        "failed": 2,
+        "other": 1,
+        "failures": [
+            {"index": 1, "exit_code": 3, "reason": "exit_code"},
+            {"index": 4, "exit_code": None, "reason": "quota_exceeded"},
+        ],
+        "truncated": False,
+    }
+    expected = {
+        "state": "failed",
+        "exit_code": 3,
+        "reason": "exit_code",
+        "started_at": None,
+        "finished_at": None,
+        "tasks": status.details["tasks"],
+    }
+    response = h.client.get(f"/v1/jobs/{job_id}/result", headers=h.headers)
+    assert response.status_code == 200
+    assert response.json()["result"] == expected
+    job = h.client.get(f"/v1/jobs/{job_id}", headers=h.headers).json()
+    assert job["result"] == expected
+    # An overpopulated stored snapshot still cannot escape the DTO.
+    snapshot = {
+        **expected,
+        "tasks": {
+            "count": 30,
+            "succeeded": 0,
+            "failed": 30,
+            "other": 0,
+            "failures": [
+                {
+                    "index": index,
+                    "exit_code": 1,
+                    "reason": "raw-provider-secret",
+                    "message": "metadata-secret",
+                }
+                for index in range(30)
+            ],
+            "truncated": False,
+            "uid": "uid-secret",
+        },
+    }
+    with h.store.connect() as connection:
+        connection.execute(
+            "UPDATE hosted_jobs SET terminal_result=?", (json.dumps(snapshot),)
+        )
+    response = h.client.get(f"/v1/jobs/{job_id}/result", headers=h.headers)
+    tasks = response.json()["result"]["tasks"]
+    assert len(tasks["failures"]) == 20 and tasks["truncated"] is True
+    assert tasks["failures"][0] == {"index": 0, "exit_code": 1, "reason": None}
+    assert "secret" not in response.text

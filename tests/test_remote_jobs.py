@@ -53,6 +53,18 @@ def terminal(**changes):
     }
 
 
+def tasks(**changes):
+    return {
+        "count": 4,
+        "succeeded": 2,
+        "failed": 1,
+        "other": 1,
+        "failures": [{"index": 3, "exit_code": 7, "reason": "exit_code"}],
+        "truncated": False,
+        **changes,
+    }
+
+
 class Response(io.BytesIO):
     status = 200
 
@@ -219,6 +231,44 @@ def test_http_errors_are_bounded_closed_and_not_reflected(transport):
         status(result=terminal(started_at="2026-01-01")),
         status(result=terminal(state="unknown")),
         status(result=terminal(private="raw-secret")),
+        status(result=terminal(reason="zone-secret has no capacity")),
+        status(result=terminal(tasks={"count": 2})),
+        status(result=terminal(tasks=tasks(private="raw-secret"))),
+        status(result=terminal(tasks=tasks(count=-1))),
+        status(result=terminal(tasks=tasks(truncated=1))),
+        status(
+            result=terminal(
+                tasks=tasks(
+                    failures=[
+                        {"index": 0, "exit_code": 1, "reason": "raw-secret"}
+                    ]
+                )
+            )
+        ),
+        status(
+            result=terminal(
+                tasks=tasks(
+                    failures=[
+                        {
+                            "index": 0,
+                            "exit_code": 1,
+                            "reason": None,
+                            "message": "raw-secret",
+                        }
+                    ]
+                )
+            )
+        ),
+        status(
+            result=terminal(
+                tasks=tasks(
+                    failures=[
+                        {"index": i, "exit_code": 1, "reason": None}
+                        for i in range(21)
+                    ]
+                )
+            )
+        ),
     ],
 )
 def test_malformed_or_extra_response_is_sanitized(transport, payload):
@@ -496,3 +546,43 @@ assert not any(n.split('.')[0] in {'fastapi', 'uvicorn', 'google', 'modal', 'day
         env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("reason", ["quota_exceeded", "capacity_unavailable"])
+def test_capacity_reasons_are_surfaced(transport, reason):
+    client, _, queued = transport
+    queued.append((200, {"result": terminal(state="failed", reason=reason)}))
+    result = client.result("hjob_synthetic")
+    assert result.reason == reason and result.exit_code is None
+    # A single-task response has no tasks key at all.
+    assert result.tasks is None
+
+
+def test_multi_task_result_is_typed(transport):
+    client, _, queued = transport
+    failures = [
+        {"index": 1, "exit_code": 7, "reason": "exit_code"},
+        {"index": 3, "exit_code": None, "reason": "capacity_unavailable"},
+    ]
+    summary = tasks(failed=2, other=0, failures=failures, truncated=True)
+    queued.extend(
+        [
+            (200, {"result": terminal(state="failed", tasks=summary)}),
+            (
+                200,
+                status(
+                    phase="terminal",
+                    state="failed",
+                    result=terminal(state="failed", tasks=summary),
+                ),
+            ),
+        ]
+    )
+    result = client.result("hjob_synthetic")
+    assert (result.tasks.count, result.tasks.succeeded) == (4, 2)
+    assert (result.tasks.failed, result.tasks.other) == (2, 0)
+    assert result.tasks.truncated is True
+    assert [
+        (f.index, f.exit_code, f.reason) for f in result.tasks.failures
+    ] == [(1, 7, "exit_code"), (3, None, "capacity_unavailable")]
+    assert client.status("hjob_synthetic").result == result
