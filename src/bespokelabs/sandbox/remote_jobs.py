@@ -13,6 +13,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import datetime
 from typing import Literal, TypeVar
@@ -26,6 +27,25 @@ _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024  # JSON escaping of a 1 MiB log tail.
 _MAX_ERROR_BYTES = 4096
 _ID_PATTERN = r"[A-Za-z0-9_-]{1,255}"
+_MAX_EXTRA_HEADERS = 32
+_MAX_HEADER_NAME_CHARS = 256
+_MAX_HEADER_VALUE_CHARS = 8192
+# Headers this client or its urllib transport sets; a caller cannot replace them.
+_PROTECTED_HEADERS = frozenset(
+    {
+        "authorization",
+        "accept",
+        "content-type",
+        "idempotency-key",
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "user-agent",
+    }
+)
+
+ExtraHeaders = Mapping[str, str] | Callable[[], Mapping[str, str]]
 
 
 class RemoteJobError(RemoteSandboxError):
@@ -180,6 +200,54 @@ def _header(value: str, name: str, maximum: int) -> str:
     return value
 
 
+def _extra_headers_error(message: str) -> RemoteJobError:
+    # Raised before any request is sent; messages never contain header values.
+    return RemoteJobError(message, code="extra_headers", op="extra_headers")
+
+
+def _extra_headers(value: object) -> dict[str, str]:
+    """Validate caller headers; errors never reflect caller input."""
+    if not isinstance(value, Mapping):
+        raise _extra_headers_error(
+            "extra_headers must be a mapping or a callable returning one"
+        )
+    if len(value) > _MAX_EXTRA_HEADERS:
+        raise _extra_headers_error(
+            f"extra_headers accepts at most {_MAX_EXTRA_HEADERS} headers"
+        )
+    headers: dict[str, str] = {}
+    seen: set[str] = set()
+    for name, item in value.items():
+        # An HTTP token; excludes CR, LF, spaces and separators.
+        if not isinstance(name, str) or not re.fullmatch(
+            rf"[!#$%&'*+.^_`|~0-9A-Za-z-]{{1,{_MAX_HEADER_NAME_CHARS}}}", name
+        ):
+            raise _extra_headers_error(
+                "extra_headers names must be HTTP tokens of 1 to"
+                f" {_MAX_HEADER_NAME_CHARS} characters"
+            )
+        folded = name.lower()
+        if folded in _PROTECTED_HEADERS:
+            raise _extra_headers_error(
+                f"extra_headers cannot set the client-owned header {folded!r}"
+            )
+        if folded in seen:
+            raise _extra_headers_error(
+                "extra_headers names must be unique ignoring case"
+            )
+        seen.add(folded)
+        if not isinstance(item, str) or not re.fullmatch(
+            rf"[\t\x20-\x7e]{{1,{_MAX_HEADER_VALUE_CHARS}}}", item
+        ):
+            raise _extra_headers_error(
+                "extra_headers values must be 1 to"
+                f" {_MAX_HEADER_VALUE_CHARS} printable ASCII characters"
+                " without line breaks"
+            )
+        headers[name] = item
+    return headers
+
+
 def _base_url(value: str) -> str:
     # Reject ambiguous encodings before urlsplit can strip control characters.
     if not isinstance(value, str) or not re.fullmatch(r"[\x21-\x7e]+", value):
@@ -220,6 +288,11 @@ class RemoteJobClient:
     must not contain credentials, query parameters, fragments or dot segments.
     Use HTTPS except for trusted local testing. Only the supplied bearer key is
     sent: no dashboard cookies, CSRF tokens, admin headers or ambient API keys.
+    ``extra_headers`` optionally adds caller-supplied headers, for a platform
+    that authenticates requests in front of the service. It is a mapping, or a
+    zero-argument callable returning one that is evaluated for every request so
+    a short-lived credential can be refreshed. It cannot set a header this
+    client owns; an invalid value raises RemoteJobError before anything is sent.
     Like RemoteSandboxClient, the timeout defaults to 60 seconds and urllib's
     environment proxy handling is used; set ``trust_env=False`` to disable it.
     Redirects are always rejected, including same-origin redirects, to avoid
@@ -234,6 +307,7 @@ class RemoteJobClient:
         *,
         timeout_secs: float = 60,
         trust_env: bool = True,
+        extra_headers: ExtraHeaders | None = None,
     ) -> None:
         self._base_url = _base_url(base_url)
         self._api_key = _header(api_key, "api_key", 4096)
@@ -246,6 +320,12 @@ class RemoteJobClient:
             raise ValueError("timeout_secs must be positive and finite")
         if type(trust_env) is not bool:
             raise ValueError("trust_env must be a boolean")
+        # A mapping is copied once; a callable is validated on every request.
+        self._extra_headers: (
+            dict[str, str] | Callable[[], Mapping[str, str]] | None
+        ) = extra_headers
+        if extra_headers is not None and not callable(extra_headers):
+            self._extra_headers = _extra_headers(extra_headers)
         self._timeout_secs = timeout_secs
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler(None if trust_env else {}),
@@ -311,6 +391,22 @@ class RemoteJobClient:
             "POST", f"/v1/jobs/{_identifier(job_id)}/cancel", RemoteJobStatus
         )
 
+    def _caller_headers(self) -> dict[str, str]:
+        extra = self._extra_headers
+        if extra is None:
+            return {}
+        if not callable(extra):
+            return dict(extra)
+        try:
+            produced = extra()
+        except Exception as exc:
+            # The message may hold a credential; report only the type.
+            raise _extra_headers_error(
+                "extra_headers callable raised "
+                f"{type(exc).__name__}; no request was sent"
+            ) from None
+        return _extra_headers(produced)
+
     def _request(
         self,
         method: str,
@@ -321,10 +417,13 @@ class RemoteJobClient:
         key: str | None = None,
         expected: int = 200,
     ) -> _ResponseT:
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Accept": "application/json",
-        }
+        headers = self._caller_headers()
+        headers.update(
+            {
+                "Authorization": f"Bearer {self._api_key}",
+                "Accept": "application/json",
+            }
+        )
         if body is not None:
             headers["Content-Type"] = "application/json"
         if key is not None:

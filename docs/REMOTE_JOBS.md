@@ -127,8 +127,8 @@ parse as before.
   ASCII letters/digits/underscore/hyphen identifiers, never paths or URLs.
 - Use HTTPS outside trusted local tests. The client sends only the explicit
   bearer key; no dashboard cookies, CSRF tokens, ambient API credentials, or
-  admin headers are supplied. Existing server bearer/cookie/CSRF precedence is
-  unchanged. Do not include keys in URLs or log client credentials.
+  admin headers are supplied, apart from any `extra_headers` you configure
+  (see below). Existing server bearer/cookie/CSRF precedence is unchanged. Do not include keys in URLs or log client credentials.
 - All redirects, including same-origin redirects, are rejected rather than
   forwarding credentials or implicitly replaying a POST. Configure the final
   service URL, including any reverse-proxy prefix.
@@ -146,6 +146,63 @@ parse as before.
   discarded. `retryable=True` on transport errors is not authorization to
   create a new submission operation. Log content is authorized workload output,
   not automatically redacted data; callers must handle it accordingly.
+
+## Calling a service behind a platform that authenticates requests
+
+Some deployments put the service behind a layer that authenticates every
+request before it reaches the application: an identity-aware proxy, a private
+container platform that requires a platform identity token, or a gateway that
+expects its own header. The API key still authenticates the caller to the
+service; `extra_headers` carries the additional credential for the layer in
+front of it.
+
+`extra_headers` is either a mapping, copied when the client is constructed, or
+a zero-argument callable returning a mapping. The callable is evaluated for
+every request, so it can return a fresh short-lived token each time. The client
+never retries, so a call you repeat yourself evaluates it again.
+
+```python
+import os
+
+from bespokelabs.sandbox import RemoteJobClient
+
+
+def platform_headers() -> dict[str, str]:
+    # Replace with your platform's way of obtaining an identity token for
+    # this service, cached until shortly before it expires.
+    token = fetch_platform_identity_token(audience="https://jobs.example.test")
+    return {"X-Platform-Identity-Token": token}
+
+
+client = RemoteJobClient(
+    "https://jobs.example.test",
+    os.environ["SANDBOX_API_KEY"],
+    extra_headers=platform_headers,
+)
+```
+
+Use the header name your platform documents. The client is synchronous, so the
+callable runs inline on each request; cache the token rather than fetching one
+every time.
+
+- A caller cannot set a header the client or its transport owns:
+  `Authorization` (the API key), `Idempotency-Key`, `Content-Type`, `Accept`,
+  `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, or `User-Agent`,
+  in any letter case. A platform that only accepts its credential in
+  `Authorization` cannot be used together with the API key through this client.
+- At most 32 headers. Names are HTTP tokens of at most 256 characters, unique
+  ignoring case. Values are 1 to 8192 printable ASCII characters (spaces and
+  tabs allowed) with no line breaks.
+- A violation raises `RemoteJobError` with `code="extra_headers"`: at
+  construction for a mapping, and on the call for a callable. Nothing is sent.
+  If the callable raises, the error names only the exception type, because the
+  message could contain a credential.
+- Header values never appear in errors or in the client's `repr`. They are
+  credentials: keep them out of your own logs too.
+- When a forward proxy from the environment tunnels an HTTPS request, the
+  transport hands a `Proxy-Authorization` header to that proxy instead of the
+  service. Set `trust_env=False` if the header is meant for the service's
+  platform.
 
 ## Service limitations remain unchanged
 

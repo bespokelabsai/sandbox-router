@@ -510,6 +510,275 @@ def test_real_redirects_never_forward_credentials_or_replay(cross_origin):
                 target_worker.join(5)
 
 
+def call_every_method(client, queued):
+    queued.extend(
+        [
+            (202, status()),
+            (200, status()),
+            (200, {"result": None}),
+            (200, {"logs": ""}),
+            (200, status(cancel_requested=True)),
+        ]
+    )
+    client.submit(JobSpec("true"), binding_id="batch", idempotency_key="key-1")
+    client.status("hjob_synthetic")
+    client.result("hjob_synthetic")
+    client.logs("hjob_synthetic")
+    client.cancel("hjob_synthetic")
+
+
+def test_absent_extra_headers_send_exactly_the_existing_headers(transport):
+    client, calls, queued = transport
+    call_every_method(client, queued)
+    assert [list(r.header_items()) for r, _ in calls] == [
+        [
+            ("Authorization", "Bearer test-key"),
+            ("Accept", "application/json"),
+            ("Content-type", "application/json"),
+            ("Idempotency-key", "key-1"),
+        ],
+        *[
+            [
+                ("Authorization", "Bearer test-key"),
+                ("Accept", "application/json"),
+            ]
+        ]
+        * 4,
+    ]
+
+
+def test_static_extra_headers_sent_on_every_method(transport):
+    _, calls, queued = transport
+    supplied = {"X-Platform-Token": "platform-secret", "x-trace": "a b"}
+    client = RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers=supplied
+    )
+    supplied["X-Later"] = "ignored"  # The mapping is copied at construction.
+    call_every_method(client, queued)
+    assert len(calls) == 5
+    for request, _ in calls:
+        assert request.get_header("X-platform-token") == "platform-secret"
+        assert request.get_header("X-trace") == "a b"
+        assert request.get_header("X-later") is None
+        assert request.get_header("Authorization") == "Bearer test-key"
+        assert request.get_header("Accept") == "application/json"
+    assert calls[0][0].get_header("Content-type") == "application/json"
+    assert calls[0][0].get_header("Idempotency-key") == "key-1"
+    assert "platform-secret" not in repr(client)
+
+
+def test_callable_extra_headers_evaluated_per_request_and_on_retry(transport):
+    _, calls, queued = transport
+    issued = []
+
+    def fresh():
+        issued.append(f"token-{len(issued) + 1}")
+        return {"X-Platform-Token": issued[-1]}
+
+    client = RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers=fresh
+    )
+    assert issued == []  # Not evaluated until a request is made.
+    call_every_method(client, queued)
+    # The client never retries; a caller's replay gets a fresh evaluation.
+    queued.extend([TimeoutError("synthetic"), (202, status())])
+    for _ in range(2):
+        try:
+            client.submit(
+                JobSpec("true"), binding_id="batch", idempotency_key="key-1"
+            )
+        except RemoteJobError as exc:
+            assert exc.retryable
+    assert [r.get_header("X-platform-token") for r, _ in calls] == [
+        f"token-{n}" for n in range(1, 8)
+    ]
+    assert issued[-1] not in repr(client)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Authorization",
+        "authorization",
+        "AUTHORIZATION",
+        "aUtHoRiZaTiOn",
+        "Idempotency-Key",
+        "idempotency-key",
+        "IDEMPOTENCY-KEY",
+        "Content-Type",
+        "content-type",
+        "Accept",
+        "ACCEPT",
+        "Host",
+        "content-length",
+        "Transfer-Encoding",
+        "connection",
+        "User-Agent",
+    ],
+)
+def test_extra_headers_cannot_override_client_owned_headers(transport, name):
+    _, calls, queued = transport
+    supplied = {"X-Ok": "fine", name: "override-secret"}
+    with pytest.raises(RemoteJobError) as caught:
+        RemoteJobClient(
+            "https://jobs.example.test", "test-key", extra_headers=supplied
+        )
+    assert name.lower() in str(caught.value)
+    assert "override-secret" not in "".join(
+        traceback.format_exception(caught.value)
+    )
+    client = RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers=lambda: supplied
+    )
+    with pytest.raises(RemoteJobError) as caught:
+        client.status("hjob_synthetic")
+    assert caught.value.code == "extra_headers" and not caught.value.retryable
+    assert "override-secret" not in "".join(
+        traceback.format_exception(caught.value)
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        {"X-Token": "secret-value\r\nX-Injected: 1"},
+        {"X-Token": "secret-value\n"},
+        {"X-Token": "secret-value\r"},
+        {"X-Token\r\nX-Injected": "secret-value"},
+        {"X-Token\n": "secret-value"},
+        {"X Token": "secret-value"},
+        {"X-Token:": "secret-value"},
+        {"": "secret-value"},
+        {"X-Token": ""},
+        {"X-Token": "secret-value\x00"},
+        {"X-Token": "secret-value\u00e9"},
+        {"X-Token": b"secret-value"},
+        {"X-Token": None},
+        {b"X-Token": "secret-value"},
+        {"X-Token": "secret-value", "x-token": "secret-value"},
+        {"N" * 257: "secret-value"},
+        {"X-Token": "secret-value" + "v" * 8192},
+        {f"X-Token-{n}": "secret-value" for n in range(33)},
+        [("X-Token", "secret-value")],
+        "X-Token: secret-value",
+        7,
+    ],
+)
+def test_invalid_extra_headers_rejected_without_reflection(transport, supplied):
+    _, calls, queued = transport
+    with pytest.raises(RemoteJobError) as caught:
+        RemoteJobClient(
+            "https://jobs.example.test", "test-key", extra_headers=supplied
+        )
+    static = "".join(traceback.format_exception(caught.value))
+    client = RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers=lambda: supplied
+    )
+    with pytest.raises(RemoteJobError) as caught:
+        client.cancel("hjob_synthetic")
+    assert isinstance(caught.value, RemoteSandboxError)
+    dynamic = "".join(traceback.format_exception(caught.value))
+    for text in (static, dynamic):
+        assert "secret-value" not in text and "X-Token" not in text
+    assert calls == []
+
+
+def test_extra_headers_bounds_are_inclusive(transport):
+    _, calls, queued = transport
+    client = RemoteJobClient(
+        "https://jobs.example.test",
+        "test-key",
+        extra_headers={
+            "N" * 256: "v" * 8192,
+            **{f"X-{n}": "\tv" for n in range(31)},
+        },
+    )
+    queued.append((200, status()))
+    client.status("hjob_synthetic")
+    assert calls[0][0].get_header("N" + "n" * 255) == "v" * 8192
+    assert RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers={}
+    )
+
+
+def test_extra_headers_callable_failure_is_sanitized_and_sends_nothing(
+    transport,
+):
+    _, calls, queued = transport
+
+    class TokenUnavailable(Exception):
+        pass
+
+    def failing():
+        raise TokenUnavailable("credential-secret")
+
+    client = RemoteJobClient(
+        "https://jobs.example.test", "test-key", extra_headers=failing
+    )
+    with pytest.raises(RemoteJobError) as caught:
+        client.submit(
+            JobSpec("true"), binding_id="batch", idempotency_key="key-1"
+        )
+    assert "TokenUnavailable" in str(caught.value)
+    assert caught.value.code == "extra_headers" and not caught.value.retryable
+    assert caught.value.__suppress_context__
+    assert "credential-secret" not in "".join(
+        traceback.format_exception(caught.value)
+    )
+    assert "credential-secret" not in repr(caught.value) + repr(client)
+    assert calls == []
+
+
+def test_extra_headers_reach_a_real_server_with_owned_headers_intact():
+    seen = []
+
+    class Platform(BaseHTTPRequestHandler):
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            seen.append(self.headers)
+            body = json.dumps(status()).encode()
+            self.send_response(202 if self.path == "/v1/jobs" else 200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST
+
+        def log_message(self, *args):
+            pass
+
+    tokens = iter(["token-1", "token-2"])
+    with ThreadingHTTPServer(("127.0.0.1", 0), Platform) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            client = RemoteJobClient(
+                f"http://127.0.0.1:{server.server_port}",
+                "synthetic-key",
+                trust_env=False,
+                extra_headers=lambda: {"X-Platform-Token": next(tokens)},
+            )
+            job = client.submit(
+                JobSpec("true"), binding_id="batch", idempotency_key="key-1"
+            )
+            client.status(job.id)
+        finally:
+            server.shutdown()
+            worker.join(5)
+    assert [h.get_all("X-Platform-Token") for h in seen] == [
+        ["token-1"],
+        ["token-2"],
+    ]
+    assert [h.get_all("Authorization") for h in seen] == [
+        ["Bearer synthetic-key"]
+    ] * 2
+    assert seen[0].get_all("Idempotency-Key") == ["key-1"]
+    assert seen[0].get_all("Content-Type") == ["application/json"]
+    assert seen[0].get_all("Host") == [f"127.0.0.1:{server.server_port}"]
+
+
 def test_cancel_timeout_is_unknown_not_completion(transport):
     client, calls, queued = transport
     queued.append(TimeoutError("synthetic-secret"))
