@@ -1058,8 +1058,10 @@ class SandboxClient:
     def list_sandboxes(self, labels: Mapping[str, str]) -> list[SandboxListing]:
         """List this backend's running sandboxes that carry all of *labels*.
 
-        Supported on ``daytona`` (resource labels) and ``modal`` (sandbox
-        tags); every other backend raises :class:`FeatureNotSupportedError`.
+        Supported on ``daytona`` (resource labels), ``modal`` (sandbox
+        tags) and ``tensorlake`` (which has no labels: the sandbox name is
+        the only key, ``{"name": ...}``); every other backend raises
+        :class:`FeatureNotSupportedError`.
         *labels* must name at least one non-empty label: an unfiltered
         listing is refused, so a caller can never act on sandboxes it did
         not mark.  Provider failures raise; a partial list is never
