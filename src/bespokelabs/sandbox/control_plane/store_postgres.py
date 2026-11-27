@@ -19,6 +19,8 @@ from .security import redact_payload
 from .store import _id, _normalize_expiration, _now, api_key_digest
 
 _JOURNAL = "authority_schema_migrations"
+# Arbitrary fixed key for the advisory lock that serializes organization seeding.
+_ORGANIZATION_LOCK = 0x6F72675F73656564
 
 _MIGRATIONS = (
     (
@@ -92,6 +94,36 @@ class PostgresAuthorityStore:
             "created_at": created_at,
         }
 
+    def ensure_organization(self, name: str) -> dict[str, str]:
+        """Return the oldest organization with this name, creating it if absent."""
+        name = name.strip()
+        if not name:
+            raise ValueError("organization name must not be empty")
+        with transaction(self._connections) as cursor:
+            # Names are not unique, so serialize concurrent callers explicitly.
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (_ORGANIZATION_LOCK,)
+            )
+            cursor.execute(
+                "SELECT id, name, created_at FROM organizations "
+                "WHERE name = %s ORDER BY created_at, id LIMIT 1",
+                (name,),
+            )
+            row = cursor.fetchone()
+            if row is not None:
+                return dict(row)
+            organization = {
+                "id": _id("org"),
+                "name": name,
+                "created_at": _now(),
+            }
+            cursor.execute(
+                "INSERT INTO organizations(id, name, created_at) "
+                "VALUES (%s, %s, %s)",
+                tuple(organization.values()),
+            )
+        return organization
+
     def issue_api_key(
         self,
         organization_id: str,
@@ -142,6 +174,30 @@ class PostgresAuthorityStore:
             secret=secret,
             created_at=created_at,
         )
+
+    def list_api_keys(self, organization_id: str) -> list[dict]:
+        """List key metadata for one organization; secrets are never stored."""
+        with transaction(self._connections) as cursor:
+            cursor.execute(
+                "SELECT id, name, key_prefix, scopes_json, created_at, "
+                "last_used_at, expires_at, revoked_at FROM api_keys "
+                "WHERE organization_id = %s ORDER BY created_at",
+                (organization_id,),
+            )
+            rows = cursor.fetchall()
+        return [
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "prefix": row["key_prefix"],
+                "scopes": json.loads(row["scopes_json"]),
+                "created_at": row["created_at"],
+                "last_used_at": row["last_used_at"],
+                "expires_at": row["expires_at"],
+                "revoked_at": row["revoked_at"],
+            }
+            for row in rows
+        ]
 
     def authenticate(self, secret: str) -> Principal:
         if not secret.startswith("bsk_live_"):

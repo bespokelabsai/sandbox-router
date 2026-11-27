@@ -7,6 +7,9 @@ routes, import no job plugin or provider SDK, and activate no providers. The
 existing direct `SandboxJobBackend` API is unchanged: `submit_job(spec)` still
 returns `str`, and `JobSpec` defaults retain their existing meanings.
 
+To run these routes on their own as a stateless service with several instances,
+see [Deploying the jobs-only service](JOBS_SERVICE_DEPLOYMENT.md).
+
 For the opt-in, provider-free `RemoteJobClient` over these existing HTTP routes,
 see [Remote hosted-job SDK](REMOTE_JOBS.md). It leaves native job methods and
 existing remote sandbox clients unchanged and does not deploy or activate a host.
@@ -149,11 +152,19 @@ sandbox, dashboard-session, attachment, or billing tables, so it cannot back
 the full sandbox control plane or `create_app`. The audit `session_id` column
 is a plain nullable value, not a reference.
 
-`HostedJobService` accepts any `JobRepository`. For HTTP, pass the repository
-to `install_job_routes(app, None, configuration, authenticate,
-repository=repository)` with an `authenticate` callable built on the authority
-store. The repository's HMAC function must be
+`HostedJobService` accepts any `JobRepository`. For HTTP, use
+`create_job_app(authority=..., repository=..., configuration=...)` from
+`job_app.py`, which serves only the job routes and health endpoints on either
+pair of stores; see
+[Deploying the jobs-only service](JOBS_SERVICE_DEPLOYMENT.md). It is built on
+`install_job_routes(app, None, configuration, authenticate,
+repository=repository)`, which you can also call directly with your own
+`authenticate` callable. The repository's HMAC function must be
 `hosted_job_hmac(configuration.hmac_secret)`.
+
+Both authority stores also provide `ensure_organization` and `list_api_keys`
+(the `SeedableAuthorityStore` protocol), which the operator seeding helper in
+`job_seed.py` uses in place of an HTTP administration route.
 
 Migrations run when each store is constructed. Each store records applied
 versions in its own journal (`authority_schema_migrations` and
@@ -494,6 +505,13 @@ concurrent reservation, lease-claim, cancel-versus-update, and simultaneous
 migration cases over separate connections. Its database cases are skipped unless
 `SANDBOX_TEST_POSTGRES_DSN` names a disposable database; each test uses and
 drops its own schema. CI runs them against a PostgreSQL service container.
+
+`tests/test_job_app.py` drives the jobs-only app over HTTP on SQLite stores with
+the same native fakes: authentication, per-route scopes, tenant isolation, audit
+rows, request limits, both health endpoints, the absence of dashboard and
+administration routes, and operator seeding. `tests/test_job_app_postgres.py`
+reruns those cases on PostgreSQL under the same environment variable and adds
+several app instances on one database, each with its own connections.
 
 `tests/test_hosted_jobs_gcp_batch.py` additionally exercises real public client
 translation and actual Batch status detail extraction with class-spec autospec

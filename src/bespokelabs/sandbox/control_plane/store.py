@@ -579,6 +579,32 @@ class SQLiteStore:
             "created_at": created_at,
         }
 
+    def ensure_organization(self, name: str) -> dict[str, str]:
+        """Return the oldest organization with this name, creating it if absent."""
+        name = name.strip()
+        if not name:
+            raise ValueError("organization name must not be empty")
+        with self._connect() as connection:
+            # Take the write lock first so two callers cannot both insert.
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT id, name, created_at FROM organizations "
+                "WHERE name = ? ORDER BY created_at, id LIMIT 1",
+                (name,),
+            ).fetchone()
+            if row is not None:
+                return dict(row)
+            organization = {
+                "id": _id("org"),
+                "name": name,
+                "created_at": _now(),
+            }
+            connection.execute(
+                "INSERT INTO organizations(id, name, created_at) VALUES (?, ?, ?)",
+                tuple(organization.values()),
+            )
+        return organization
+
     def issue_api_key(
         self,
         organization_id: str,

@@ -28,13 +28,14 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from bespokelabs.sandbox.control_plane.errors import (
-    AuthenticationError,
-    AuthorizationError,
-    ConflictError,
-    NotFoundError,
-    PolicyDeniedError,
-    provider_error_payload,
+from bespokelabs.sandbox.control_plane.errors import AuthenticationError
+from bespokelabs.sandbox.control_plane.http_support import (
+    add_security_headers,
+    audit_outcome,
+    bearer,
+    install_exception_handlers,
+    job_route_action,
+    path_job_mutation_action,
 )
 from bespokelabs.sandbox.control_plane.models import Principal, SandboxRecord
 from bespokelabs.sandbox.control_plane.security import (
@@ -42,11 +43,7 @@ from bespokelabs.sandbox.control_plane.security import (
     encode_cursor,
 )
 from bespokelabs.sandbox.control_plane.service import ControlPlane
-from bespokelabs.sandbox.exceptions import (
-    ErrorCode,
-    SandboxConfigurationError,
-    SandboxError,
-)
+from bespokelabs.sandbox.exceptions import SandboxConfigurationError
 from bespokelabs.sandbox.types import NetworkPolicy
 
 if TYPE_CHECKING:
@@ -181,12 +178,6 @@ def _sandbox_response(record: SandboxRecord) -> dict[str, Any]:
     return result
 
 
-def _bearer(authorization: str | None) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise AuthenticationError("Bearer API key required")
-    return authorization.removeprefix("Bearer ").strip()
-
-
 def _if_match_version(value: str | None) -> int | None:
     if value is None:
         return None
@@ -249,55 +240,21 @@ def create_app(
     )
     request_auth: ContextVar[dict] = ContextVar("request_auth")
 
-    def add_security_headers(response: Response) -> Response:
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; connect-src 'self'; font-src 'self'; "
-            "base-uri 'none'; form-action 'self'; frame-ancestors 'none'; "
-            "object-src 'none'"
-        )
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=()"
-        )
-        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Strict-Transport-Security"] = (
-            "max-age=63072000; includeSubDomains"
-        )
-        if response.headers.get("content-type", "").startswith("text/html"):
-            response.headers["Cache-Control"] = "no-store"
-        return response
-
     def job_mutation_action(request: Request) -> str | None:
         # CSRF is checked before routing, so route metadata is not available yet.
-        if hosted_job_configuration is None or request.method != "POST":
+        if hosted_job_configuration is None:
             return None
-        if request.url.path == "/v1/jobs":
-            return "job.submit"
-        parts = request.url.path.split("/")
-        if (
-            len(parts) == 5
-            and parts[1:3] == ["v1", "jobs"]
-            and parts[3]
-            and parts[4] == "cancel"
-        ):
-            return "job.cancel"
-        return None
+        return path_job_mutation_action(request)
 
     def audit_action(request: Request) -> str:
         mutation = job_mutation_action(request)
         if mutation is not None:
             return mutation
+        if request.url.path.startswith("/v1/jobs"):
+            return job_route_action(request)
         route = request.scope.get("route")
         template = getattr(route, "path", request.url.path)
         names = {
-            ("POST", "/v1/jobs"): "job.submit",
-            ("GET", "/v1/jobs/{job_id}"): "job.read",
-            ("GET", "/v1/jobs/{job_id}/result"): "job.result",
-            ("GET", "/v1/jobs/{job_id}/logs"): "job.logs",
-            ("POST", "/v1/jobs/{job_id}/cancel"): "job.cancel",
             ("POST", "/v1/sandboxes"): "sandbox.create",
             ("DELETE", "/v1/sandboxes/{sandbox_id}"): "sandbox.terminate",
             ("POST", "/v1/sandboxes/{sandbox_id}/execute"): "sandbox.execute",
@@ -318,8 +275,6 @@ def create_app(
             ("PUT", "/v1/retention/current"): "retention.configure",
             ("POST", "/v1/retention/apply"): "retention.apply",
         }
-        if request.url.path.startswith("/v1/jobs"):
-            return names.get((request.method, template), "job.request")
         return names.get(
             (request.method, template), f"{request.method.lower()} {template}"
         )
@@ -398,13 +353,7 @@ def create_app(
                 control_plane.record_audit(
                     principal,
                     action=audit_action(request),
-                    outcome=(
-                        "success"
-                        if response.status_code < 400
-                        else "denied"
-                        if response.status_code < 500
-                        else "failure"
-                    ),
+                    outcome=audit_outcome(response.status_code),
                     session_id=state.get("session_id"),
                     resource_type="http_route",
                     resource_id=(
@@ -418,61 +367,12 @@ def create_app(
         finally:
             request_auth.reset(context_token)
 
-    @app.exception_handler(AuthenticationError)
-    async def authentication_error(
-        _: Request, exc: AuthenticationError
-    ) -> JSONResponse:
-        return JSONResponse(status_code=401, content={"detail": str(exc)})
-
-    @app.exception_handler(AuthorizationError)
-    async def authorization_error(
-        _: Request, exc: AuthorizationError
-    ) -> JSONResponse:
-        return JSONResponse(status_code=403, content={"detail": str(exc)})
-
-    @app.exception_handler(NotFoundError)
-    async def not_found_error(_: Request, exc: NotFoundError) -> JSONResponse:
-        return JSONResponse(status_code=404, content={"detail": str(exc)})
-
-    @app.exception_handler(ConflictError)
-    async def conflict_error(_: Request, exc: ConflictError) -> JSONResponse:
-        return JSONResponse(status_code=409, content={"detail": str(exc)})
-
-    @app.exception_handler(PolicyDeniedError)
-    async def policy_denied_error(
-        _: Request, exc: PolicyDeniedError
-    ) -> JSONResponse:
-        return JSONResponse(status_code=403, content={"detail": exc.payload()})
-
-    @app.exception_handler(ValueError)
-    async def invalid_request(_: Request, exc: ValueError) -> JSONResponse:
-        return JSONResponse(status_code=422, content={"detail": str(exc)})
-
-    @app.exception_handler(SandboxError)
-    async def provider_error(_: Request, exc: SandboxError) -> JSONResponse:
-        status_code = 504 if exc.code is ErrorCode.TIMEOUT else 502
-        if exc.code in {
-            ErrorCode.BACKEND_NOT_INSTALLED,
-            ErrorCode.CONFIGURATION,
-            ErrorCode.FEATURE_NOT_SUPPORTED,
-        }:
-            status_code = 422
-        return JSONResponse(
-            status_code=status_code,
-            content={"detail": provider_error_payload(exc)},
-        )
-
-    @app.exception_handler(Exception)
-    async def unexpected_error(_: Request, __: Exception) -> JSONResponse:
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Internal control-plane error."},
-        )
+    install_exception_handlers(app)
 
     def current_principal(authorization: str | None) -> Principal:
         state = request_auth.get({})
         if authorization:
-            principal = control_plane.store.authenticate(_bearer(authorization))
+            principal = control_plane.store.authenticate(bearer(authorization))
             state["principal"] = principal
             return principal
         principal = state.get("principal")
