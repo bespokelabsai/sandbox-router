@@ -365,6 +365,300 @@ class BuildJobTests(GcpBatchTestCase):
                 with self.assertRaises(error):
                     self.backend.build_job(spec)
 
+    def test_absent_new_options_leave_the_job_unchanged(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(command="x", image="i", labels={"team": "a"})
+        )
+        task = job.task_groups[0].task_spec
+        self.assertEqual(task.runnables[0].container.image_uri, "i")
+        self.assertFalse(task.runnables[0].script.text)
+        self.assertNotIn("environment", task)
+        instances = job.allocation_policy.instances[0]
+        self.assertFalse(instances.install_gpu_drivers)
+        self.assertFalse(instances.block_project_ssh_keys)
+        self.assertNotIn("boot_disk", instances.policy)
+        self.assertEqual(dict(job.allocation_policy.labels), {"team": "a"})
+        self.assertEqual(dict(job.labels), {"team": "a"})
+
+    def test_secret_env_vars_reference_secret_manager(self) -> None:
+        version = "projects/example-project/secrets/api-key/versions/latest"
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                env_vars={"MODE": "fast"},
+                backend_options={"secret_env_vars": {"API_KEY": version}},
+            )
+        )
+        environment = job.task_groups[0].task_spec.environment
+        self.assertEqual(dict(environment.variables), {"MODE": "fast"})
+        self.assertEqual(
+            dict(environment.secret_variables), {"API_KEY": version}
+        )
+        only = (
+            self.backend.build_job(
+                JobSpec(
+                    command="x",
+                    image="i",
+                    backend_options={
+                        "secret_env_vars": {
+                            "API_KEY": "projects/123/secrets/api-key/versions/7"
+                        }
+                    },
+                )
+            )
+            .task_groups[0]
+            .task_spec.environment
+        )
+        self.assertEqual(dict(only.variables), {})
+        self.assertEqual(
+            dict(only.secret_variables),
+            {"API_KEY": "projects/123/secrets/api-key/versions/7"},
+        )
+
+    def test_secret_env_var_rejections_do_not_echo_the_reference(self) -> None:
+        version = "projects/example-project/secrets/api-key/versions/1"
+        cases = [
+            ({"secret_env_vars": ["API_KEY"]}, {}),
+            ({"secret_env_vars": {"1BAD": version}}, {}),
+            ({"secret_env_vars": {"API_KEY": version}}, {"API_KEY": "x"}),
+            ({"secret_env_vars": {"API_KEY": 7}}, {}),
+            ({"secret_env_vars": {"API_KEY": "pasted-secret-value"}}, {}),
+            (
+                {
+                    "secret_env_vars": {
+                        "API_KEY": "projects/example-project/secrets/api-key"
+                    }
+                },
+                {},
+            ),
+            (
+                {
+                    "secret_env_vars": {
+                        "API_KEY": "projects/p/locations/l/secrets/s/versions/1"
+                    }
+                },
+                {},
+            ),
+            ({"secret_env_vars": {"API_KEY": version + "/extra"}}, {}),
+        ]
+        for options, env_vars in cases:
+            with self.subTest(options=options):
+                with self.assertRaises(SandboxConfigurationError) as ctx:
+                    self.backend.build_job(
+                        JobSpec(
+                            command="x",
+                            image="i",
+                            env_vars=env_vars,
+                            backend_options=options,
+                        )
+                    )
+                self.assertNotIn("pasted-secret-value", str(ctx.exception))
+
+    def test_script_runs_the_command_on_the_vm(self) -> None:
+        text = "#!/bin/bash\nset -euo pipefail\necho hello\n"
+        job = self.backend.build_job(
+            JobSpec(
+                command=text,
+                env_vars={"MODE": "fast"},
+                backend_options={"runnable": "script"},
+            )
+        )
+        task = job.task_groups[0].task_spec
+        self.assertEqual(len(task.runnables), 1)
+        self.assertEqual(task.runnables[0].script.text, text)
+        self.assertNotIn("container", task.runnables[0])
+        self.assertEqual(dict(task.environment.variables), {"MODE": "fast"})
+        explicit = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"runnable": "container"},
+            )
+        )
+        runnable = explicit.task_groups[0].task_spec.runnables[0]
+        self.assertEqual(runnable.container.image_uri, "i")
+
+    def test_script_rejections(self) -> None:
+        script = {"runnable": "script"}
+        cases = [
+            JobSpec(command="x", image="i", backend_options=script),
+            JobSpec(command=["echo", "x"], backend_options=script),
+            JobSpec(command="x", workdir="/work", backend_options=script),
+            JobSpec(
+                command="x",
+                backend_options={**script, "container_options": "--init"},
+            ),
+            JobSpec(command="x", allow_internet=False, backend_options=script),
+            JobSpec(command="x", image="i", backend_options={"runnable": "vm"}),
+            JobSpec(command="x", backend_options={"runnable": "container"}),
+        ]
+        for spec in cases:
+            with self.subTest(spec=spec):
+                with self.assertRaises(SandboxConfigurationError):
+                    self.backend.build_job(spec)
+
+    def test_boot_disk_image_and_type(self) -> None:
+        image = "projects/example-project/global/images/worker-image"
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                disk_mb=200 * 1024,
+                backend_options={
+                    "boot_disk_image": image,
+                    "boot_disk_type": "pd-balanced",
+                },
+            )
+        )
+        disk = job.allocation_policy.instances[0].policy.boot_disk
+        self.assertEqual(
+            (disk.size_gb, disk.image, disk.type_),
+            (200, image, "pd-balanced"),
+        )
+        unsized = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"boot_disk_type": "pd-ssd"},
+            )
+        )
+        disk = unsized.allocation_policy.instances[0].policy.boot_disk
+        self.assertEqual(
+            (disk.size_gb, disk.image, disk.type_), (0, "", "pd-ssd")
+        )
+        for key in ("boot_disk_image", "boot_disk_type"):
+            for value in ("", 7, "pd balanced", "x" * 1025):
+                with self.subTest(key=key, value=value):
+                    with self.assertRaises(SandboxConfigurationError):
+                        self.backend.build_job(
+                            JobSpec(
+                                command="x",
+                                image="i",
+                                backend_options={key: value},
+                            )
+                        )
+
+    def test_gpu_drivers_for_an_explicit_gpu_machine_type(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={
+                    "machine_type": "g2-standard-8",
+                    "install_gpu_drivers": True,
+                },
+            )
+        )
+        instances = job.allocation_policy.instances[0]
+        self.assertTrue(instances.install_gpu_drivers)
+        self.assertEqual(instances.policy.machine_type, "g2-standard-8")
+        self.assertEqual(list(instances.policy.accelerators), [])
+        # Without the option an explicit machine type installs nothing.
+        plain = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"machine_type": "g2-standard-8"},
+            )
+        )
+        self.assertFalse(
+            plain.allocation_policy.instances[0].install_gpu_drivers
+        )
+        # An image that ships its own drivers can turn the install off.
+        preinstalled = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                gpu="L4",
+                backend_options={"install_gpu_drivers": False},
+            )
+        )
+        self.assertFalse(
+            preinstalled.allocation_policy.instances[0].install_gpu_drivers
+        )
+        for options in (
+            {"install_gpu_drivers": True},
+            {"install_gpu_drivers": True, "machine_type": "n2-standard-8"},
+            {"install_gpu_drivers": "yes", "machine_type": "g2-standard-8"},
+            {"install_gpu_drivers": 1, "machine_type": "g2-standard-8"},
+        ):
+            with self.subTest(options=options):
+                with self.assertRaises(SandboxConfigurationError):
+                    self.backend.build_job(
+                        JobSpec(command="x", image="i", backend_options=options)
+                    )
+
+    def test_block_project_ssh_keys(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"block_project_ssh_keys": True},
+            )
+        )
+        self.assertTrue(
+            job.allocation_policy.instances[0].block_project_ssh_keys
+        )
+        off = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"block_project_ssh_keys": False},
+            )
+        )
+        self.assertFalse(
+            off.allocation_policy.instances[0].block_project_ssh_keys
+        )
+        with self.assertRaises(SandboxConfigurationError):
+            self.backend.build_job(
+                JobSpec(
+                    command="x",
+                    image="i",
+                    backend_options={"block_project_ssh_keys": "true"},
+                )
+            )
+
+    def test_instance_labels_go_on_the_vms_only(self) -> None:
+        job = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                labels={"team": "a"},
+                backend_options={"instance_labels": {"Pool": "GPU Workers"}},
+            )
+        )
+        self.assertEqual(dict(job.labels), {"team": "a"})
+        self.assertEqual(
+            dict(job.allocation_policy.labels),
+            {"team": "a", "pool": "gpu_workers"},
+        )
+        only = self.backend.build_job(
+            JobSpec(
+                command="x",
+                image="i",
+                backend_options={"instance_labels": {"pool": "gpu"}},
+            )
+        )
+        self.assertEqual(dict(only.labels), {})
+        self.assertEqual(dict(only.allocation_policy.labels), {"pool": "gpu"})
+        for labels, extra in (
+            ({"team": "a"}, {"Team": "b"}),
+            ({}, {"Pool": "a", "pool": "b"}),
+            ({}, {"pool": 1}),
+            ({}, ["pool"]),
+        ):
+            with self.subTest(extra=extra):
+                with self.assertRaises(SandboxConfigurationError):
+                    self.backend.build_job(
+                        JobSpec(
+                            command="x",
+                            image="i",
+                            labels=labels,
+                            backend_options={"instance_labels": extra},
+                        )
+                    )
+
     def test_interactive_sandboxes_are_not_supported(self) -> None:
         with self.assertRaises(FeatureNotSupportedError):
             Sandbox("gcp_batch")

@@ -91,6 +91,65 @@ def test_real_public_client_receives_reserved_name_and_reports_actual_ownership(
     rpc.create_job.assert_called_once()
 
 
+def test_real_batch_request_carries_the_new_options(sdk_harness):
+    h, rpc, _ = sdk_harness
+    secret = "projects/example-project/secrets/api-key/versions/latest"
+    image = "projects/example-project/global/images/worker"
+    h.spec = replace(
+        h.spec,
+        command="#!/bin/bash\necho hello\n",
+        image=None,
+        env_vars={"MODE": "fast"},
+        disk_mb=100 * 1024,
+        labels={"team": "evals"},
+        backend_options={
+            "runnable": "script",
+            "secret_env_vars": {"API_KEY": secret},
+            "boot_disk_image": image,
+            "boot_disk_type": "pd-balanced",
+            "machine_type": "g2-standard-8",
+            "install_gpu_drivers": True,
+            "instance_labels": {"pool": "gpu"},
+        },
+    )
+    record = h.submit()
+    assert record.phase is JobPhase.ACTIVE
+    request = rpc.create_job.call_args.kwargs["request"]
+    # Routing is still the binding's, whatever the options carry.
+    assert request.parent == (
+        f"projects/{h.binding.project}/locations/{h.binding.region}"
+    )
+    task = request.job.task_groups[0].task_spec
+    assert task.runnables[0].script.text == h.spec.command
+    assert "container" not in task.runnables[0]
+    assert dict(task.environment.variables) == {"MODE": "fast"}
+    assert dict(task.environment.secret_variables) == {"API_KEY": secret}
+    instances = request.job.allocation_policy.instances[0]
+    assert instances.install_gpu_drivers is True
+    assert instances.policy.machine_type == "g2-standard-8"
+    disk = instances.policy.boot_disk
+    assert (disk.size_gb, disk.image, disk.type_) == (100, image, "pd-balanced")
+    marker = {OWNERSHIP_LABEL: record.ownership_marker}
+    assert dict(request.job.labels) == {"team": "evals", **marker}
+    assert dict(request.job.allocation_policy.labels) == {
+        "team": "evals",
+        "pool": "gpu",
+        **marker,
+    }
+
+
+def test_real_batch_request_blocks_project_ssh_keys(sdk_harness):
+    policy = batch.AllocationPolicy.InstancePolicyOrTemplate
+    if "block_project_ssh_keys" not in policy.meta.fields:
+        pytest.skip("this google-cloud-batch has no block_project_ssh_keys")
+    h, rpc, _ = sdk_harness
+    h.spec = replace(h.spec, backend_options={"block_project_ssh_keys": True})
+    assert h.submit().phase is JobPhase.ACTIVE
+    request = rpc.create_job.call_args.kwargs["request"]
+    instances = request.job.allocation_policy.instances[0]
+    assert instances.block_project_ssh_keys is True
+
+
 @pytest.mark.parametrize("change", ["uid", "owner"])
 def test_real_status_details_not_request_labels_gate_cancel(
     sdk_harness, change

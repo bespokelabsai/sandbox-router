@@ -725,7 +725,7 @@ seen, failed reads are retried with backoff (capped at 60s) until the deadline. 
 authentication and not-installed errors raise at once.
 
 **How a Batch job runs.** `SandboxClient("gcp_batch")` runs each job as a Batch
-job with one container task; interactive `Sandbox("gcp_batch")` raises
+job with one task, a container by default; interactive `Sandbox("gcp_batch")` raises
 `FeatureNotSupportedError`. The job id is the job's resource name,
 `projects/<project>/locations/<region>/jobs/<id>`. `image` is any container
 URI the VMs can pull (e.g. Artifact Registry); `cpu` / `memory_mb` become the
@@ -761,6 +761,56 @@ the task's exit, or the job-level cause when no task exited); the key is
 absent when Batch has given none, so read it with `details.get("message")`. Files reach the job through the
 image or Cloud Storage. Credentials are Application Default Credentials.
 
+**Secrets, scripts and VM settings.** These are `backend_options` too:
+
+```python
+client.submit_job(JobSpec(
+    command="#!/bin/bash\nset -euo pipefail\n/opt/worker/run.sh\n",
+    env_vars={"MODE": "fast"},
+    disk_mb=200 * 1024,
+    labels={"team": "evals"},                       # job and VMs
+    backend_options={
+        "runnable": "script",                       # no image: runs on the VM
+        "secret_env_vars": {
+            "API_KEY": "projects/example-project/secrets/api-key/versions/latest",
+        },
+        "boot_disk_image": "projects/example-project/global/images/worker-image",
+        "boot_disk_type": "pd-balanced",
+        "machine_type": "g2-standard-8",
+        "install_gpu_drivers": True,
+        "block_project_ssh_keys": True,
+        "instance_labels": {"pool": "gpu"},         # VMs only
+        "service_account": "worker@example-project.iam.gserviceaccount.com",
+    },
+))
+```
+
+- `secret_env_vars` maps a variable name to a Secret Manager secret version,
+  `projects/<project>/secrets/<name>/versions/<version>` (a number, `latest`
+  or an alias). The job spec carries the reference and Batch reads the value
+  on the VM, so the value is never in the job, this SDK's errors, or
+  `JobStatus`. The VMs' service account needs
+  `roles/secretmanager.secretAccessor` on the secret. A name may not also be
+  in `env_vars`, and a malformed reference is rejected without being echoed.
+- `runnable="script"` runs `command` (a string, the script text) as a Batch
+  script runnable on the VM itself instead of in a container. Start it with a
+  shebang such as `#!/bin/bash`; without one Batch uses `/bin/sh`. A job has
+  exactly one of an `image` or `runnable="script"`: a script job with an
+  `image`, an argv-list `command`, `workdir`, `container_options` or
+  `allow_internet=False` (a container-only network block) is rejected. The
+  script runs with the VM's service account and outside any container.
+- `boot_disk_image` and `boot_disk_type` set the boot disk's image (a Batch
+  image name such as `batch-debian`, or
+  `projects/<project>/global/images/<image>`) and type (`pd-standard`,
+  `pd-balanced`, `pd-ssd`, ...); `disk_mb` stays its size, and either works
+  without it.
+- `install_gpu_drivers` defaults to whether `gpu` is set. `True` without `gpu`
+  needs an accelerator-optimized `machine_type` (A2, A3, A4, G2 or G4), whose
+  VMs carry their GPUs; `False` with `gpu` skips the install for an image that
+  ships its own drivers.
+- `instance_labels` are added to the VMs only. `labels` still go on both the
+  job and the VMs, so a key in both sets (after coercion) is rejected.
+
 | `backend_options` key | Meaning |
 |---|---|
 | `project`, `region` | Where to submit (else `GOOGLE_CLOUD_PROJECT`, and `GOOGLE_CLOUD_REGION` or `CLOUDSDK_COMPUTE_REGION`) |
@@ -770,6 +820,12 @@ image or Cloud Storage. Credentials are Application Default Credentials.
 | `network`, `subnetwork` | VPC network and subnetwork for the VMs (`projects/<p>/global/networks/<n>`, `projects/<p>/regions/<r>/subnetworks/<s>`) |
 | `no_external_ip` | `True` gives the VMs no external IP; the subnet then needs Private Google Access (Artifact Registry, GCS) or Cloud NAT |
 | `machine_type` | Overrides the chosen machine type |
+| `runnable` | `container` (default) or `script`: run `command` as a script on the VM, with no `image` |
+| `secret_env_vars` | `{"NAME": "projects/<project>/secrets/<name>/versions/<version>"}`: environment variables Batch reads from Secret Manager |
+| `boot_disk_image`, `boot_disk_type` | Boot disk image and type, e.g. a custom VM image and `pd-balanced` |
+| `install_gpu_drivers` | Whether Batch installs GPU drivers (default: whether `gpu` is set); `True` without `gpu` needs an accelerator-optimized `machine_type` |
+| `block_project_ssh_keys` | `True` keeps project-wide SSH keys off the VMs |
+| `instance_labels` | Labels for the VMs only, on top of `labels` |
 | `provisioning_model` | `STANDARD`, `SPOT`, `PREEMPTIBLE` or `FLEX_START` |
 | `allowed_locations` | e.g. `["zones/us-central1-a"]` |
 | `max_retry_count` | Task retries (default 0) |
