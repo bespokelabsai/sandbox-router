@@ -293,9 +293,10 @@ class PlanGuardTest(unittest.TestCase):
         plan = _plan([_candidate(labels_complete=False)], is_owned=owned)
         self.assertEqual(calls, [])
         self.assertIs(_reasons(plan)["r1"], ReapReason.OWNERSHIP_UNKNOWN)
-        # The provider matched the required labels, so they alone still prove it.
+        # Labels that were not read back in full prove nothing on their own.
         plan = _plan([_candidate(labels_complete=False)])
-        self.assertEqual(_delete_ids(plan), ["r1"])
+        self.assertEqual(_delete_ids(plan), [])
+        self.assertIs(_reasons(plan)["r1"], ReapReason.OWNERSHIP_UNKNOWN)
 
     def test_state_is_not_checked_unless_asked(self) -> None:
         plan = _plan(
@@ -431,13 +432,12 @@ class PlanGuardTest(unittest.TestCase):
             state="stopped",
             created_at=NOW - timedelta(days=1),
             session_state=SandboxSessionState(backend="x", data={}),
-            labels_complete=False,
         )
         candidate = ReapCandidate.from_listing(listing)
         self.assertEqual(candidate.resource_id, "sb-1")
         self.assertEqual(candidate.labels, OWNER)
         self.assertEqual(candidate.state, "stopped")
-        self.assertFalse(candidate.labels_complete)
+        self.assertTrue(candidate.labels_complete)
         plan = plan_reap(
             [listing], _unused("sb-1"), now=NOW, required_labels=OWNER
         )

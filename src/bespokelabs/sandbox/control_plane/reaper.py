@@ -83,7 +83,7 @@ class ReapCandidate:
 
     ``created_at`` must be timezone-aware to count as a known age.
     ``labels_complete`` is ``False`` when the listing could not read every
-    label back; an ownership predicate is then not trusted with the resource.
+    label back; the resource's ownership is then unknown and it is kept.
     """
 
     resource_id: str
@@ -549,12 +549,13 @@ def _ownership_reason(
         return ReapReason.OWNERSHIP_UNKNOWN
     if any(labels.get(key) != value for key, value in wanted.items()):
         return ReapReason.NOT_OWNED
-    if is_owned is None:
-        return None
-    # A predicate may reason from the absence of a label, which a partial
-    # label set cannot show.
+    # A partial label set is not proof of ownership: a predicate may reason
+    # from the absence of a label, and a required label echoed from the query
+    # was not read back from the resource.
     if candidate.labels_complete is not True:
         return ReapReason.OWNERSHIP_UNKNOWN
+    if is_owned is None:
+        return None
     try:
         verdict = is_owned(candidate)
     except Exception:

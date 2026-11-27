@@ -81,7 +81,7 @@ Guards run in this order; the first one that fails gives the reason.
 | Duplicates | the id is listed more than once | `duplicate_listing` | always on |
 | Protected ids | the id is in `protected_ids` | `protected` | none protected |
 | Ownership | a required label is missing or different, or `is_owned` does not return `True` | `not_owned` | one of `required_labels` / `is_owned` is required |
-| Ownership | `is_owned` raises, the labels are unreadable, or `is_owned` is used on a listing with `labels_complete=False` | `ownership_unknown` | always on |
+| Ownership | `is_owned` raises, the labels are unreadable, or the listing has `labels_complete=False` | `ownership_unknown` | always on |
 | State | `deletable_states` is given and the state is missing | `state_unknown` | no state check |
 | State | `deletable_states` is given and the state is not in it | `state_not_deletable` | no state check |
 | Age | `created_at` is missing or has no timezone | `age_unknown` | always on |
