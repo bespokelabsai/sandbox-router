@@ -567,6 +567,47 @@ in, until it is started); Modal lists running ones only. On a Modal SDK that
 cannot read tags back, `labels` is only the matched filter and
 `labels_complete` is `False`. Other backends raise `FeatureNotSupportedError`.
 
+Tensorlake sandboxes have no labels or tags, and its SDK lists a whole project
+without a filter. The one caller-chosen value a sandbox carries is its name, so
+Tensorlake accepts exactly one label key, `name`, and matches it against the
+name the sandbox was created with:
+
+```python
+client = SandboxClient("tensorlake")
+sb = client.create(backend_options={"name": "run-42"})
+...
+for found in client.list_sandboxes({"name": "run-42"}):
+    client.resume(found.session_state).destroy()
+```
+
+Any other key raises `FeatureNotSupportedError` instead of matching nothing.
+The project listing is filtered client-side; pending, running, and suspended
+sandboxes are returned with their `state`, and ended ones are left out. A
+sandbox created without a name cannot be found this way.
+
+### Tensorlake retries and failed creates
+
+The Tensorlake backend retries calls that are safe to repeat (listing,
+reattaching with `resume()`, and deleting a sandbox left by a failed create) on
+connection errors and HTTP 408, 429, 500, 502, 503, and 504: four attempts in
+all, with a delay that doubles from 0.5 seconds. Commands, file operations,
+and snapshots are never retried.
+
+`create` is sent once. When it fails, `SandboxCreationError.outcome` says what
+is known:
+
+| Failure | `outcome` | `retryable` |
+|---|---|---|
+| Request refused (4xx other than 408, such as a 429 rate or quota limit, or a 409 for a name already in use) | `failed` | `True` for 429, else `False` |
+| Sandbox was created but never started, or was still queued when the wait ran out; the backend deleted it | `failed` | `False` |
+| Same, but the delete failed (`context["provider_resource_id"]` has the id) | `unknown` | `False` |
+| Connection error, timeout, HTTP 408, or 5xx | `unknown` | `False` |
+
+An `unknown` outcome means a sandbox may exist, so do not send the same create
+again blindly. If the create had a `name`, look it up with
+`list_sandboxes({"name": ...})` first; Tensorlake also refuses a second create
+with a name that is in use (HTTP 409).
+
 ### Detached jobs (Google Cloud Batch)
 
 A job runs one command to completion without the submitting process staying

@@ -3,23 +3,135 @@
 from __future__ import annotations
 
 import base64
+import logging
 import pathlib
 import shlex
 import threading
-from typing import Any
+import time
+from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Any, TypeVar
 
 from bespokelabs.sandbox.exceptions import (
     BackendNotInstalledError,
+    ErrorOutcome,
     FeatureNotSupportedError,
+    SandboxAuthenticationError,
+    SandboxConnectionError,
     SandboxCreationError,
+    SandboxError,
     SandboxExecutionError,
+    SandboxTimeoutError,
 )
 from bespokelabs.sandbox.types import (
     FileInfo,
     SandboxConfig,
+    SandboxListing,
     SandboxResult,
+    SandboxSessionState,
     SnapshotInfo,
 )
+
+logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# HTTP statuses after which the same request may succeed if sent again.
+_TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+# Sandboxes in these states have ended; a listing leaves them out.
+_ENDED_STATES = frozenset({"terminated", "timeout", "failed"})
+# Tensorlake sandboxes carry no labels or tags.  The one caller-chosen value a
+# listing reports is the sandbox name, exposed as this single label key.
+_NAME_LABEL = "name"
+
+
+def _http_status(exc: BaseException) -> int | None:
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    # The SDK's own SandboxConnectionError is matched by name so that telling
+    # errors apart never needs the SDK imported.
+    return (
+        isinstance(exc, ConnectionError)
+        or type(exc).__name__ == "SandboxConnectionError"
+    )
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    return (
+        type(exc).__name__ == "SandboxNotFoundError" or _http_status(exc) == 404
+    )
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Whether *exc* is a transport, rate-limit or quota failure worth a resend."""
+    if _is_not_found(exc):
+        return False
+    if _is_connection_error(exc) or isinstance(exc, TimeoutError):
+        return True
+    return _http_status(exc) in _TRANSIENT_STATUSES
+
+
+def _is_rejection(exc: BaseException) -> bool:
+    """Whether the API refused the request outright, so nothing was created."""
+    status = _http_status(exc)
+    return status is not None and 400 <= status < 500 and status != 408
+
+
+def _tensorlake_error(
+    exc: BaseException,
+    *,
+    op: str,
+    outcome: ErrorOutcome = ErrorOutcome.FAILED,
+    context: dict[str, Any] | None = None,
+    default: type[SandboxError] = SandboxExecutionError,
+    detail: str = "",
+) -> SandboxError:
+    """Translate a Tensorlake SDK error into the public error taxonomy.
+
+    *default* is the type for a failure that is neither an authentication,
+    connection nor timeout error.  A creation error (``default`` is
+    ``SandboxCreationError``) keeps that type whatever the cause, so callers
+    that catch ``SandboxCreationError`` see every failed create.
+    """
+    status = _http_status(exc)
+    ctx: dict[str, Any] = dict(context or {})
+    if status is not None:
+        ctx["provider_status"] = status
+    # Sending the request again can only help when nothing was left behind.
+    retryable = _is_transient(exc) and outcome is ErrorOutcome.FAILED
+    common: dict[str, Any] = {
+        "backend": "tensorlake",
+        "op": op,
+        "context": ctx,
+        "outcome": outcome,
+    }
+    if status in (401, 403):
+        return SandboxAuthenticationError(
+            "Tensorlake authentication failed.", **common
+        )
+    message = f"Tensorlake {op} failed: {exc}{detail}"
+    if default is not SandboxCreationError:
+        if _is_connection_error(exc):
+            return SandboxConnectionError(
+                message, retryable=retryable, **common
+            )
+        if isinstance(exc, TimeoutError):
+            return SandboxTimeoutError(message, retryable=retryable, **common)
+    return default(message, retryable=retryable, **common)
+
+
+def _aware_time(value: object) -> datetime | None:
+    """Return a provider timestamp as an aware datetime (naive means UTC), or None."""
+    if not isinstance(value, datetime):
+        return None
+    return (
+        value
+        if value.tzinfo is not None
+        else value.replace(tzinfo=timezone.utc)
+    )
 
 
 class TensorlakeClient:
@@ -27,7 +139,18 @@ class TensorlakeClient:
 
     The Tensorlake SDK client is built on first create() and reused for
     every session created through this client.
+
+    Calls that are safe to repeat (listing, reattaching by id, deleting) are
+    retried on transport, rate-limit and quota errors, at most
+    ``retry_attempts`` times in all with a doubling delay.  ``create`` is sent
+    once: a create that failed after the request left may still have built a
+    sandbox, and sending it again could build a second one.
     """
+
+    # Attempts in all for a repeatable call, and the delay before the second.
+    retry_attempts = 4
+    retry_backoff_secs = 0.5
+    retry_backoff_max_secs = 8.0
 
     def __init__(self) -> None:
         try:
@@ -55,26 +178,127 @@ class TensorlakeClient:
                     self._client = self._client_cls()
         return self._client
 
+    def _retry(self, op: str, call: Callable[[], _T]) -> _T:
+        """Run a repeatable *call*, sending it again after a transient failure.
+
+        Only for calls where a repeat cannot add a second resource.  The last
+        failure is raised as the SDK raised it, for the caller to translate.
+        """
+        attempts = max(1, int(self.retry_attempts))
+        for attempt in range(attempts):
+            try:
+                return call()
+            except Exception as exc:
+                if attempt == attempts - 1 or not _is_transient(exc):
+                    raise
+                delay = min(
+                    self.retry_backoff_max_secs,
+                    self.retry_backoff_secs * (2**attempt),
+                )
+                logger.warning(
+                    "Tensorlake %s failed (attempt %d of %d), retrying in %.1fs: %s",
+                    op,
+                    attempt + 1,
+                    attempts,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _delete_failed_create(self, client: object, sandbox_id: str) -> bool:
+        """Delete the sandbox a failed create left behind; True once it is gone."""
+        try:
+            self._retry("delete", lambda: client.delete(sandbox_id))
+        except Exception as exc:
+            if _is_not_found(exc):
+                return True
+            logger.warning(
+                "Could not delete Tensorlake sandbox %s left by a failed create; "
+                "it may still be running and billing.",
+                sandbox_id,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _create_error(
+        self, exc: Exception, client: object, name: object
+    ) -> SandboxError:
+        """Say what a failed create left behind, and clean up what is known.
+
+        Three cases.  The SDK names the sandbox it created (it never started,
+        or was still queued): that sandbox is deleted, since no caller holds a
+        handle to it.  The request was refused: nothing exists.  Anything
+        else (a dropped connection, a timeout, a 5xx) leaves it unknown
+        whether a sandbox was built, and the error says so instead of the
+        create being sent again.
+        """
+        context: dict[str, Any] = {}
+        detail = ""
+        sandbox_id = getattr(exc, "sandbox_id", None)
+        if isinstance(sandbox_id, str) and sandbox_id:
+            context["provider_resource_id"] = sandbox_id
+            if self._delete_failed_create(client, sandbox_id):
+                context["cleanup_status"] = "deleted"
+                outcome = ErrorOutcome.FAILED
+            else:
+                context["cleanup_status"] = "unknown"
+                outcome = ErrorOutcome.UNKNOWN
+                detail = (
+                    f" (sandbox {sandbox_id} could not be deleted and may"
+                    " still exist)"
+                )
+        elif _is_rejection(exc) or isinstance(exc, (TypeError, ValueError)):
+            # Refused by the API, or by the SDK before any request was sent.
+            outcome = ErrorOutcome.FAILED
+        else:
+            outcome = ErrorOutcome.UNKNOWN
+            hint = ""
+            if isinstance(name, str) and name:
+                context[_NAME_LABEL] = name
+                hint = (
+                    "; look for it with"
+                    f" list_sandboxes({{'{_NAME_LABEL}': {name!r}}})"
+                )
+            detail = (
+                " (the request may have reached Tensorlake, so a sandbox may"
+                f" exist; the create was not sent again{hint})"
+            )
+        return _tensorlake_error(
+            exc,
+            op="create",
+            outcome=outcome,
+            context=context,
+            default=SandboxCreationError,
+            detail=detail,
+        )
+
     def create(self, config: SandboxConfig) -> TensorlakeSession:
         try:
             client = self._ensure_client()
-            kwargs: dict = {
-                "cpus": config.cpu,
-                "memory_mb": config.memory_mb,
-                "timeout_secs": config.timeout_secs,
-                "allow_internet_access": config.allow_internet,
-            }
-            if config.image:
-                kwargs["image"] = config.image
-            if config.snapshot_id:
-                kwargs["snapshot_id"] = config.snapshot_id
-            if config.backend_options:
-                kwargs.update(config.backend_options)
+        except Exception as exc:
+            # No request was sent, so there is nothing to clean up.
+            raise _tensorlake_error(
+                exc, op="create", default=SandboxCreationError
+            ) from exc
+        kwargs: dict = {
+            "cpus": config.cpu,
+            "memory_mb": config.memory_mb,
+            "timeout_secs": config.timeout_secs,
+            "allow_internet_access": config.allow_internet,
+        }
+        if config.image:
+            kwargs["image"] = config.image
+        if config.snapshot_id:
+            kwargs["snapshot_id"] = config.snapshot_id
+        if config.backend_options:
+            kwargs.update(config.backend_options)
+        try:
+            # Sent once: see the class docstring.
             sandbox = client.create_and_connect(**kwargs)
         except Exception as exc:
-            raise SandboxCreationError(
-                f"Failed to create Tensorlake sandbox: {exc}"
-            ) from exc
+            raise self._create_error(exc, client, kwargs.get("name")) from exc
 
         return TensorlakeSession(
             client=client,
@@ -90,7 +314,9 @@ class TensorlakeClient:
                 "This Tensorlake SDK version has no connect(); cannot resume by id"
             )
         try:
-            sandbox = connect(data["sandbox_id"])
+            sandbox_id = data["sandbox_id"]
+            # Attaching to an existing sandbox by id is safe to repeat.
+            sandbox = self._retry("connect", lambda: connect(sandbox_id))
         except Exception as exc:
             raise SandboxCreationError(
                 f"Cannot resume Tensorlake sandbox '{data.get('sandbox_id')}': {exc}"
@@ -100,6 +326,75 @@ class TensorlakeClient:
             sandbox=sandbox,
             workdir=data.get("workdir", "/tmp"),
         )
+
+    def list_sandboxes(self, labels: dict[str, str]) -> list[SandboxListing]:
+        """Every sandbox that has not ended and is named ``labels["name"]``.
+
+        Tensorlake sandboxes have no labels or tags, and the SDK's ``list()``
+        takes no filter.  The only caller-chosen value a sandbox carries is
+        its name (``backend_options={"name": ...}`` at creation), so ``name``
+        is the one label key accepted here; any other key raises
+        ``FeatureNotSupportedError`` rather than matching nothing.  The whole
+        project listing is fetched and filtered client-side.  Pending, running
+        and suspended sandboxes are returned with their ``state``; terminated
+        ones are left out.  Any failure raises instead of returning part of
+        the list.
+        """
+        unsupported = sorted(set(labels) - {_NAME_LABEL})
+        if unsupported or not labels.get(_NAME_LABEL):
+            raise FeatureNotSupportedError(
+                "Tensorlake sandboxes carry no labels; they can only be listed"
+                f" by name, as {{'{_NAME_LABEL}': ...}}",
+                backend="tensorlake",
+                op="list",
+                context={"unsupported_labels": ", ".join(unsupported)},
+            )
+        wanted = labels[_NAME_LABEL]
+        try:
+            client = self._ensure_client()
+            lister = getattr(client, "list", None)
+        except Exception as exc:
+            raise _tensorlake_error(exc, op="list") from exc
+        if not callable(lister):
+            raise FeatureNotSupportedError(
+                "This Tensorlake SDK version has no list(); cannot list sandboxes",
+                backend="tensorlake",
+                op="list",
+            )
+        try:
+            # list() may return a lazy iterable, so materialize it in the guard.
+            found = self._retry("list", lambda: list(lister()))
+        except Exception as exc:
+            raise _tensorlake_error(exc, op="list") from exc
+        listings: list[SandboxListing] = []
+        for info in found:
+            if getattr(info, "name", None) != wanted:
+                continue
+            state = getattr(info, "status", None)
+            state = getattr(state, "value", state)
+            state = None if state is None else str(state)
+            if state is not None and state.lower() in _ENDED_STATES:
+                continue
+            sandbox_id = getattr(info, "sandbox_id", None)
+            if not sandbox_id:
+                raise SandboxExecutionError(
+                    "Tensorlake listed a sandbox without an id.",
+                    backend="tensorlake",
+                    op="list",
+                )
+            listings.append(
+                SandboxListing(
+                    provider_resource_id=str(sandbox_id),
+                    labels={_NAME_LABEL: wanted},
+                    state=state,
+                    created_at=_aware_time(getattr(info, "created_at", None)),
+                    session_state=SandboxSessionState(
+                        backend="tensorlake",
+                        data={"sandbox_id": str(sandbox_id)},
+                    ),
+                )
+            )
+        return listings
 
 
 class TensorlakeSession:

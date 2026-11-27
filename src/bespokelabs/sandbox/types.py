@@ -279,7 +279,8 @@ class SandboxListing:
     """One running sandbox that a provider listed by its labels.
 
     Returned by ``SandboxClient.list_sandboxes``.  ``labels`` are the
-    sandbox's own labels (Daytona) or tags (Modal).  ``state`` is the
+    sandbox's own labels (Daytona) or tags (Modal); Tensorlake has neither,
+    so its listings carry the sandbox name as ``{"name": ...}``.  ``state`` is the
     provider's raw state string when it reports one.  ``created_at`` is a
     timezone-aware time when the provider reports it, else ``None`` (Modal's
     listing carries none).  ``labels_complete`` is ``False`` when the SDK

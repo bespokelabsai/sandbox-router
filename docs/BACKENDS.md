@@ -274,6 +274,7 @@ Novita's reattachment limitations are covered in the
 | Resource limits | No | No | cpu, memory | cpu (Ray) | cpu, memory, disk | cpu, memory | cpu, memory, gpu | cpu, memory, disk, gpu | Tier-based | Template-defined | cpu, memory (size class) |
 | `allow_internet=False` (legacy, prefer `network=`) | Ignored | Ignored | Yes | Ignored | Ignored | Yes | Ignored | Rejected | Ignored | Ignored | Yes |
 | `network=` modes | public | public | public, none | public | all | public, none | all | public | public | public | all |
+| `list_sandboxes(labels)` | No | No | No | No | Labels | `name` only | Tags | No | No | No | No |
 | `set_network()` | No | No | No | No | Yes | No | public, allowlist | No | No | No | Yes |
 | Isolation | Process-level | macOS `sandbox-exec` | Container | Process | Full VM | Container | Container | Container | Full VM | MicroVM | Full VM |
 | `native` | No | No | `Container` | Actor handle | SDK `Sandbox` | SDK sandbox | `modal.Sandbox` | No | SDK `Sandbox` | SDK `Sandbox` | `boxd` client |
@@ -286,7 +287,9 @@ per GPU, not exact allocations. Ray reserves CPU scheduling resources without
 requesting GPU or memory limits. Tensorlake currently does not forward the
 top-level `env_vars` option; inside-agent `AgentSpec.env` can supply per-command
 variables. Its `read_file` converts text stdout to bytes; use `download_file`
-for binary data. boxd `expose_port` URLs are public and unauthenticated; the
+for binary data. Tensorlake sandboxes have no labels, so `list_sandboxes`
+accepts only `{"name": ...}`; see
+[Listing sandboxes by label](SDK_REFERENCE.md#listing-sandboxes-by-label). boxd `expose_port` URLs are public and unauthenticated; the
 first one on a machine waits for its TLS certificate, which takes about 20
 seconds.
 
