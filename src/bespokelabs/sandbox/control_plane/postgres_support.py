@@ -23,6 +23,17 @@ Migration = tuple[int, Sequence[str]]
 _IDENTIFIER = re.compile(r"[a-z_]+")
 
 
+def sql_module() -> Any:
+    """``psycopg.sql``, used to compose identifiers instead of formatting text."""
+    try:
+        from psycopg import sql
+    except ImportError as exc:
+        raise ImportError(
+            "PostgreSQL stores require psycopg; install the 'postgres' extra"
+        ) from exc
+    return sql
+
+
 def _dict_row() -> Any:
     try:
         from psycopg.rows import dict_row
@@ -81,12 +92,16 @@ def apply_migrations(
             )
             if cursor.fetchone()["relation"] is None:
                 raise ValueError(missing_message)
+        sql = sql_module()
+        table = sql.Identifier(journal)
         cursor.execute(
-            f"CREATE TABLE IF NOT EXISTS {journal} ("
-            "version INTEGER PRIMARY KEY, "
-            "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS {} ("
+                "version INTEGER PRIMARY KEY, "
+                "applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            ).format(table)
         )
-        cursor.execute(f"SELECT version FROM {journal}")
+        cursor.execute(sql.SQL("SELECT version FROM {}").format(table))
         applied = {row["version"] for row in cursor.fetchall()}
         for version, statements in migrations:
             if version in applied:
@@ -94,5 +109,6 @@ def apply_migrations(
             for statement in statements:
                 cursor.execute(statement)
             cursor.execute(
-                f"INSERT INTO {journal}(version) VALUES (%s)", (version,)
+                sql.SQL("INSERT INTO {}(version) VALUES (%s)").format(table),
+                (version,),
             )

@@ -15,7 +15,12 @@ from typing import Callable
 from .errors import ConflictError, NotFoundError
 from .job_models import HostedJob, JobBinding
 from .job_store import HostedJobRepositoryBase, canonical, check_column_names
-from .postgres_support import ConnectionSource, apply_migrations, transaction
+from .postgres_support import (
+    ConnectionSource,
+    apply_migrations,
+    sql_module,
+    transaction,
+)
 
 _JOURNAL = "hosted_jobs_schema_migrations"
 
@@ -147,15 +152,20 @@ class PostgresHostedJobRepository(HostedJobRepositoryBase):
         re-check its predicate, so at most one of two racing updates applies.
         """
         check_column_names(changes)
-        assignments = ", ".join(f"{key}=%s" for key in changes)
+        sql = sql_module()
+        assignments = sql.SQL(", ").join(
+            sql.SQL("{}=%s").format(sql.Identifier(key)) for key in changes
+        )
         with transaction(self._connections) as cursor:
             cursor.execute(
-                f"UPDATE hosted_jobs SET {assignments}, version=version+1 "
-                "WHERE id=%s AND organization_id=%s AND version=%s "
-                "AND uid IS NOT DISTINCT FROM %s "
-                "AND lease_token IS NOT DISTINCT FROM %s "
-                "AND binding_json=%s AND resource_name=%s "
-                "AND phase=%s AND phase != 'terminal'",
+                sql.SQL(
+                    "UPDATE hosted_jobs SET {}, version=version+1 "
+                    "WHERE id=%s AND organization_id=%s AND version=%s "
+                    "AND uid IS NOT DISTINCT FROM %s "
+                    "AND lease_token IS NOT DISTINCT FROM %s "
+                    "AND binding_json=%s AND resource_name=%s "
+                    "AND phase=%s AND phase != 'terminal'"
+                ).format(assignments),
                 (
                     *changes.values(),
                     record.id,
