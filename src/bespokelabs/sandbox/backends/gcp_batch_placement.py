@@ -90,9 +90,12 @@ def _regions_client() -> Any:
     return compute_v1.RegionsClient()
 
 
-def _read_region(client: Any, project: str, region: str) -> RegionQuota:
+def _read_region(
+    client_factory: Callable[[], Any], project: str, region: str
+) -> RegionQuota:
     try:
-        response = client.get(project=project, region=region)
+        # One client per read: the reads run on separate threads.
+        response = client_factory().get(project=project, region=region)
     except Exception as exc:  # noqa: BLE001 - one unreadable region must not fail the choice
         logger.warning(
             "could not read Compute quota for region %s: %s",
@@ -120,10 +123,12 @@ def probe_region_quotas(
     """
     if not regions:
         return []
-    client = (client_factory or _regions_client)()
+    factory = client_factory or _regions_client
     with ThreadPoolExecutor(max_workers=min(len(regions), 8)) as pool:
         return list(
-            pool.map(lambda region: _read_region(client, project, region), regions)
+            pool.map(
+                lambda region: _read_region(factory, project, region), regions
+            )
         )
 
 
@@ -136,5 +141,7 @@ def choose_region(
     client_factory: Callable[[], Any] | None = None,
 ) -> RegionChoice:
     """Probe ``regions`` and pick the first with ``requirements`` free."""
-    quotas = probe_region_quotas(project, regions, client_factory=client_factory)
+    quotas = probe_region_quotas(
+        project, regions, client_factory=client_factory
+    )
     return select_region(quotas, requirements, fallback=fallback)

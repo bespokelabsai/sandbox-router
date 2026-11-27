@@ -70,7 +70,9 @@ class SelectRegionTests(unittest.TestCase):
         self.assertEqual((choice.region, choice.has_capacity), ("z", False))
 
     def test_no_requirements_takes_the_first_readable_region(self) -> None:
-        choice = select_region([RegionQuota("a", None), RegionQuota("b", {})], {})
+        choice = select_region(
+            [RegionQuota("a", None), RegionQuota("b", {})], {}
+        )
         self.assertEqual((choice.region, choice.has_capacity), ("b", True))
 
     def test_no_candidates_is_an_error(self) -> None:
@@ -87,21 +89,29 @@ class ProbeTests(unittest.TestCase):
                 "b": [_quota("CPUS", 100, 0)],
             }
         )
-        quotas = probe_region_quotas("proj", ["a", "b"], client_factory=lambda: client)
+        quotas = probe_region_quotas(
+            "proj", ["a", "b"], client_factory=lambda: client
+        )
         self.assertEqual([q.region for q in quotas], ["a", "b"])
-        self.assertEqual(quotas[0].available, {"CPUS": 10.0, "SSD_TOTAL_GB": 1000.0})
+        self.assertEqual(
+            quotas[0].available, {"CPUS": 10.0, "SSD_TOTAL_GB": 1000.0}
+        )
         self.assertEqual(quotas[1].available, {"CPUS": 100.0})
         self.assertEqual(sorted(client.calls), [("proj", "a"), ("proj", "b")])
 
     def test_a_failed_read_is_none_not_an_error(self) -> None:
         client = _Regions({"a": RuntimeError("403"), "b": []})
-        quotas = probe_region_quotas("proj", ["a", "b"], client_factory=lambda: client)
+        quotas = probe_region_quotas(
+            "proj", ["a", "b"], client_factory=lambda: client
+        )
         self.assertIsNone(quotas[0].available)
         self.assertEqual(quotas[1].available, {})
 
     def test_no_regions_reads_nothing(self) -> None:
         self.assertEqual(
-            probe_region_quotas("proj", [], client_factory=lambda: self.fail("read")),
+            probe_region_quotas(
+                "proj", [], client_factory=lambda: self.fail("read")
+            ),
             [],
         )
 
@@ -113,7 +123,9 @@ class ProbeTests(unittest.TestCase):
                 "c": [_quota("CPUS", 100, 0), _quota("SSD_TOTAL_GB", 1000, 0)],
             }
         )
-        choice = choose_region("proj", ["a", "b", "c"], NEED, client_factory=lambda: client)
+        choice = choose_region(
+            "proj", ["a", "b", "c"], NEED, client_factory=lambda: client
+        )
         self.assertEqual((choice.region, choice.has_capacity), ("c", True))
 
 

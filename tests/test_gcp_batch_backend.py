@@ -468,7 +468,9 @@ class SubmitTests(GcpBatchTestCase):
         )
         self.assertIn("/locations/us-east1/jobs/", job_id)
 
-    def test_region_candidates_without_quota_or_with_explicit_region(self) -> None:
+    def test_region_candidates_without_quota_or_with_explicit_region(
+        self,
+    ) -> None:
         from bespokelabs.sandbox.backends import gcp_batch_placement
 
         self.service.create_job.return_value = batch_v1.Job()
@@ -507,7 +509,9 @@ class SubmitTests(GcpBatchTestCase):
             with self.subTest(options=options):
                 with self.assertRaises(SandboxConfigurationError):
                     self.client.submit_job(
-                        JobSpec(command="true", image="img", backend_options=options)
+                        JobSpec(
+                            command="true", image="img", backend_options=options
+                        )
                     )
         self.service.create_job.assert_not_called()
 
